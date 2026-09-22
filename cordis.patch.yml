@@ -1,0 +1,25 @@
+# dsh-provider-failover bundle patch.
+# Applied when the plugin is installed via
+#   dsh plugin --profile <profile> add <path-to-this-package>
+#
+# 本条目只登记 Host 半插件；默认表是零介入的示例（见 README），
+# 需要覆盖时在 profile 的 cordis.patch.yml 里按插件 id 追加 config（见下）。
+#
+# 覆盖示例（写进 $DSH_HOME/profiles/<profile>/cordis.patch.yml）：
+#
+#   - id: dsh-deepseek-keypool
+#     config:
+#       startup: { preferTier: 1 }
+#       ranking: { mode: keywords, timeoutMs: 20000, cacheTtlMs: 60000 }
+#       tiers:
+#         - tier: 1
+#           enabled: true
+#           entries:
+#             - { id: first, route: my-provider, model: my-model, cooldownMs: 60000 }
+#         - tier: 2
+#           enabled: true
+#           entries:
+#             - { id: fallback, route: my-provider-2, model: my-model-2, cooldownMs: 60000 }
+- insert:
+    - id: dsh-deepseek-keypool
+      name: dsh-deepseek-keypool

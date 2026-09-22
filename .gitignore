@@ -1,0 +1,9 @@
+node_modules/
+*.log
+probe.jsonl
+probe*.jsonl
+mock-stdout*.log
+mock-stderr*.log
+.credentials.yaml
+*.credentials.yaml
+.env

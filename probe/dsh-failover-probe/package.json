@@ -1,0 +1,21 @@
+{
+  "name": "dsh-failover-probe",
+  "version": "0.0.1",
+  "private": true,
+  "description": "M0 探针：记录 agent/request、agent/request-error、llm/stream 事件，并验证「在 agent/request 返回新 provider 能否在同一步生效」",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

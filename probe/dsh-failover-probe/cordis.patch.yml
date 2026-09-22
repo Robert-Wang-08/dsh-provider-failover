@@ -1,0 +1,9 @@
+# M0 探针 Bundle patch：把一个纯观测 + 单次切换实验的 Host 插件插入 profile。
+- insert:
+    - id: failover-probe
+      name: dsh-failover-probe
+      config:
+        logFile: !!js process.env.DSH_PROBE_LOG || 'probe.jsonl'
+        switchTo: !!js process.env.DSH_PROBE_SWITCH_TO || ''
+        switchModel: !!js process.env.DSH_PROBE_SWITCH_MODEL || ''
+        diagnoseProviders: [probe-quota, probe-overload]
