@@ -12,8 +12,16 @@
  *   3. 失败码由适配器归一化：402→QUOTA，401/403→AUTH，429→RATE_LIMIT，5xx→SERVER；
  *      凭据不可用的路由会以 NO_ADAPTER 失败。
  *
+ *  4. 单路由多 key：条目的 `keys` 是**同一路由的凭据引用名**列表；凭据类失败时改写该
+ *     路由的 `apiKeyEnv` 引用（只写引用名），下一次尝试由适配器按新引用解析凭据。
+ *     路由名与模型名不变，因此模型选择列表里不会多出任何路由。实证：适配器每请求
+ *     `resolveApiKey(provider, profile)` = `credentials.resolve(profile.apiKeyEnv)`，
+ *     profile 按 settings 快照记忆化，故改写引用对下一个请求立即生效。
+ *  5. 每日重置：`keyResetAt`（本地时间，默认 06:00）清空 key 失效标记并把仍属插件
+ *     状态的条目写回首项（默认 key）；当前引用不在 `keys` 内时视为用户手工状态，不动。
+ *
  * 约束（自 openspec 规范）：
- *   - 不持有、不存储、不写入任何凭据；凭据由各路由既有 apiKeyEnv 从宿主凭据源解析。
+ *   - 不持有、不存储、不读取任何凭据值；只读写引用名，凭据由适配器按 apiKeyEnv 解析。
  *   - 每 `(turn, step)` 每个条目至多尝试一次；单 turn 切换次数有上限；冷却期内不选中。
  *   - 未配置/未启用时零介入；无法解析目标时交回宿主，不做隐式降级。
  */
@@ -40,6 +48,7 @@ const FailoverSettingsSchema = z.object({
   maxSwitchesPerTurn: z.number().step(1).min(1).default(6),
   startupPreferTier: z.number().step(1).min(0).default(1),
   rankingMode: z.union(['declared', 'keywords', 'llm']).default('keywords'),
+  keyResetAt: z.string().default('06:00'),
 })
 
 /** 只读状态接口与设置页共用的 JSON 助手。 */
@@ -81,6 +90,25 @@ function isLocalRequest(req) {
 /** 可切换失败的默认归一化编码集合。 */
 const DEFAULT_TERMINAL_CODES = ['QUOTA', 'AUTH', 'INVALID_CREDENTIAL', 'MISSING_CREDENTIAL', 'NO_ADAPTER', 'SERVER', 'RATE_LIMIT']
 
+/**
+ * 「可切换失败」里属于**凭据类**的编码：命中时先尝试条目内 key 轮换（改 apiKeyEnv 引用），
+ * 其余（SERVER/RATE_LIMIT/NO_ADAPTER）走 provider 切换——换 key 治不了过载与路由缺失。
+ * 消息模式兜底命中的失败一律按非凭据类处理：不因一句话就消耗一把 key。
+ */
+const KEY_ROTATION_CODES = new Set(['QUOTA', 'AUTH', 'INVALID_CREDENTIAL', 'MISSING_CREDENTIAL'])
+
+/** 凭据引用名的形状（宿主凭据服务的 POSIX 标识符约定）。 */
+const KEY_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+/** `keyResetAt` 的形状：24 小时制本地时间。 */
+const KEY_RESET_AT_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/
+
+/** 宿主 pi-ai 适配器的设置命名空间：路由 profile（含 apiKeyEnv）在这里。 */
+const PI_AI_NAMESPACE = 'llm-pi-ai'
+
+/** 引用描述（是否已配置 / 来源层）的缓存时长，避免每次状态查询都打凭据服务。 */
+const REF_INFO_TTL_MS = 10000
+
 /** 编码未归一化时的消息模式兜底（大小写不敏感）。 */
 const DEFAULT_FAILURE_PATTERNS = [
   'insufficient balance',
@@ -102,7 +130,7 @@ const DEFAULT_TIERS = [
     tier: 1,
     enabled: false,
     entries: [
-      { id: 'example', route: 'example-provider', model: 'example-model', description: '示例条目：替换为你自己的首选路由与模型', keywords: [], compatible: { tools: true, images: true }, cooldownMs: 60000 },
+      { id: 'example', route: 'example-provider', model: 'example-model', description: '示例条目：替换为你自己的首选路由与模型', keywords: [], compatible: { tools: true, images: true }, cooldownMs: 60000, keys: [] },
     ],
   },
 ]
@@ -117,6 +145,8 @@ const DEFAULT_CONFIG = {
   minSwitchIntervalMs: 1000,
   maxSwitchesPerTurn: 6,
   probeTarget: true,
+  // key 状态每日重置时刻（本地时间）：清空失效标记并把默认 key 写回。
+  keyResetAt: '06:00',
   startup: { preferTier: 1 },
   ranking: {
     mode: 'keywords',
@@ -146,6 +176,40 @@ function optionalString(value) {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
 }
 
+/** 凭据引用名（POSIX 标识符）：`keys` 的每个元素都是它，而不是路由名，更不是密钥值。 */
+function isCredentialRef(value) {
+  return typeof value === 'string' && KEY_REF_PATTERN.test(value)
+}
+
+/** 条目内 key 轮换序列的纯函数：从 `active` 之后环形前进，返回第一个 `isUsable` 的引用。 */
+function selectNextRef(keys, active, isUsable) {
+  if (Array.isArray(keys) !== true || keys.length === 0) return undefined
+  const start = active === undefined ? -1 : keys.indexOf(active)
+  for (let offset = 1; offset <= keys.length; offset++) {
+    const candidate = keys[(start + offset) % keys.length]
+    if (candidate === active) continue
+    if (isUsable(candidate) === true) return candidate
+  }
+  return undefined
+}
+
+/** 从 `HH:MM` 解析出 { hours, minutes }；非法返回 undefined。 */
+function parseClock(text) {
+  if (typeof text !== 'string' || KEY_RESET_AT_PATTERN.test(text) !== true) return undefined
+  const [hours, minutes] = text.split(':').map((part) => Number(part))
+  return { hours, minutes }
+}
+
+/** 下一个 `HH:MM`（本地时间）的毫秒时间戳；`now` 已过当日时刻时取次日。 */
+function nextResetAt(text, now) {
+  const clock = parseClock(text)
+  if (clock === undefined) return now + 24 * 60 * 60 * 1000
+  const next = new Date(now)
+  next.setHours(clock.hours, clock.minutes, 0, 0)
+  if (next.getTime() <= now) next.setDate(next.getDate() + 1)
+  return next.getTime()
+}
+
 function strings(value) {
   return Array.isArray(value) ? value.filter((item) => typeof item === 'string' && item.length > 0) : []
 }
@@ -164,6 +228,7 @@ function normalizeConfig(raw) {
     minSwitchIntervalMs: input.minSwitchIntervalMs === undefined ? DEFAULT_CONFIG.minSwitchIntervalMs : input.minSwitchIntervalMs,
     maxSwitchesPerTurn: input.maxSwitchesPerTurn === undefined ? DEFAULT_CONFIG.maxSwitchesPerTurn : input.maxSwitchesPerTurn,
     probeTarget: input.probeTarget === undefined ? DEFAULT_CONFIG.probeTarget : input.probeTarget === true,
+    keyResetAt: optionalString(input.keyResetAt) ?? DEFAULT_CONFIG.keyResetAt,
     startup: { preferTier: 0 },
     ranking: {
       mode: 'keywords',
@@ -177,6 +242,7 @@ function normalizeConfig(raw) {
 
   if (typeof config.minSwitchIntervalMs !== 'number' || Number.isFinite(config.minSwitchIntervalMs) !== true || config.minSwitchIntervalMs < 0) errors.push('minSwitchIntervalMs must be a non-negative number (0 disables the interval guard)')
   if (!Number.isInteger(config.maxSwitchesPerTurn) || config.maxSwitchesPerTurn < 1) errors.push('maxSwitchesPerTurn must be a positive integer')
+  if (parseClock(config.keyResetAt) === undefined) errors.push('keyResetAt must be HH:MM in 24-hour local time (e.g. 06:00)')
 
   const startup = isPlainObject(input.startup) ? input.startup : {}
   if (startup.preferTier !== undefined) {
@@ -247,32 +313,25 @@ function normalizeConfig(raw) {
       if (model === undefined) errors.push('entry.model is required (entry ' + String(id ?? '?') + ')')
       const cooldownMs = rawEntry.cooldownMs === undefined ? 60000 : rawEntry.cooldownMs
       if (!positiveNumber(cooldownMs)) errors.push('entry.cooldownMs must be a positive number (entry ' + String(id ?? '?') + ')')
-      // 条目内 key 轮换（opt-in）：keys[] 是兄弟路由 key，轮换序列 = [route, ...keys]。
+      // 条目内 key 轮换（opt-in）：keys[] 是**同一路由的凭据引用名**（有序，首项为默认 key）。
+      // 未声明或声明为空数组时不参与轮换，行为与单 key 条目一致。
       const keys = []
       if (rawEntry.keys !== undefined && Array.isArray(rawEntry.keys) !== true) {
-        errors.push('entry.keys must be an array of route keys (entry ' + String(id ?? '?') + ')')
+        errors.push('entry.keys must be an array of credential reference names (entry ' + String(id ?? '?') + ')')
       }
       if (Array.isArray(rawEntry.keys)) {
         const seenKey = new Set()
         for (const item of rawEntry.keys) {
-          const keyRoute = optionalString(item)
-          if (keyRoute === undefined) {
-            errors.push('entry.keys items must be non-empty strings (entry ' + String(id ?? '?') + ')')
+          if (isCredentialRef(item) !== true) {
+            errors.push('entry.keys items must be credential reference names (POSIX identifiers such as MY_KEY_2) (entry ' + String(id ?? '?') + ')')
             continue
           }
-          if (keyRoute === route) {
-            errors.push('entry.keys must not repeat entry.route: ' + keyRoute + ' (entry ' + String(id ?? '?') + ')')
+          if (seenKey.has(item)) {
+            errors.push('duplicate credential reference in entry.keys: ' + item + ' (entry ' + String(id ?? '?') + ')')
             continue
           }
-          if (seenKey.has(keyRoute)) {
-            errors.push('duplicate key route in entry.keys: ' + keyRoute + ' (entry ' + String(id ?? '?') + ')')
-            continue
-          }
-          seenKey.add(keyRoute)
-          keys.push(keyRoute)
-        }
-        if (keys.length === 0 && route !== undefined) {
-          errors.push('entry.keys declares no usable distinct key route; in-entry rotation needs at least one key besides entry.route (entry ' + String(id ?? '?') + ')')
+          seenKey.add(item)
+          keys.push(item)
         }
       }
       if (id === undefined || route === undefined || model === undefined || !positiveNumber(cooldownMs)) continue
@@ -293,16 +352,16 @@ function normalizeConfig(raw) {
     if (Array.isArray(rawTier.entries) !== true) errors.push('tier.entries must be an array (tier ' + String(tierNumber) + ')')
     config.tiers.push({ tier: Number.isInteger(tierNumber) ? tierNumber : 0, enabled: rawTier.enabled === true, entries })
   }
-  // 每个 key 只用于单个 provider：同一路由 key（主路由或 keys 候选）不得服务多个条目。
-  const routeOwner = new Map()
+  // 每个引用只服务一个 provider：同一凭据引用名不得出现在多个条目（引用即该路由的凭据来源）。
+  const refOwner = new Map()
   for (const tier of config.tiers) {
     for (const entry of tier.entries) {
-      for (const routeKey of [entry.route, ...entry.keys]) {
-        const owner = routeOwner.get(routeKey)
+      for (const ref of entry.keys) {
+        const owner = refOwner.get(ref)
         if (owner !== undefined) {
-          errors.push('route key "' + routeKey + '" is used by both entry ' + owner + ' and entry ' + entry.id + '; each key serves a single provider')
+          errors.push('credential reference "' + ref + '" is used by both entry ' + owner + ' and entry ' + entry.id + '; each reference serves a single provider')
         } else {
-          routeOwner.set(routeKey, entry.id)
+          refOwner.set(ref, entry.id)
         }
       }
     }
@@ -363,11 +422,11 @@ function tierOf(config, route) {
   return undefined
 }
 
-/** 失败归属：返回路由（条目主路由或 keys 候选）所在的 {tier, entry}。 */
+/** 失败归属：返回路由所在的 {tier, entry}。key 轮换不改路由，因此只按路由匹配。 */
 function locateRoute(config, route) {
   for (const tier of config.tiers) {
     for (const entry of tier.entries) {
-      if (entry.route === route || entry.keys.includes(route)) return { tier, entry }
+      if (entry.route === route) return { tier, entry }
     }
   }
   return undefined
@@ -431,10 +490,19 @@ export function apply(ctx, rawConfig) {
     routeHealth: new Map(),
     /** 最近转移记录（上限 50） */
     switchLog: [],
-    /** stepKey -> { attempted:Set<'entryId@route'>, target, switches, needs, at } */
+    /** stepKey -> { attempted:Set<'entryId@route#ref'>, target, switches, needs, at } */
     steps: new Map(),
-    /** keys 候选的预检警告去重（每路由每进程一次，避免刷屏） */
+    /** key 候选的预检警告去重（每引用每进程一次，避免刷屏） */
     keyWarned: new Set(),
+    /**
+     * 当日失效的凭据引用：ref -> { gen, code, route, at }。
+     * `gen` 与 `keyGeneration` 相等才算「本次重置周期内失效」——每日重置只是把代数 +1，
+     * 无需遍历清理，也不依赖时钟比较。
+     */
+    keyFailed: new Map(),
+    keyGeneration: 0,
+    /** 引用描述缓存：ref -> { configured, source, at }（短 TTL，仅用于状态展示） */
+    refInfo: new Map(),
     lastSwitchAt: 0,
     /** 排序结果缓存：hash -> { ids, at } */
     rankingCache: new Map(),
@@ -449,6 +517,152 @@ export function apply(ctx, rawConfig) {
   }
 
   const stepKeyOf = (turn, step) => String(turn) + '/' + String(step)
+
+  // ------------------------------------------------------- 单路由多 key（凭据引用轮换）
+
+  const settingsService = () => ctx.get('settings') ?? undefined
+  const credentialsService = () => ctx.get('credentials') ?? undefined
+
+  /** 实时读取某路由当前的凭据引用名（不缓存：用户手工改 settings 立即被采纳）。 */
+  function activeRefOf(route) {
+    const service = settingsService()
+    if (service === undefined || typeof service.get !== 'function') return undefined
+    let section
+    try {
+      section = service.get(PI_AI_NAMESPACE)
+    } catch (error) {
+      return undefined
+    }
+    if (section === null || typeof section !== 'object') return undefined
+    const profile = section.providers !== undefined && section.providers !== null ? section.providers[route] : undefined
+    if (profile === null || typeof profile !== 'object') return undefined
+    const ref = profile.apiKeyEnv
+    return typeof ref === 'string' && ref.length > 0 ? ref : undefined
+  }
+
+  /** 引用是否已配置（凭据描述）。服务缺失或描述失败一律按「未配置」处理——失败闭合。 */
+  async function refConfigured(ref) {
+    const service = credentialsService()
+    if (service === undefined || typeof service.describe !== 'function') {
+      state.refInfo.set(ref, { configured: false, source: undefined, at: Date.now() })
+      return { configured: false, source: undefined }
+    }
+    try {
+      const info = await service.describe(ref)
+      const record = { configured: info?.configured === true, source: typeof info?.source === 'string' ? info.source : undefined, at: Date.now() }
+      state.refInfo.set(ref, record)
+      return record
+    } catch (error) {
+      state.refInfo.set(ref, { configured: false, source: undefined, at: Date.now() })
+      return { configured: false, source: undefined }
+    }
+  }
+
+  /** 只改写引用名；永不触碰凭据值。 */
+  async function writeActiveRef(route, ref) {
+    const service = settingsService()
+    if (service === undefined || typeof service.mutate !== 'function') throw new Error('settings service is not composed')
+    await service.mutate(PI_AI_NAMESPACE, [{ op: 'set', path: ['providers', route, 'apiKeyEnv'], value: ref }])
+  }
+
+  /** 每次尝试的记账键：同一条路由在不同凭据引用下算不同的尝试。 */
+  function attemptKey(entryId, route, ref) {
+    return entryId + '@' + route + '#' + String(ref ?? '')
+  }
+
+  function refFailed(ref) {
+    const mark = state.keyFailed.get(ref)
+    return mark !== undefined && mark.gen === state.keyGeneration
+  }
+
+  function warnRefOnce(ref, detail) {
+    if (state.keyWarned.has(ref)) return
+    state.keyWarned.add(ref)
+    console.warn('[dsh-provider-failover] key reference skipped: ' + ref + ' — ' + detail)
+  }
+
+  /**
+   * 条目内 key 轮换：把失败路由的 `apiKeyEnv` 改写为条目内下一把可用引用。
+   * 环形前进（从当前引用之后开始，至多一圈）：跳过本周期已失效者与未配置者。
+   * 返回生效的引用名；无可用候选或写入失败时返回 undefined（调用方落到 provider 切换）。
+   */
+  async function rotateKey(entry, route, failedRef, code, now) {
+    if (entry.keys.length === 0) return undefined
+    const active = failedRef ?? activeRefOf(route)
+    if (active !== undefined) state.keyFailed.set(active, { gen: state.keyGeneration, code, route, at: now })
+    // 环形前进至多一圈：跳过本周期已失效者，逐个用凭据描述预检，第一个已配置的即为目标。
+    let remaining = entry.keys.length
+    let cursor = active
+    while (remaining > 0) {
+      const candidate = selectNextRef(entry.keys, cursor, (ref) => refFailed(ref) !== true)
+      if (candidate === undefined) break
+      remaining -= 1
+      cursor = candidate
+      const info = await refConfigured(candidate)
+      if (info.configured !== true) {
+        warnRefOnce(candidate, 'not configured in the host credential store')
+        continue
+      }
+      try {
+        await writeActiveRef(route, candidate)
+      } catch (error) {
+        console.warn('[dsh-provider-failover] key rotate failed for ' + route + ' -> ' + candidate + ': ' + messageOf(error))
+        return undefined
+      }
+      return candidate
+    }
+    return undefined
+  }
+
+  /** 每日重置：清空失效标记 + 把仍属插件状态的条目写回首项（默认 key）。 */
+  async function keyResetDue(reason) {
+    const previous = state.keyGeneration
+    state.keyGeneration = previous + 1
+    state.keyFailed.clear()
+    const actions = []
+    for (const tier of config.tiers) {
+      for (const entry of tier.entries) {
+        if (entry.keys.length === 0) continue
+        const active = activeRefOf(entry.route)
+        if (active === undefined) continue
+        if (entry.keys.indexOf(active) < 0) {
+          // 当前引用不是本条目声明的引用：视为用户手工状态，只清标记不改写。
+          actions.push({ entry: entry.id, action: 'keep-manual', ref: active })
+          continue
+        }
+        const target = entry.keys[0]
+        if (target === active) continue
+        const info = await refConfigured(target)
+        if (info.configured !== true) {
+          actions.push({ entry: entry.id, action: 'skip-unconfigured', ref: target })
+          continue
+        }
+        try {
+          await writeActiveRef(entry.route, target)
+          actions.push({ entry: entry.id, action: 'restore', ref: target, from: active })
+        } catch (error) {
+          actions.push({ entry: entry.id, action: 'failed', ref: target, error: messageOf(error) })
+        }
+      }
+    }
+    pushLog({ at: Date.now(), kind: 'key-reset', reason, actions })
+    const summary = actions.length === 0 ? 'no entry with keys needed a rewrite' : actions.map((item) => item.entry + ':' + item.action + (item.ref !== undefined ? '(' + item.ref + ')' : '')).join(', ')
+    console.warn('[dsh-provider-failover] key reset (' + reason + '): ' + summary)
+  }
+
+  /** 状态展示用的引用描述刷新（短 TTL；只读，失败按未配置）。 */
+  async function refreshRefInfo() {
+    const now = Date.now()
+    for (const tier of config.tiers) {
+      for (const entry of tier.entries) {
+        for (const ref of entry.keys) {
+          const cached = state.refInfo.get(ref)
+          if (cached !== undefined && now - cached.at < REF_INFO_TTL_MS) continue
+          await refConfigured(ref)
+        }
+      }
+    }
+  }
 
   function stepState(turn, step) {
     const key = stepKeyOf(turn, step)
@@ -486,22 +700,15 @@ export function apply(ctx, rawConfig) {
   }
 
   /** 目标预检：路由/模型必须能被解析；失败即视为候选不合格。 */
-  async function serviceable(entry, signal, keyRoute) {
+  async function serviceable(entry, signal) {
     if (config.probeTarget !== true) return true
     const service = llm()
     if (service === undefined || typeof service.resolveModelInfo !== 'function') return true
-    const route = keyRoute ?? entry.route
     try {
-      await service.resolveModelInfo(route, entry.model, signal)
+      await service.resolveModelInfo(entry.route, entry.model, signal)
       return true
     } catch (error) {
-      if (route === entry.route) {
-        console.warn('[dsh-provider-failover] candidate skipped (unresolvable): ' + route + '/' + entry.model + ' — ' + messageOf(error))
-      } else if (state.keyWarned.has(route) !== true) {
-        // keys 候选不可解析：按路由名去重，每进程只警告一次。
-        state.keyWarned.add(route)
-        console.warn('[dsh-provider-failover] key candidate skipped (unresolvable): ' + entry.id + '@' + route + '/' + entry.model + ' — ' + messageOf(error))
-      }
+      console.warn('[dsh-provider-failover] candidate skipped (unresolvable): ' + entry.route + '/' + entry.model + ' — ' + messageOf(error))
       return false
     }
   }
@@ -619,22 +826,18 @@ export function apply(ctx, rawConfig) {
     return orderEntries(tier.entries, context)
   }
 
-  async function pickCandidate(turn, step, context, signal, excludeRoute, primaryOnly) {
+  async function pickCandidate(turn, step, context, signal, excludeRoute) {
     const record = stepState(turn, step)
     const now = Date.now()
     for (const tier of config.tiers) {
       if (tier.enabled !== true) continue
       for (const entry of await entriesInOrder(tier, context, signal, excludeRoute)) {
         if (entry.enabled !== true) continue
-        // entry-major：先穷尽条目自身路由与其 keys 候选，再进入下一条目（条目内先换 key）。
-        // primaryOnly（启动对齐专用）：只考虑条目主路由，keys 不参与，且主路由不可用（冷却/已尝试）时整条目让位——与单 key 语义一致。
-        for (const keyRoute of primaryOnly === true ? [entry.route] : [entry.route, ...entry.keys]) {
-          if (record.attempted.has(entry.id + '@' + keyRoute)) continue
-          if (cooling(keyRoute, now)) continue
-          if (compatible(entry, record.needs) !== true) continue
-          if ((await serviceable(entry, signal, keyRoute)) !== true) continue
-          return { tier, entry, keyRoute }
-        }
+        if (record.attempted.has(attemptKey(entry.id, entry.route, activeRefOf(entry.route)))) continue
+        if (cooling(entry.route, now)) continue
+        if (compatible(entry, record.needs) !== true) continue
+        if ((await serviceable(entry, signal)) !== true) continue
+        return { tier, entry }
       }
     }
     return undefined
@@ -675,10 +878,9 @@ export function apply(ctx, rawConfig) {
       const current = tierOf(config, base.provider)
       const wanted = config.tiers.find((tier) => tier.tier === config.startup.preferTier)
       if (wanted !== undefined && wanted.enabled === true && (current === undefined || current.tier !== wanted.tier)) {
-        const picked = await pickCandidate(turn, step, base.provider + '/' + base.model + ' startup', payload?.signal, undefined, true)
+        const picked = await pickCandidate(turn, step, base.provider + '/' + base.model + ' startup', payload?.signal, undefined)
         if (picked !== undefined) {
-          // 启动对齐只落条目主路由（keys 仅参与失败路径）。
-          target = { entry: picked.entry, tier: picked.tier, keyRoute: picked.entry.route, reason: 'startup-align' }
+          target = { entry: picked.entry, tier: picked.tier, reason: 'startup-align' }
           record.target = target
           pushLog({ at: Date.now(), kind: 'startup-align', from: base.provider + '/' + base.model, to: picked.entry.route + '/' + picked.entry.model, tier: picked.tier.tier })
           console.warn('[dsh-provider-failover] startup-align ' + base.provider + '/' + base.model + ' -> ' + picked.entry.route + '/' + picked.entry.model + ' tier ' + String(picked.tier.tier) + ' (preferTier ' + String(config.startup.preferTier) + ')')
@@ -687,8 +889,8 @@ export function apply(ctx, rawConfig) {
     }
 
     if (target === undefined) return base
-    // keys 轮换：本次实际下发的路由是生效目标的 keyRoute（主路由或别名）。
-    const switchedConfig = { ...base, provider: target.keyRoute ?? target.entry.route, model: target.entry.model }
+    // 路由与模型由条目决定；key 轮换不改这两者（只改该路由的 apiKeyEnv 引用）。
+    const switchedConfig = { ...base, provider: target.entry.route, model: target.entry.model }
     if (target.entry.reasoningEffort !== undefined) switchedConfig.reasoningEffort = target.entry.reasoningEffort
     return switchedConfig
   })
@@ -704,15 +906,45 @@ export function apply(ctx, rawConfig) {
     const step = payload?.step ?? 0
     const record = stepState(turn, step)
     const failedRoute = typeof payload?.provider === 'string' ? payload.provider : ''
+    const code = typeof failure?.code === 'string' ? failure.code.toUpperCase() : ''
 
     const now = Date.now()
     if (now - state.lastSwitchAt < config.minSwitchIntervalMs) return next()
     if (record.switches >= config.maxSwitchesPerTurn) return next()
 
-    // 失败路由（条目主路由或 keys 候选）进入冷却，且本步不再尝试它。
     const failedLoc = failedRoute.length > 0 ? locateRoute(config, failedRoute) : undefined
     const failedEntry = failedLoc?.entry
-    if (failedEntry !== undefined) record.attempted.add(failedEntry.id + '@' + failedRoute)
+    const activeRef = failedRoute.length > 0 ? activeRefOf(failedRoute) : undefined
+    if (failedEntry !== undefined) record.attempted.add(attemptKey(failedEntry.id, failedRoute, activeRef))
+
+    // ① 凭据类失败：先在该条目内换 key（同路由、同模型，只改 apiKeyEnv 引用）。
+    //    只有归一化到凭据类编码才走这里；消息模式兜底命中的失败按非凭据类处理。
+    if (failedEntry !== undefined && failedEntry.keys.length > 0 && KEY_ROTATION_CODES.has(code)) {
+      const rotatedTo = await rotateKey(failedEntry, failedRoute, activeRef, code, now)
+      if (rotatedTo !== undefined) {
+        record.target = { entry: failedEntry, tier: failedLoc.tier, reason: 'key:' + code }
+        record.switches += 1
+        state.lastSwitchAt = now
+        pushLog({
+          at: now,
+          kind: 'key-rotate',
+          from: failedRoute,
+          to: failedRoute + '/' + failedEntry.model,
+          key: rotatedTo,
+          fromKey: activeRef,
+          tier: failedLoc.tier.tier,
+          code,
+          trigger: decision.how,
+          turn,
+          step,
+        })
+        console.warn('[dsh-provider-failover] key rotate ' + failedEntry.id + '@' + failedRoute + ' ' + String(activeRef ?? '(unset)') + ' -> ' + rotatedTo + ' (' + decision.how + ', turn ' + String(turn) + ' step ' + String(step) + ')')
+        return { kind: 'retry' }
+      }
+      // 无可用下一把（全部失效 / 未配置 / 写入失败）→ 落到 provider 切换路径。
+    }
+
+    // ② provider 切换：失败路由进入冷却，本步不再尝试它。
     if (failedRoute.length > 0) {
       state.routeHealth.set(failedRoute, {
         coolingUntil: now + (failedEntry?.cooldownMs ?? 60000),
@@ -723,25 +955,24 @@ export function apply(ctx, rawConfig) {
     }
 
     const context = String(failure?.code ?? '') + ' ' + String(failure?.message ?? '') + (record.needs.tools ? ' tools' : '') + (record.needs.images ? ' images' : '')
-        const picked = await pickCandidate(turn, step, context, payload?.signal, failedRoute)
+    const picked = await pickCandidate(turn, step, context, payload?.signal, failedRoute)
     if (picked === undefined) return next()
 
-    record.target = { entry: picked.entry, tier: picked.tier, keyRoute: picked.keyRoute, reason: decision.how }
+    record.target = { entry: picked.entry, tier: picked.tier, reason: decision.how }
     record.switches += 1
     state.lastSwitchAt = now
     pushLog({
       at: now,
       kind: 'failover',
       from: failedRoute,
-      to: picked.keyRoute + '/' + picked.entry.model,
-      ...(picked.keyRoute !== picked.entry.route ? { key: picked.keyRoute } : {}),
+      to: picked.entry.route + '/' + picked.entry.model,
       tier: picked.tier.tier,
       code: typeof failure?.code === 'string' ? failure.code : '',
       trigger: decision.how,
       turn,
       step,
     })
-    console.warn('[dsh-provider-failover] switch ' + (failedRoute.length > 0 ? failedRoute : '(unknown)') + ' -> ' + picked.keyRoute + '/' + picked.entry.model + ' tier ' + String(picked.tier.tier) + (picked.keyRoute !== picked.entry.route ? ' key ' + picked.keyRoute : '') + ' (' + decision.how + ', turn ' + String(turn) + ' step ' + String(step) + ')')
+    console.warn('[dsh-provider-failover] switch ' + (failedRoute.length > 0 ? failedRoute : '(unknown)') + ' -> ' + picked.entry.route + '/' + picked.entry.model + ' tier ' + String(picked.tier.tier) + ' (' + decision.how + ', turn ' + String(turn) + ' step ' + String(step) + ')')
     return { kind: 'retry' }
   })
 
@@ -757,6 +988,7 @@ export function apply(ctx, rawConfig) {
         maxSwitchesPerTurn: config.maxSwitchesPerTurn,
         startupPreferTier: config.startup.preferTier,
         rankingMode: config.ranking.mode,
+        keyResetAt: config.keyResetAt,
       },
     })
     const sync = (value, source) => {
@@ -765,13 +997,39 @@ export function apply(ctx, rawConfig) {
       config.maxSwitchesPerTurn = value.maxSwitchesPerTurn
       config.startup.preferTier = value.startupPreferTier
       config.ranking.mode = value.rankingMode
-      console.log('[dsh-provider-failover] settings ' + source + ': enabled=' + String(config.enabled) + ' minSwitchIntervalMs=' + String(config.minSwitchIntervalMs) + ' maxSwitchesPerTurn=' + String(config.maxSwitchesPerTurn) + ' startup.preferTier=' + String(config.startup.preferTier) + ' ranking=' + config.ranking.mode)
+      if (parseClock(value.keyResetAt) !== undefined) config.keyResetAt = value.keyResetAt
+      else console.warn('[dsh-provider-failover] ignoring invalid keyResetAt (expected HH:MM): ' + String(value.keyResetAt))
+      console.log('[dsh-provider-failover] settings ' + source + ': enabled=' + String(config.enabled) + ' minSwitchIntervalMs=' + String(config.minSwitchIntervalMs) + ' maxSwitchesPerTurn=' + String(config.maxSwitchesPerTurn) + ' startup.preferTier=' + String(config.startup.preferTier) + ' ranking=' + config.ranking.mode + ' keyResetAt=' + config.keyResetAt)
     }
     state.settings = scope
     state.syncSettings = sync
     sync(scope.get(), 'loaded')
     scope.watch((next) => { sync(next, 'updated') })
   })
+
+  // 每日重置排程：到下一个 keyResetAt（本地时间）清失效标记并把默认 key 写回，然后重新排程。
+  // 无任何条目声明 keys 时不排程（零配置零介入）。
+  if (config.tiers.some((tier) => tier.entries.some((entry) => entry.keys.length > 0))) {
+    ctx.effect(() => {
+      let handle
+      const arm = () => {
+        const now = Date.now()
+        const due = nextResetAt(config.keyResetAt, now)
+        // setTimeout 的上限约 24.8 天；这里最多 24 小时，无需分段。
+        handle = setTimeout(() => {
+          keyResetDue('scheduled')
+            .catch((error) => console.warn('[dsh-provider-failover] key reset failed: ' + messageOf(error)))
+            .finally(arm)
+        }, Math.max(1000, due - now))
+        // 不因后台排程阻止宿主/脚本退出（宿主有 webServer 时本就长驻，此项无副作用）。
+        if (typeof handle.unref === 'function') handle.unref()
+      }
+      arm()
+      return () => {
+        if (handle !== undefined) clearTimeout(handle)
+      }
+    }, 'dsh-provider-failover: daily key reset timer')
+  }
 
   ctx.inject(['webServer'], (webCtx) => {
     const register = (path, handler) => ctx.effect(() => webCtx.webServer.register({ kind: 'exact', path: path, handler: handler }), 'dsh-provider-failover: ' + path)
@@ -798,7 +1056,8 @@ export function apply(ctx, rawConfig) {
       }
       return { registered, configurable }
     }
-    const snapshot = () => {
+    const snapshot = async () => {
+      await refreshRefInfo()
       const directory = providerDirectory()
       // 目录不可用（llm 未就绪或宿主未报告任何 provider）时不做关联判断，避免全量误标。
       const directoryKnown = directory.registered.length > 0 || directory.configurable.length > 0
@@ -810,18 +1069,24 @@ export function apply(ctx, rawConfig) {
         enabled: tier.enabled,
         entries: tier.entries.map((entry) => {
           assigned.add(entry.route)
-          for (const keyRoute of entry.keys) assigned.add(keyRoute)
+          const active = activeRefOf(entry.route)
           return {
             id: entry.id,
             route: entry.route,
             model: entry.model,
-            keys: entry.keys.map((keyRoute) => ({
-              route: keyRoute,
-              registered: directoryKnown ? registeredIds.has(keyRoute) : true,
-              cooling: cooling(keyRoute, now),
-            })),
             registered: directoryKnown ? registeredIds.has(entry.route) : true,
             cooling: cooling(entry.route, now),
+            activeRef: active,
+            keys: entry.keys.map((ref) => {
+              const info = state.refInfo.get(ref)
+              return {
+                ref,
+                active: ref === active,
+                configured: info !== undefined ? info.configured : false,
+                source: info?.source,
+                failed: refFailed(ref),
+              }
+            }),
           }
         }),
       }))
@@ -834,8 +1099,11 @@ export function apply(ctx, rawConfig) {
           maxSwitchesPerTurn: config.maxSwitchesPerTurn,
           startupPreferTier: config.startup.preferTier,
           rankingMode: config.ranking.mode,
+          keyResetAt: config.keyResetAt,
         },
         writable: state.settings !== undefined,
+        keyResetAt: config.keyResetAt,
+        nextKeyResetAt: nextResetAt(config.keyResetAt, now),
         tiers,
         providers: directoryKnown ? {
           registered: directory.registered,
@@ -849,7 +1117,50 @@ export function apply(ctx, rawConfig) {
     }
     register(ROUTE_BASE + '/status', async (req, res) => {
       if (isLocalRequest(req) !== true) return sendJson(res, 403, { ok: false, error: 'local requests only' })
-      sendJson(res, 200, snapshot())
+      sendJson(res, 200, await snapshot())
+    })
+    // 手工改状态：{entry, ref} 置位某引用；{entry} 重置该条目到默认 key；{} 重置全部。
+    register(ROUTE_BASE + '/keys', async (req, res) => {
+      if (isLocalRequest(req) !== true) return sendJson(res, 403, { ok: false, error: 'local requests only' })
+      if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only' })
+      const body = await readJsonBody(req)
+      const wanted = typeof body.entry === 'string' ? body.entry : undefined
+      const targets = []
+      for (const tier of config.tiers) {
+        for (const entry of tier.entries) {
+          if (entry.keys.length === 0) continue
+          if (wanted !== undefined && entry.id !== wanted) continue
+          targets.push(entry)
+        }
+      }
+      if (targets.length === 0) return sendJson(res, 404, { ok: false, error: 'no entry with keys matches the request' })
+      // 手工操作即「状态重来」：清空本周期失效标记。
+      state.keyGeneration += 1
+      state.keyFailed.clear()
+      const results = []
+      for (const entry of targets) {
+        const ref = typeof body.ref === 'string' && body.ref.length > 0 ? body.ref : entry.keys[0]
+        if (entry.keys.indexOf(ref) < 0) {
+          results.push({ entry: entry.id, ok: false, ref, error: 'ref is not declared in entry.keys' })
+          continue
+        }
+        const info = await refConfigured(ref)
+        if (info.configured !== true) {
+          results.push({ entry: entry.id, ok: false, ref, error: 'ref is not configured in the host credential store' })
+          continue
+        }
+        try {
+          await writeActiveRef(entry.route, ref)
+          results.push({ entry: entry.id, ok: true, ref, route: entry.route })
+        } catch (error) {
+          results.push({ entry: entry.id, ok: false, ref, error: messageOf(error) })
+        }
+      }
+      for (const item of results) {
+        if (item.ok !== true) continue
+        pushLog({ at: Date.now(), kind: 'key-manual', from: item.route, to: item.route, key: item.ref, tier: 0, code: 'MANUAL', trigger: 'manual', turn: 0, step: 0 })
+      }
+      sendJson(res, 200, { ok: results.some((item) => item.ok === true), results, status: await snapshot() })
     })
     register(ROUTE_BASE + '/config', async (req, res) => {
       if (isLocalRequest(req) !== true) return sendJson(res, 403, { ok: false, error: 'local requests only' })
@@ -857,10 +1168,11 @@ export function apply(ctx, rawConfig) {
       if (state.settings === undefined) return sendJson(res, 503, { ok: false, error: 'settings service is not composed; edit the profile patch instead' })
       const body = await readJsonBody(req)
       const patch = {}
-      for (const key of ['enabled', 'minSwitchIntervalMs', 'maxSwitchesPerTurn', 'startupPreferTier', 'rankingMode']) {
+      for (const key of ['enabled', 'minSwitchIntervalMs', 'maxSwitchesPerTurn', 'startupPreferTier', 'rankingMode', 'keyResetAt']) {
         if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
       }
       if (Object.keys(patch).length === 0) return sendJson(res, 400, { ok: false, error: 'no editable field in request' })
+      if (patch.keyResetAt !== undefined && parseClock(patch.keyResetAt) === undefined) return sendJson(res, 400, { ok: false, error: 'keyResetAt must be HH:MM in 24-hour local time' })
       try {
         await state.settings.update(patch)
       } catch (error) {
@@ -874,10 +1186,11 @@ export function apply(ctx, rawConfig) {
           maxSwitchesPerTurn: config.maxSwitchesPerTurn,
           startupPreferTier: config.startup.preferTier,
           rankingMode: config.ranking.mode,
+          keyResetAt: config.keyResetAt,
           ...patch,
         }, 'updated')
       }
-      sendJson(res, 200, snapshot())
+      sendJson(res, 200, await snapshot())
     })
   })
 
@@ -899,4 +1212,4 @@ export function normalize(raw) {
 export { masked }
 
 /** 内部纯函数，供冒烟测试断言（不属于对外契约）。 */
-export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries }
+export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef }

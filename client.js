@@ -36,8 +36,9 @@ window.__ModuleLoader__.load({
       ".pf-card{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:8px}",
       ".pf-row{display:flex;align-items:center;justify-content:space-between;gap:12px}",
       ".pf-row>label{flex:0 0 auto;color:var(--dsw-alias-label-secondary)}",
-      ".pf-row>input[type=number],.pf-row>select{width:168px;padding:4px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}",
+      ".pf-row>input[type=number],.pf-row>input[type=text],.pf-row>select{width:168px;padding:4px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}",
       ".pf-hint{color:var(--dsw-alias-label-secondary);font-size:12px}",
+      ".pf-warn{color:var(--dsw-alias-state-error-primary);font-size:12px}",
       ".pf-actions{display:flex;align-items:center;gap:10px}",
       ".pf-btn{padding:5px 12px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);cursor:pointer}",
       ".pf-btn[disabled]{opacity:.5;cursor:default}",
@@ -68,6 +69,12 @@ window.__ModuleLoader__.load({
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(patch),
+      });
+    const resetKeys = (body) =>
+      apiFetch(ROUTE + "/keys", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body === undefined ? {} : body),
       });
 
     function describeSwitch(entry) {
@@ -119,6 +126,7 @@ window.__ModuleLoader__.load({
       if (String(form.maxSwitchesPerTurn) !== String(status.editable.maxSwitchesPerTurn)) patch.maxSwitchesPerTurn = Number(form.maxSwitchesPerTurn);
       if (String(form.startupPreferTier) !== String(status.editable.startupPreferTier)) patch.startupPreferTier = Number(form.startupPreferTier);
       if (form.rankingMode !== status.editable.rankingMode) patch.rankingMode = form.rankingMode;
+      if (String(form.keyResetAt) !== String(status.editable.keyResetAt)) patch.keyResetAt = String(form.keyResetAt);
       const dirty = Object.keys(patch).length > 0;
 
       const save = async () => {
@@ -143,10 +151,45 @@ window.__ModuleLoader__.load({
           h("input", { id: "pf-" + key, type: "number", min: 0, step: 1, value: form[key], onChange: set(key) }),
           hint === undefined ? null : h("span", { className: "pf-hint" }, hint));
 
+      const resetAllKeys = async () => {
+        setBusy(true);
+        try {
+          const data = await resetKeys({});
+          setStatus(data.status);
+          setForm(data.status.editable);
+          setError("");
+          setSaved("已重置全部 key 状态");
+        } catch (err) {
+          setError(err.message);
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      /** 条目内 key 引用的一行说明：只显示引用名与状态，永不显示值。 */
+      const keyLine = (entry) =>
+        entry.keys.length === 0
+          ? null
+          : h("div", { className: "pf-hint" },
+              "key：" + entry.keys.map((key) =>
+                key.ref
+                + (key.active === true ? "（生效）" : "")
+                + (key.failed === true ? "［本周期失效］" : "")
+                + (key.configured !== true ? "［未配置］" : "")
+                + (key.source === "env" ? "［环境·只读］" : "")).join(" → "));
+
+      const resetAtRow =
+        h("div", { className: "pf-row" },
+          h("label", { htmlFor: "pf-keyResetAt" }, "key 每日重置时刻"),
+          h("input", { id: "pf-keyResetAt", type: "text", placeholder: "06:00", value: form.keyResetAt, onChange: set("keyResetAt") }),
+          h("span", { className: "pf-hint" }, status.nextKeyResetAt === undefined
+            ? "本地时间 HH:MM；到点清空失效标记并把默认 key 写回"
+            : "本地时间 HH:MM；下次：" + new Date(status.nextKeyResetAt).toLocaleString()));
+
       return h("div", { className: "pf-root" },
         h("div", null,
           h("div", { className: "pf-title" }, "Provider 故障转移"),
-          h("div", { className: "pf-sub" }, "终端失败（额度/凭据/过载/限流等）后按档位顺序切换路由；设置改动即时生效，写入 settings.yaml 的 provider-failover 段。")),
+          h("div", { className: "pf-sub" }, "终端失败（额度/凭据/过载/限流等）后按档位顺序切换路由；凭据类失败先在条目内轮换 key（改写该路由的 apiKeyEnv 引用，路由与模型不变）。设置改动即时生效，写入 settings.yaml 的 provider-failover 段。")),
 
         h("div", { className: "pf-card" },
           h("div", { className: "pf-row" },
@@ -159,11 +202,13 @@ window.__ModuleLoader__.load({
           h("div", { className: "pf-row" },
             h("label", { htmlFor: "pf-rankingMode" }, "档内排序模式"),
             h("select", { id: "pf-rankingMode", value: form.rankingMode, onChange: set("rankingMode") },
-              RANKING_MODES.map((mode) => h("option", { key: mode.value, value: mode.value }, mode.label))))),
+              RANKING_MODES.map((mode) => h("option", { key: mode.value, value: mode.value }, mode.label)))),
+          resetAtRow),
 
         h("div", { className: "pf-actions" },
           h("button", { className: "pf-btn", disabled: busy === true || dirty !== true, onClick: save }, busy === true ? "保存中…" : "保存"),
           h("button", { className: "pf-btn", disabled: busy === true, onClick: load }, "重新读取"),
+          h("button", { className: "pf-btn", disabled: busy === true, onClick: resetAllKeys }, "重置 key 状态"),
           saved.length > 0 ? h("span", { className: "pf-ok" }, saved) : null,
           error.length > 0 ? h("span", { className: "pf-err" }, error) : null,
           status.writable !== true ? h("span", { className: "pf-err" }, "settings 服务未装载，无法在此保存") : null),
@@ -176,7 +221,8 @@ window.__ModuleLoader__.load({
               tier.entries.map((entry, index) => h("span", { key: entry.id },
                 index > 0 ? "、" : "",
                 String(entry.id) + " → " + String(entry.route) + "/" + String(entry.model),
-                entry.registered !== true ? h("span", { className: "pf-err" }, "［宿主未注册］") : null,
+                entry.registered !== true ? h("span", { className: "pf-warn" }, "［宿主未注册］") : null,
+                keyLine(entry),
                 entry.cooling === true ? h("span", { className: "pf-hint" }, "［冷却中］") : null))))) ),
 
         h("div", { className: "pf-card" },

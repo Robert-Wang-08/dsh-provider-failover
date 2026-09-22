@@ -1,8 +1,8 @@
 # dsh-provider-failover
 
-> 包名保持 `dsh-deepseek-keypool`（便于 `dsh plugin` 覆盖安装），能力：**分档 Provider 故障转移 + 条目内 key 轮换**。
+> 包名保持 `dsh-deepseek-keypool`（便于 `dsh plugin` 覆盖安装），能力：**分档 Provider 故障转移 + 单路由多 key（凭据引用轮换）**。
 
-DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切换失败**结束时，按配置表的**档位顺序**把同一个 step 的下一次尝试换成另一条 harness 路由（provider），并可一并下发该条目声明的模型与推理层级；条目还可声明多把 key（兄弟路由别名）实现**条目内 key 轮换**。
+DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切换失败**结束时，按配置表的**档位顺序**把同一个 step 的下一次尝试换成另一条 harness 路由（provider），并可一并下发该条目声明的模型与推理层级；条目还可用 `keys` 声明同一条路由的多把 key（**改写该路由的 `apiKeyEnv` 引用名**，不新增路由），并按每日重置时刻恢复默认 key。
 
 ## 为什么能生效（已实测）
 
@@ -56,50 +56,47 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
           - { id: fallback, route: my-provider-2, model: my-model-2, cooldownMs: 60000 }
 ```
 
-字段：顶层 `enabled` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `probeTarget` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**；校验失败时插件完全不介入并在日志说明原因。
+字段：顶层 `enabled` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
 
-## 条目内 key 轮换（opt-in）
+## 单路由多 key（`keys` = 同一路由的凭据引用名）
 
-条目可声明 `keys: string[]`（**兄弟路由 key**，非凭据值），启用「单个 provider 多把 key」的 key 池：失败时先在条目内换下一把 key，条目内耗尽再换条目/降档。
+条目可声明 `keys: [ref1, ref2, …]`（**凭据引用名**，POSIX 标识符；`keys[0]` 是默认 key）启用轮换。**路由与模型不变**——插件不会多出任何 provider，模型选择列表里也不会出现第二条。
 
-- 每把 key 每 `(turn, step)` 至多尝试一次，计入单 turn 切换上限与最小切换间隔；失败 key 按条目 `cooldownMs` 冷却（自动关闭、到期恢复），也可随时从 `keys[]` 移除。
-- 未注册/不可解析的 key 候选被预检跳过并警告（每进程每路由一次，日志形如 `key candidate skipped (unresolvable): …`）。
-- `switchLog` 与 status 接口带 key 维度（只记路由别名，无任何凭据值）。
-- **每个 key 只用于单个 provider**：同一路由 key 不得出现在多个条目的 `route`/`keys`（校验拒绝）；两条路由不得指向同一凭据引用。
-- **oauth / 非 key-api 凭据的 provider 默认不可用**：不支持 `keys[]`，插件也不会为其创建或桥接凭据。
-- 凭据纪律不变：插件不 resolve、不缓存、不写任何 key 值；每把 key 的解析由适配器按该路由自身 `apiKeyEnv` 完成（环境 → `.credentials.yaml` → `.env`）。
+机制：宿主 pi-ai 适配器**每次请求**按路由 profile 的 `apiKeyEnv` 解析凭据（`resolveApiKey` → `credentials.resolve(ref)`，profile 按 settings 快照记忆化）。因此插件只需把该路由的 `apiKeyEnv` 从一个引用名改写为另一个，下一次尝试就换了一把 key。
 
-配置示例（profile patch；条目内轮换序列 = `my-provider` → `my-provider-k2`）：
+规则：
+
+- **只写引用名，永不写值**：插件经 `ctx.settings.mutate('llm-pi-ai', …)` 改写 `providers.<route>.apiKeyEnv`，不调用凭据服务的任何写接口，也不读取/缓存/打印凭据值。
+- **失败分工**：凭据类编码（`QUOTA` / `AUTH` / `INVALID_CREDENTIAL` / `MISSING_CREDENTIAL`）→ 条目内换 key；`SERVER` / `RATE_LIMIT` / `NO_ADAPTER` 与消息模式兜底 → 走 provider 切换（换 key 治不了过载，也不因一句话就消耗一把 key）。
+- **候选预检**：轮换前用 `credentials.describe(ref)` 确认目标引用已配置；未配置则跳过并每进程警告一次（`key reference skipped: …`）。全部候选不可用时交回宿主默认失败路径（`settings` 只读、命名空间未注册、写入抛错同样如此）。
+- **有界**：记账键是 `entryId@route#ref`，同一引用每 `(turn, step)` 至多一次；轮换计入单 turn 上限与最小切换间隔；key 类失败**不给路由冷却**（否则换 key 后仍被冷却挡住）。
+- **每个引用只服务一个 provider**：同一引用名不得出现在多个条目（校验拒绝）。
+- 无 `keys` 或 `keys: []` 的条目行为与单 key 完全一致。
+
+### 每日重置与手工状态
+
+- 顶层 `keyResetAt`（`HH:MM` 本地时间，默认 `06:00`）：到点清空全部 key 失效标记，并把「当前引用属于 `keys` 且不是首项」的条目写回 `keys[0]`，全部 key 恢复可重试。
+- **手工状态优先**：活动引用每次实时读 settings（不缓存），你直接改 `settings.yaml` 的 `apiKeyEnv` 立即生效；当前引用**不在** `keys` 内时视为手工状态，重置只清标记、不改写它。
+- 手工干预接口：`POST /provider-failover/keys`，body `{entry, ref}` 置位某引用、`{entry}` 重置该条目到 `keys[0]`、`{}` 重置全部（未声明或未配置的引用被拒绝）。设置页也有「重置 key 状态」按钮。
+
+配置示例（profile patch；`keys` 是引用名，不是路由名）：
 
 ```yaml
 - id: dsh-deepseek-keypool
   config:
+    keyResetAt: '06:00'
     tiers:
       - tier: 1
         enabled: true
         entries:
-          - { id: first, route: my-provider, model: my-model, keys: [my-provider-k2], cooldownMs: 60000 }
+          - { id: first, route: my-provider, model: my-model, keys: [MY_PROVIDER_API_KEY, MY_PROVIDER_API_KEY_2], cooldownMs: 60000 }
 ```
 
-settings.yaml 侧为每把额外 key 建一条**同 baseURL** 的兄弟路由（名称以实际为准）：
-
-```yaml
-llm-pi-ai:
-  providers:
-    my-provider-k2:
-      displayName: my-provider-k2
-      apiKeyEnv: MY_PROVIDER_API_KEY_2   # 第二把 key 的凭据引用（由 dsh 自身机制落盘）
-      api: openai-completions
-      baseURL: http://<与 my-provider 相同>/v1
-      models:                            # 与主路由声明一致
-        - id: my-model
-```
-
-实测（本地 mock，未消耗真实额度）：同 baseURL 两把 key 一坏一好，坏 key 402 后条目内换 key，线上请求的 Authorization 从坏 key 变为好 key 并成功回答；不可解析 key 候选被跳过并警告；`.credentials.yaml` 全程零写入。
+引用名对应的密钥值由你写入宿主凭据库（`.credentials.yaml` 的 `refs`，或环境变量 / 设置页的 Models 页），插件不代写。实测（本地 mock，未消耗真实额度）：路由 `probe-key-bad` 首把引用在 402 后，未配置的备选被跳过，`apiKeyEnv` 被改写为第二把引用，mock 实收 `Authorization` 从 `sk-probe-ba…` 变为 `sk-probe-go…` 并成功回答，`settings.yaml` 同步落盘。
 
 ## 启动对齐
 
-`startup.preferTier: 1` 表示：**当前路由已属于第一档就不改写**；不属于时才对齐到该档排序最前的可用条目；目标档不可用时沿档位顺序下探；失败不阻断请求。设为 `0` 则完全跟随宿主默认路由。启动对齐只落条目主路由（`keys` 仅参与失败路径）。
+`startup.preferTier: 1` 表示：**当前路由已属于第一档就不改写**；不属于时才对齐到该档排序最前的可用条目；目标档不可用时沿档位顺序下探；失败不阻断请求。设为 `0` 则完全跟随宿主默认路由。启动对齐只决定 provider/model，不触碰 key 引用。
 
 ## 档内排序
 
@@ -127,9 +124,9 @@ llm-pi-ai:
 
 ## 凭据策略（重要）
 
-- **插件不持有、不存储、不写入任何密钥**；不调用凭据服务的写入接口。
+- **插件不持有、不存储、不读取、不写入任何密钥值**；不调用凭据服务的写入接口。
 - 凭据由**各路由既有的 `apiKeyEnv`** 从宿主凭据源解析：继承的进程环境（只读、优先）→ `$DSH_HOME/.credentials.yaml`（可写）→ `.env` 兜底。
-- 条目内 key 轮换同样零写入：每把 key 都是独立路由的 `apiKeyEnv` 引用，见上文「条目内 key 轮换」。
+- 单路由多 key 的唯一写动作是**改写引用名**（`llm-pi-ai.providers.<route>.apiKeyEnv`，经 settings 服务的路径编辑落盘）；轮换前用 `credentials.describe` 确认目标引用已配置，未配置不改写。见上文「单路由多 key」。
 - `$DSH_HOME/.credentials.yaml` 含明文密钥，**必须被 `.gitignore` 忽略**。
 
 ## 边界与不做什么
@@ -156,18 +153,21 @@ dsh plugin --profile <profile> remove dsh-deepseek-keypool
 宿主日志中可见：
 
 - `[dsh-provider-failover] ready: …` 启动时的档位/条目摘要与 `startup.preferTier`、`ranking` 模式；
-- `switch <from> -> <to> tier N [key <alias>] (<trigger>)` 每次实际转移（trigger 为 `code:XXX` 或 `pattern:xxx`；条目内换 key 时带 `key` 维度）；
-- `candidate skipped (unresolvable): …` / `key candidate skipped (unresolvable): …` 预检跳过的候选；
+- `switch <from> -> <to> tier N (<trigger>)` 每次实际转移（trigger 为 `code:XXX` 或 `pattern:xxx`）；
+- `key rotate <entry>@<route> <旧引用> -> <新引用> (<trigger>)` 条目内换 key（只含引用名，无凭据值）；
+- `key reset (scheduled|manual): …` 每日重置/手工重置的动作摘要；
+- `candidate skipped (unresolvable): …` / `key reference skipped: <ref> — …` 预检跳过的候选；
 - `llm ranking: a > b` 运行期排序结果，或 `llm ranking unavailable, falling back…`。
 
 ## 设置页与状态接口
 
-dsh 设置页新增「Provider 故障转移」小节：**总开关** + 常用参数（最小切换间隔、单 turn 上限、启动对齐档位、档内排序模式），保存后**即时生效，无需重启**。
+dsh 设置页新增「Provider 故障转移」小节：**总开关** + 常用参数（最小切换间隔、单 turn 上限、启动对齐档位、档内排序模式、key 每日重置时刻），保存后**即时生效，无需重启**；另有「重置 key 状态」按钮。
 
 - 持久化：写宿主 settings 命名空间 `provider-failover`，用户层落 `$DSH_HOME/settings.yaml` 的 `provider-failover:` 段；**用户层优先于 profile patch 的对应字段**（这正是开关语义；没被用户改过的项仍以 patch 为准）。
 - 接口（仅本地回环）：
-  - `GET /provider-failover/status`：生效值 + 档位表（含每条目 `keys` 候选的注册/冷却标注）+ 最近转移（10 条）+ 冷却路由。
-  - `POST /provider-failover/config`：字段白名单 `{enabled, minSwitchIntervalMs, maxSwitchesPerTurn, startupPreferTier, rankingMode}`，经 settings 服务落盘。
+  - `GET /provider-failover/status`：生效值 + 档位表（含每条目 key 引用的 `ref/active/configured/source/failed` 标注）+ `nextKeyResetAt` + 最近 10 条转移/换 key 记录 + 冷却路由。
+  - `POST /provider-failover/config`：字段白名单 `{enabled, minSwitchIntervalMs, maxSwitchesPerTurn, startupPreferTier, rankingMode, keyResetAt}`，经 settings 服务落盘。
+  - `POST /provider-failover/keys`：`{entry, ref}` 手工置位、`{entry}` 重置该条目、`{}` 重置全部（未声明或未配置的引用被拒绝）。
 - 档位表与宿主 provider 目录**实时关联**：条目显示 `id → route/model` 并标注「宿主未注册／冷却中」；同时列出未纳入任何档位的 provider 与「档位引用但未注册」的警告。目录不可用（llm 未就绪）时不做关联判断，不误标。
 - 客户端半仅注册这一个设置小节；路由决策完全在 Host 半。
 
@@ -176,7 +176,7 @@ dsh 设置页新增「Provider 故障转移」小节：**总开关** + 常用参
 ```powershell
 pnpm install
 node --check index.js
-node probe/smoke-config.mjs      # 配置归一化与导出形状冒烟（48 项断言）
+node probe/smoke-config.mjs      # 配置归一化、key 轮换与接口冒烟（不依赖 dsh 运行时）
 node probe/mock-llm.mjs 8799     # 本地 mock LLM 端点（配合 probe/dsh-failover-probe 做运行时验证）
 ```
 

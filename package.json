@@ -1,7 +1,7 @@
 {
   "name": "dsh-deepseek-keypool",
-  "version": "2.2.0",
-  "description": "DSH Provider 分档故障转移 —— 模型请求以额度/凭据/过载/限流等可切换失败结束时，按配置表档位顺序切换 harness 路由（provider），并可下发该条目声明的模型与推理层级；条目可显式声明多把 key（兄弟路由别名）实现条目内轮换。Host 半负责转移与设置命名空间，客户端半只提供「设置 → 故障转移」小节；不持有任何凭据。",
+  "version": "3.0.0",
+  "description": "DSH Provider 分档故障转移 —— 模型请求以额度/凭据/过载/限流等可切换失败结束时，按配置表档位顺序切换 harness 路由（provider）；凭据类失败先在条目内轮换 key（改写该路由的 apiKeyEnv 引用名，路由与模型不变，模型列表不会多出条目），并按每日重置时刻恢复默认 key。Host 半负责转移与设置命名空间，客户端半只提供「设置 → 故障转移」小节；不持有也不读写任何凭据值。",
   "type": "module",
   "main": "index.js",
   "exports": {
