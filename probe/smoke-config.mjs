@@ -116,7 +116,7 @@ const makeCtx = (providers, options) => {
   const providerSection = { providers: opts.providerSection ?? {} }
   const refInfo = opts.refInfo ?? {}
   const settingsScope = {
-    get: () => ({ enabled: true, minSwitchIntervalMs: 1000, maxSwitchesPerTurn: 6, startupPreferTier: 1, rankingMode: 'keywords', keyResetAt: '06:00' }),
+    get: () => ({ enabled: true, minSwitchIntervalMs: 1000, maxSwitchesPerTurn: 6, startupPreferTier: 1, rankingMode: 'keywords', keyResetAt: '06:00', keysByEntry: opts.keysByEntry ?? {} }),
     watch: () => () => {},
     update: async (patch) => { updated.push(patch) },
   }
@@ -196,6 +196,130 @@ await env8.routes['/provider-failover/keys'](badReq, res8)
 check('手工置位拒绝未声明的引用', res8.body.ok === false && env8.mutations.length === 0, JSON.stringify(res8.body))
 
 for (const env of [env4, env5, env6, env7, env8]) for (const dispose of env.disposers) dispose()
+
+console.log('apply 假 ctx（keysByEntry 界面配置与状态）:')
+const TWO_ENTRIES = { tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm' }, { id: 'codex', route: 'r2', model: 'm' }] }] }
+const statusOf = async (env) => {
+  const res = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
+  await env.routes['/provider-failover/status']({ socket: { remoteAddress: '127.0.0.1' } }, res)
+  return res
+}
+const postConfig = async (env, body) => {
+  const req = { method: 'POST', socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify(body)) } }
+  const res = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
+  await env.routes['/provider-failover/config'](req, res)
+  return res
+}
+
+// a) 设置层 keys 覆盖 patch（patch 未声明 keys），并按需启用每日重置排程
+const env9 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true, source: 'file' }, K9: { configured: true, source: 'file' } }, keysByEntry: { ais: ['K1', 'K9'] } })
+apply(env9.ctx, { tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm' }] }] })
+const res9 = await statusOf(env9)
+check('设置层 keys 覆盖 patch keys', res9.body.tiers[0].entries[0].keys.length === 2 && res9.body.tiers[0].entries[0].keysSource === 'settings', JSON.stringify(res9.body.tiers[0].entries[0]))
+check('patch 无 keys 时默认不排程、有覆盖时按需排程', env9.disposers.length === 5, String(env9.disposers.length))
+const noKeys = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true } } })
+apply(noKeys.ctx, { tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm' }] }] })
+check('无任何 key 引用时不排程每日重置', noKeys.disposers.length === 4, String(noKeys.disposers.length))
+
+// b) 轮换使用设置层 keys
+const rotated9 = await env9.handlers['agent/request-error'](failure, async () => 'NEXT')
+check('轮换按设置层 keys 前进（K1 → K9）', rotated9?.kind === 'retry' && env9.mutations[0]?.ops?.[0]?.value === 'K9', JSON.stringify(env9.mutations))
+
+// c) 失效状态字段（时间 / 编码 / 消息）
+const res10 = await statusOf(env9)
+const failedKey = res10.body.tiers[0].entries[0].keys.find((key) => key.ref === 'K1')
+check('失效 key 带时间与错误', failedKey?.failed === true && typeof failedKey.failedAt === 'number' && failedKey.failedCode === 'AUTH' && String(failedKey.failedMessage).includes('invalid api key'), JSON.stringify(failedKey))
+
+// d) /config 校验
+const env11 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' }, r2: { apiKeyEnv: 'K2' } }, refInfo: { K1: { configured: true }, K2: { configured: true }, K3: { configured: true } } })
+apply(env11.ctx, TWO_ENTRIES)
+check('拒绝条目内重复引用', (await postConfig(env11, { keysByEntry: { ais: ['K1', 'K1'] } })).body.error?.includes('repeats') === true)
+check('拒绝非法引用名', (await postConfig(env11, { keysByEntry: { ais: ['not a ref'] } })).body.error?.includes('invalid credential reference name') === true)
+check('拒绝未知条目 id', (await postConfig(env11, { keysByEntry: { nope: ['K1'] } })).body.error?.includes('unknown entry id') === true)
+check('拒绝跨条目复用引用', (await postConfig(env11, { keysByEntry: { ais: ['K3'], codex: ['K3'] } })).body.error?.includes('used by both entry') === true)
+check('非法写入不改动现有配置', env11.updated.length === 0 && env11.mutations.length === 0, JSON.stringify(env11.updated))
+const okConfig = await postConfig(env11, { keysByEntry: { ais: ['K1', 'K3'] } })
+check('合法写入被接受并落盘', okConfig.status === 200 && JSON.stringify(env11.updated.at(-1)) === JSON.stringify({ keysByEntry: { ais: ['K1', 'K3'] } }), JSON.stringify(env11.updated.at(-1)))
+check('写入后状态快照反映新引用', okConfig.body.tiers[0].entries[0].keys.length === 2 && okConfig.body.tiers[0].entries[0].keys[1].ref === 'K3', JSON.stringify(okConfig.body.tiers[0].entries[0].keys))
+check('快照暴露可编辑的 keysByEntry', JSON.stringify(okConfig.body.editable.keysByEntry) === JSON.stringify({ ais: ['K1', 'K3'] }), JSON.stringify(okConfig.body.editable.keysByEntry))
+for (const env of [env9, noKeys, env11]) for (const dispose of env.disposers) dispose()
+
+console.log('测试切换（指令 + /test 路由）:')
+const TEST_TIERS = [
+  { tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm1', enabled: true }, { id: 'relay', route: 'r2', model: 'm2', enabled: true }] },
+  { tier: 2, enabled: true, entries: [{ id: 'kimi', route: 'r3', model: 'm3', enabled: true }] },
+  { tier: 3, enabled: false, entries: [{ id: 'off', route: 'r4', model: 'm4', enabled: true }] },
+]
+check('resolveTestTarget 空参数 = 当前条目之后的下一条', __test.resolveTestTarget(TEST_TIERS, '', 'r1').entry.id === 'relay')
+check('resolveTestTarget 末尾回环', __test.resolveTestTarget(TEST_TIERS, '', 'r3').entry.id === 'ais')
+check('resolveTestTarget tier:N', __test.resolveTestTarget(TEST_TIERS, 'tier:2').entry.id === 'kimi')
+check('resolveTestTarget 条目 id', __test.resolveTestTarget(TEST_TIERS, 'relay').entry.id === 'relay')
+check('resolveTestTarget 未知目标返回 undefined', __test.resolveTestTarget(TEST_TIERS, 'nope') === undefined)
+check('resolveTestTarget 跳过未启用档位', __test.resolveTestTarget(TEST_TIERS, 'tier:3') === undefined)
+check('resolveTestTarget 无匹配当前 provider 时从首项开始', __test.resolveTestTarget(TEST_TIERS, '', 'unknown').entry.id === 'ais')
+
+// 最小同构 ctx：只挂测试切换需要的能力（settings / webServer / commands / sessionController）
+const makeSwitchEnv = (controller, patch) => {
+  const routes = {}
+  const disposers = []
+  const handlers = {}
+  const logs = []
+  const ctx = {
+    logger: { warn: () => {} },
+    effect: (fn) => { const d = fn(); if (typeof d === 'function') disposers.push(d); return () => {} },
+    on: (event, fn) => { handlers[event] = fn },
+    get: (n) => n === 'llm' ? { listProviders: () => [], listConfigurableProviders: () => [] } : n === 'sessionController' ? controller : undefined,
+    inject: (deps, cb) => {
+      if (deps.includes('settings')) cb({ settings: { register: () => ({ get: () => ({ enabled: true, minSwitchIntervalMs: 1000, maxSwitchesPerTurn: 6, startupPreferTier: 1, rankingMode: 'keywords', keyResetAt: '06:00', keysByEntry: {} }), watch: () => () => {}, update: async () => {} }) } })
+      if (deps.includes('webServer')) cb({ webServer: { register: (r) => { routes[r.path] = r.handler; return () => {} } } })
+      if (deps.includes('commands')) cb({ commands: { register: (def) => { logs.push(def); return () => {} } } })
+    },
+  }
+  apply(ctx, patch)
+  return { routes, disposers, handlers, registered: logs }
+}
+const postTest = async (env, body) => {
+  const req = { method: 'POST', socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify(body)) } }
+  const res = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
+  await env.routes['/provider-failover/test'](req, res)
+  return res
+}
+const SWITCH_PATCH = { startup: { preferTier: 1 }, tiers: TEST_TIERS }
+
+const selections = []
+const controllerStub = { selectModel: async (request) => { selections.push(request); return { selected: { provider: request.provider, model: request.model } } } }
+const env12 = makeSwitchEnv(controllerStub, SWITCH_PATCH)
+check('注册 /test 路由与 failover-test 指令', env12.routes['/provider-failover/test'] !== undefined && env12.registered.some((def) => def.name === 'failover-test') === true)
+const res12 = await postTest(env12, { sessionId: 's1', entry: 'relay' })
+check('/test 切换会话模型', res12.status === 200 && res12.body.ok === true && selections.at(-1).provider === 'r2' && selections.at(-1).model === 'm2', JSON.stringify(res12.body.pin))
+check('/test 记录 pin 与测试目标', res12.body.pin.entryId === 'relay' && res12.body.status.pins.length === 1 && res12.body.status.testTargets.length === 3, JSON.stringify(res12.body.status.pins))
+check('/test 无会话时报错', (await postTest(env12, { entry: 'relay' })).status === 400)
+check('/test 未知目标报错', (await postTest(env12, { sessionId: 's1', entry: 'nope' })).status === 400)
+check('/test clear 解除 pin', (await postTest(env12, { sessionId: 's1', clear: true })).body.cleared === true)
+
+// pin 短路 agent/request（跳过启动对齐）
+const env13 = makeSwitchEnv(controllerStub, SWITCH_PATCH)
+await postTest(env13, { sessionId: 's2', entry: 'relay' })
+const agentStub = { session: { id: 's2', requestHeader: () => undefined } }
+const pinned = await env13.handlers['agent/request']({ agent: agentStub, turn: 1, step: 1 }, async () => ({ provider: 'r1', model: 'm1' }))
+check('pin 生效时 agent/request 下发 pin 目标', pinned.provider === 'r2' && pinned.model === 'm2', JSON.stringify(pinned))
+const otherSession = await env13.handlers['agent/request']({ agent: { session: { id: 's3', requestHeader: () => undefined } }, turn: 1, step: 1 }, async () => ({ provider: 'r1', model: 'm1' }))
+check('pin 只影响被 pin 的会话', otherSession.provider === 'r1' && otherSession.model === 'm1', JSON.stringify(otherSession))
+
+// 指令路径（含 clear 与未知目标）
+const env14 = makeSwitchEnv(controllerStub, SWITCH_PATCH)
+const def = env14.registered.find((item) => item.name === 'failover-test')
+const cmdAgent = { session: { id: 's4', requestHeader: () => ({ config: { provider: 'r1', model: 'm1' } }) } }
+const cmdResult = await def.handler({ agent: cmdAgent, rawInput: ' tier:2 ' })
+check('指令 tier:N 切换并返回成功文本', cmdResult.kind === 'success' && cmdResult.text.includes('r3/m3'), String(cmdResult.text))
+check('指令未知目标返回错误', (await def.handler({ agent: cmdAgent, rawInput: 'nope' })).kind === 'error')
+check('指令 clear 解除 pin', (await def.handler({ agent: cmdAgent, rawInput: 'clear' })).kind === 'success' && (await postTest(env14, { sessionId: 's4' })).body.ok === true)
+
+// sessionController 未组合时不静默
+const env15 = makeSwitchEnv(undefined, SWITCH_PATCH)
+const noController = await postTest(env15, { sessionId: 's5', entry: 'relay' })
+check('sessionController 未组合时报错而非静默', noController.status === 400 && String(noController.body.error).includes('session controller'), JSON.stringify(noController.body))
+for (const env of [env12, env13, env14, env15]) for (const dispose of env.disposers) dispose()
 
 console.log(failures.length === 0 ? '\nALL PASSED' : '\nFAILURES: ' + failures.length)
 process.exitCode = failures.length === 0 ? 0 : 1

@@ -94,6 +94,20 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 
 引用名对应的密钥值由你写入宿主凭据库（`.credentials.yaml` 的 `refs`，或环境变量 / 设置页的 Models 页），插件不代写。实测（本地 mock，未消耗真实额度）：路由 `probe-key-bad` 首把引用在 402 后，未配置的备选被跳过，`apiKeyEnv` 被改写为第二把引用，mock 实收 `Authorization` 从 `sk-probe-ba…` 变为 `sk-probe-go…` 并成功回答，`settings.yaml` 同步落盘。
 
+## 测试切换（会话级 provider/模型）
+
+不用等真失败，就能验证档位表里的某条目是否可用：
+
+- **对话指令**：`/failover-test`（切到当前条目之后的下一启用条目）、`/failover-test tier:2`、`/failover-test <条目 id>`、`/failover-test clear`（解除）。
+- **设置页按钮**：「测试切换」卡片选目标条目后点按钮（未指定时用最近活跃会话），另有「解除测试切换」。
+
+实现要点：
+
+- 切换走**官方会话模型选择通路** `ctx.sessionController.selectModel({sessionId, provider, model, reasoningEffort?})` —— 与模型选择器同一条路，会写 `model/selection` 事件，因此会话选择与 UI 都会变。**副作用**：官方通路会同时把该选择存为默认模型（`agentDefaultModel.saveSelection`），本插件不另造旁路。
+- 插件侧同时记一个**会话级 pin**（30 分钟 TTL）：pin 有效期内 `agent/request` 直接下发该目标并**跳过启动对齐**，否则刚切到第二档会被启动对齐拉回第一档。`clear` 或 TTL 到期即解除。
+- 测试**不伪造失败**、不注入错误码、不改档位表与 key 引用；真实失败仍按既有逻辑处理。
+- 未组合 `sessionController`（或没有活跃会话）时返回明确错误，不静默成功。
+
 ## 启动对齐
 
 `startup.preferTier: 1` 表示：**当前路由已属于第一档就不改写**；不属于时才对齐到该档排序最前的可用条目；目标档不可用时沿档位顺序下探；失败不阻断请求。设为 `0` 则完全跟随宿主默认路由。启动对齐只决定 provider/model，不触碰 key 引用。
@@ -168,6 +182,7 @@ dsh 设置页新增「Provider 故障转移」小节：**总开关** + 常用参
   - `GET /provider-failover/status`：生效值 + 档位表（含每条目 key 引用的 `ref/active/configured/source/failed` 标注）+ `nextKeyResetAt` + 最近 10 条转移/换 key 记录 + 冷却路由。
   - `POST /provider-failover/config`：字段白名单 `{enabled, minSwitchIntervalMs, maxSwitchesPerTurn, startupPreferTier, rankingMode, keyResetAt}`，经 settings 服务落盘。
   - `POST /provider-failover/keys`：`{entry, ref}` 手工置位、`{entry}` 重置该条目、`{}` 重置全部（未声明或未配置的引用被拒绝）。
+  - `POST /provider-failover/test`：`{entry?, sessionId?, clear?}` 会话级测试切换；状态接口同时返回 `testTargets`、`pins`、`lastSessionId`。
 - 档位表与宿主 provider 目录**实时关联**：条目显示 `id → route/model` 并标注「宿主未注册／冷却中」；同时列出未纳入任何档位的 provider 与「档位引用但未注册」的警告。目录不可用（llm 未就绪）时不做关联判断，不误标。
 - 客户端半仅注册这一个设置小节；路由决策完全在 Host 半。
 

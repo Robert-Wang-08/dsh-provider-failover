@@ -49,6 +49,11 @@ const FailoverSettingsSchema = z.object({
   startupPreferTier: z.number().step(1).min(0).default(1),
   rankingMode: z.union(['declared', 'keywords', 'llm']).default('keywords'),
   keyResetAt: z.string().default('06:00'),
+  /**
+   * 设置页可编辑的单 provider 多 key：条目 id → 凭据引用名列表（有序，首项为默认 key）。
+   * 存在的条目以此为准，未声明的条目回退 profile patch 的 `keys`。只存引用名，不存值。
+   */
+  keysByEntry: z.dict(z.array(z.string())).default({}),
 })
 
 /** 只读状态接口与设置页共用的 JSON 助手。 */
@@ -108,6 +113,39 @@ const PI_AI_NAMESPACE = 'llm-pi-ai'
 
 /** 引用描述（是否已配置 / 来源层）的缓存时长，避免每次状态查询都打凭据服务。 */
 const REF_INFO_TTL_MS = 10000
+
+/** 会话级测试切换（pin）的有效期：到期自动解除，避免把路由长期钉住。 */
+const TEST_PIN_TTL_MS = 30 * 60 * 1000
+
+/**
+ * 测试切换的目标解析（纯函数）。
+ *   spec = ''          → 当前条目之后的下一启用条目（末尾回环）
+ *   spec = 'tier:N'    → 第 N 档首个启用条目
+ *   spec = '<entryId>' → 该条目
+ * 只考虑启用档位与启用条目；无法解析返回 undefined。
+ */
+function resolveTestTarget(tiers, spec, currentProvider) {
+  const flat = []
+  for (const tier of tiers) {
+    if (tier.enabled !== true) continue
+    for (const entry of tier.entries) {
+      if (entry.enabled !== true) continue
+      flat.push({ tier, entry })
+    }
+  }
+  if (flat.length === 0) return undefined
+  const text = typeof spec === 'string' ? spec.trim() : ''
+  if (text.length === 0) {
+    const at = flat.findIndex((item) => item.entry.route === currentProvider)
+    return flat[(at + 1) % flat.length]
+  }
+  const tierMatch = /^tier:(\d+)$/.exec(text)
+  if (tierMatch !== null) {
+    const wanted = Number(tierMatch[1])
+    return flat.find((item) => item.tier.tier === wanted)
+  }
+  return flat.find((item) => item.entry.id === text)
+}
 
 /** 编码未归一化时的消息模式兜底（大小写不敏感）。 */
 const DEFAULT_FAILURE_PATTERNS = [
@@ -501,6 +539,14 @@ export function apply(ctx, rawConfig) {
      */
     keyFailed: new Map(),
     keyGeneration: 0,
+    /** 设置层覆盖的 key 引用列表（条目 id → 引用名[]）；空对象时全部回退 patch */
+    keysByEntry: {},
+    /** 配置类警告去重（每消息每进程一次） */
+    configWarned: new Set(),
+    /** 每日重置排程是否已启用（界面新增 keys 后可补启用） */
+    keyResetArmed: false,
+    /** 会话级测试切换 pin：sessionId -> { entryId, route, model, reasoningEffort, tier, at } */
+    pins: new Map(),
     /** 引用描述缓存：ref -> { configured, source, at }（短 TTL，仅用于状态展示） */
     refInfo: new Map(),
     lastSwitchAt: 0,
@@ -575,6 +621,109 @@ export function apply(ctx, rawConfig) {
     return mark !== undefined && mark.gen === state.keyGeneration
   }
 
+  /** 配置类警告去重（每消息每进程一次，避免刷屏）。 */
+  function warnConfigOnce(message) {
+    if (state.configWarned.has(message)) return
+    state.configWarned.add(message)
+    console.warn('[dsh-provider-failover] ' + message)
+  }
+
+  /**
+   * 条目生效的 key 引用列表：设置层 `keysByEntry[id]` 优先，否则回退 profile patch 的 `keys`。
+   * 运行时防御性过滤（不信任落盘内容）：非法名与重复项被丢弃并警告一次，绝不因此中断请求。
+   */
+  function effectiveKeys(entry) {
+    const override = state.keysByEntry[entry.id]
+    const source = Array.isArray(override) ? override : entry.keys
+    const refs = []
+    const seen = new Set()
+    for (const item of source) {
+      if (isCredentialRef(item) !== true) {
+        warnConfigOnce('keysByEntry.' + entry.id + ': ignoring invalid credential reference name ' + JSON.stringify(item))
+        continue
+      }
+      if (seen.has(item)) {
+        warnConfigOnce('keysByEntry.' + entry.id + ': ignoring duplicate credential reference ' + item)
+        continue
+      }
+      seen.add(item)
+      refs.push(item)
+    }
+    return refs
+  }
+
+  /** 该条目是否有可轮换的 key 引用（决定是否需要每日重置排程）。 */
+  function hasRotation(entry) {
+    return effectiveKeys(entry).length > 0
+  }
+
+  // ------------------------------------------------------- 会话级测试切换（pin）
+
+  const sessionController = () => ctx.get('sessionController') ?? undefined
+
+  /** agent 的会话 id（原样返回，供官方接口使用）。 */
+  function sessionIdOf(agent) {
+    const session = agent !== null && agent !== undefined ? agent.session : undefined
+    const id = session !== null && session !== undefined ? session.id : undefined
+    return id === undefined || id === null ? undefined : id
+  }
+
+  const pinKeyOf = (sessionId) => sessionId === undefined || sessionId === null ? undefined : String(sessionId)
+
+  /** 有效 pin：过期即删并返回 undefined。 */
+  function activePin(sessionId) {
+    const key = pinKeyOf(sessionId)
+    if (key === undefined) return undefined
+    const pin = state.pins.get(key)
+    if (pin === undefined) return undefined
+    if (Date.now() - pin.at >= TEST_PIN_TTL_MS) {
+      state.pins.delete(key)
+      return undefined
+    }
+    return pin
+  }
+
+  /**
+   * 执行一次测试切换：走官方会话模型选择通路（`sessionController.selectModel`，与模型选择器同路），
+   * 并在插件侧记 pin，使后续请求不被启动对齐顶回。不伪造失败、不改档位表与凭据。
+   */
+  async function applyTestSwitch(sessionId, target, reason) {
+    const controller = sessionController()
+    if (controller === undefined || typeof controller.selectModel !== 'function') {
+      throw new Error('session controller is not composed; cannot switch the session model')
+    }
+    const entry = target.entry
+    const request = { sessionId, provider: entry.route, model: entry.model }
+    if (entry.reasoningEffort !== undefined) request.reasoningEffort = entry.reasoningEffort
+    const result = await controller.selectModel(request)
+    const selected = result !== null && typeof result === 'object' && result.selected !== undefined ? result.selected : {}
+    const pin = {
+      entryId: entry.id,
+      route: String(selected.provider ?? entry.route),
+      model: String(selected.model ?? entry.model),
+      reasoningEffort: selected.reasoningEffort ?? entry.reasoningEffort,
+      tier: target.tier.tier,
+      at: Date.now(),
+    }
+    state.pins.set(pinKeyOf(sessionId), pin)
+    pushLog({ at: pin.at, kind: 'test-switch', from: '(session selection)', to: pin.route + '/' + pin.model, tier: pin.tier, code: 'TEST', trigger: reason, turn: 0, step: 0 })
+    console.warn('[dsh-provider-failover] test switch session ' + String(pinKeyOf(sessionId)) + ' -> ' + pin.route + '/' + pin.model + ' tier ' + String(pin.tier) + ' (' + reason + ')')
+    return pin
+  }
+
+  /** 可用测试目标清单（供界面下拉与指令报错提示）。 */
+  function testTargets() {
+    const targets = []
+    for (const tier of config.tiers) {
+      if (tier.enabled !== true) continue
+      for (const entry of tier.entries) {
+        if (entry.enabled !== true) continue
+        targets.push({ id: entry.id, route: entry.route, model: entry.model, tier: tier.tier })
+      }
+    }
+    return targets
+  }
+
   function warnRefOnce(ref, detail) {
     if (state.keyWarned.has(ref)) return
     state.keyWarned.add(ref)
@@ -586,15 +735,16 @@ export function apply(ctx, rawConfig) {
    * 环形前进（从当前引用之后开始，至多一圈）：跳过本周期已失效者与未配置者。
    * 返回生效的引用名；无可用候选或写入失败时返回 undefined（调用方落到 provider 切换）。
    */
-  async function rotateKey(entry, route, failedRef, code, now) {
-    if (entry.keys.length === 0) return undefined
+  async function rotateKey(entry, route, failedRef, code, now, message) {
+    const keys = effectiveKeys(entry)
+    if (keys.length === 0) return undefined
     const active = failedRef ?? activeRefOf(route)
-    if (active !== undefined) state.keyFailed.set(active, { gen: state.keyGeneration, code, route, at: now })
+    if (active !== undefined) state.keyFailed.set(active, { gen: state.keyGeneration, code, route, at: now, message: String(message ?? '').slice(0, 200) })
     // 环形前进至多一圈：跳过本周期已失效者，逐个用凭据描述预检，第一个已配置的即为目标。
-    let remaining = entry.keys.length
+    let remaining = keys.length
     let cursor = active
     while (remaining > 0) {
-      const candidate = selectNextRef(entry.keys, cursor, (ref) => refFailed(ref) !== true)
+      const candidate = selectNextRef(keys, cursor, (ref) => refFailed(ref) !== true)
       if (candidate === undefined) break
       remaining -= 1
       cursor = candidate
@@ -614,6 +764,45 @@ export function apply(ctx, rawConfig) {
     return undefined
   }
 
+  /** 写入前的整表校验：引用名、条目内去重、跨条目唯一、条目 id 必须存在。 */
+  function validateKeysByEntry(map) {
+    const errors = []
+    if (map === undefined) return errors
+    if (isPlainObject(map) !== true) {
+      errors.push('keysByEntry must be an object mapping entry id to credential reference names')
+      return errors
+    }
+    const known = new Set()
+    for (const tier of config.tiers) for (const entry of tier.entries) known.add(entry.id)
+    const owner = new Map()
+    for (const [entryId, refs] of Object.entries(map)) {
+      if (known.has(entryId) !== true) {
+        errors.push('keysByEntry has unknown entry id: ' + entryId)
+        continue
+      }
+      if (Array.isArray(refs) !== true) {
+        errors.push('keysByEntry.' + entryId + ' must be an array of credential reference names')
+        continue
+      }
+      const seen = new Set()
+      for (const ref of refs) {
+        if (isCredentialRef(ref) !== true) {
+          errors.push('keysByEntry.' + entryId + ' has an invalid credential reference name: ' + JSON.stringify(ref))
+          continue
+        }
+        if (seen.has(ref)) {
+          errors.push('keysByEntry.' + entryId + ' repeats credential reference: ' + ref)
+          continue
+        }
+        seen.add(ref)
+        const previous = owner.get(ref)
+        if (previous !== undefined && previous !== entryId) errors.push('credential reference "' + ref + '" is used by both entry ' + previous + ' and entry ' + entryId)
+        else owner.set(ref, entryId)
+      }
+    }
+    return errors
+  }
+
   /** 每日重置：清空失效标记 + 把仍属插件状态的条目写回首项（默认 key）。 */
   async function keyResetDue(reason) {
     const previous = state.keyGeneration
@@ -622,15 +811,16 @@ export function apply(ctx, rawConfig) {
     const actions = []
     for (const tier of config.tiers) {
       for (const entry of tier.entries) {
-        if (entry.keys.length === 0) continue
+        const keys = effectiveKeys(entry)
+        if (keys.length === 0) continue
         const active = activeRefOf(entry.route)
         if (active === undefined) continue
-        if (entry.keys.indexOf(active) < 0) {
+        if (keys.indexOf(active) < 0) {
           // 当前引用不是本条目声明的引用：视为用户手工状态，只清标记不改写。
           actions.push({ entry: entry.id, action: 'keep-manual', ref: active })
           continue
         }
-        const target = entry.keys[0]
+        const target = keys[0]
         if (target === active) continue
         const info = await refConfigured(target)
         if (info.configured !== true) {
@@ -655,7 +845,7 @@ export function apply(ctx, rawConfig) {
     const now = Date.now()
     for (const tier of config.tiers) {
       for (const entry of tier.entries) {
-        for (const ref of entry.keys) {
+        for (const ref of effectiveKeys(entry)) {
           const cached = state.refInfo.get(ref)
           if (cached !== undefined && now - cached.at < REF_INFO_TTL_MS) continue
           await refConfigured(ref)
@@ -873,6 +1063,13 @@ export function apply(ctx, rawConfig) {
     if (state.pendingNeeds !== undefined) record.needs = state.pendingNeeds
 
     let target = record.target
+    // 会话级测试 pin：有效期内直接下发该目标并跳过启动对齐（否则会被拉回目标档）。
+    const pin = activePin(sessionIdOf(payload?.agent))
+    if (pin !== undefined) {
+      const pinnedConfig = { ...base, provider: pin.route, model: pin.model }
+      if (pin.reasoningEffort !== undefined) pinnedConfig.reasoningEffort = pin.reasoningEffort
+      return pinnedConfig
+    }
     if (target === undefined && config.startup.preferTier > 0) {
       // 启动对齐（口径 B）：当前路由已属于目标档则不改写，否则对齐到该档排序最前的可用条目。
       const current = tierOf(config, base.provider)
@@ -919,8 +1116,8 @@ export function apply(ctx, rawConfig) {
 
     // ① 凭据类失败：先在该条目内换 key（同路由、同模型，只改 apiKeyEnv 引用）。
     //    只有归一化到凭据类编码才走这里；消息模式兜底命中的失败按非凭据类处理。
-    if (failedEntry !== undefined && failedEntry.keys.length > 0 && KEY_ROTATION_CODES.has(code)) {
-      const rotatedTo = await rotateKey(failedEntry, failedRoute, activeRef, code, now)
+    if (failedEntry !== undefined && hasRotation(failedEntry) && KEY_ROTATION_CODES.has(code)) {
+      const rotatedTo = await rotateKey(failedEntry, failedRoute, activeRef, code, now, failure?.message)
       if (rotatedTo !== undefined) {
         record.target = { entry: failedEntry, tier: failedLoc.tier, reason: 'key:' + code }
         record.switches += 1
@@ -980,6 +1177,47 @@ export function apply(ctx, rawConfig) {
   // 设置命名空间 `provider-failover`：用户层落在 `$DSH_HOME/settings.yaml`，
   // base 层来自 profile patch 的条目配置（没被用户覆盖的项仍以 patch 为准），
   // 默认 effect=live → 变更即时生效，无需重启。
+  // 对话指令：/failover-test [tier:N|<entryId>|clear]
+  // 把「该会话所选 provider/模型」切到档位表中的目标；commands 服务未组合时静默跳过。
+  ctx.inject(['commands'], (commandsCtx) => {
+    commandsCtx.commands.register({
+      name: 'failover-test',
+      description: '测试故障转移：把当前会话的 provider/模型切到档位表中的目标（tier:N / 条目 id / clear）',
+      handler: async (invocation) => {
+        const sessionId = sessionIdOf(invocation.agent)
+        if (sessionId === undefined) return { kind: 'error', text: '无法确定当前会话，测试切换未执行。' }
+        const spec = String(invocation.rawInput ?? '').trim()
+        if (spec === 'clear' || spec === 'reset') {
+          state.pins.delete(pinKeyOf(sessionId))
+          return { kind: 'success', text: '已解除本会话的测试切换。' }
+        }
+        let current
+        try {
+          const header = invocation.agent.session.requestHeader()
+          current = header !== undefined && header !== null && header.config !== undefined ? header.config.provider : undefined
+        } catch (error) {
+          current = undefined
+        }
+        const target = resolveTestTarget(config.tiers, spec, current)
+        if (target === undefined) {
+          const available = testTargets().map((item) => item.id).join(', ')
+          return { kind: 'error', text: '未知测试目标：' + (spec.length > 0 ? spec : '(空)') + '；可用条目：' + available + '，或 tier:N，或 clear。' }
+        }
+        try {
+          const pin = await applyTestSwitch(sessionId, target, 'command:' + (spec.length > 0 ? spec : 'next'))
+          return {
+            kind: 'success',
+            text: '已切换本会话模型：' + pin.route + '/' + pin.model + '（档 ' + String(pin.tier) + '，条目 ' + pin.entryId + '）。'
+              + '测试 pin ' + String(Math.round(TEST_PIN_TTL_MS / 60000)) + ' 分钟后自动失效，可 /failover-test clear 立即解除。'
+              + '注意：该切换与模型选择器同路，会同时存为默认模型。',
+          }
+        } catch (error) {
+          return { kind: 'error', text: messageOf(error) }
+        }
+      },
+    })
+  })
+
   ctx.inject(['settings'], (settingsCtx) => {
     const scope = settingsCtx.settings.register(SETTINGS_NAMESPACE, FailoverSettingsSchema, {
       base: {
@@ -989,6 +1227,7 @@ export function apply(ctx, rawConfig) {
         startupPreferTier: config.startup.preferTier,
         rankingMode: config.ranking.mode,
         keyResetAt: config.keyResetAt,
+        keysByEntry: {},
       },
     })
     const sync = (value, source) => {
@@ -999,7 +1238,10 @@ export function apply(ctx, rawConfig) {
       config.ranking.mode = value.rankingMode
       if (parseClock(value.keyResetAt) !== undefined) config.keyResetAt = value.keyResetAt
       else console.warn('[dsh-provider-failover] ignoring invalid keyResetAt (expected HH:MM): ' + String(value.keyResetAt))
-      console.log('[dsh-provider-failover] settings ' + source + ': enabled=' + String(config.enabled) + ' minSwitchIntervalMs=' + String(config.minSwitchIntervalMs) + ' maxSwitchesPerTurn=' + String(config.maxSwitchesPerTurn) + ' startup.preferTier=' + String(config.startup.preferTier) + ' ranking=' + config.ranking.mode + ' keyResetAt=' + config.keyResetAt)
+      state.keysByEntry = isPlainObject(value.keysByEntry) ? value.keysByEntry : {}
+      const keySummary = config.tiers.map((tier) => tier.entries.map((entry) => entry.id + ':' + String(effectiveKeys(entry).length)).join(',')).join(' | ')
+      console.log('[dsh-provider-failover] settings ' + source + ': enabled=' + String(config.enabled) + ' minSwitchIntervalMs=' + String(config.minSwitchIntervalMs) + ' maxSwitchesPerTurn=' + String(config.maxSwitchesPerTurn) + ' startup.preferTier=' + String(config.startup.preferTier) + ' ranking=' + config.ranking.mode + ' keyResetAt=' + config.keyResetAt + ' keys=' + keySummary)
+      ensureKeyResetTimer()
     }
     state.settings = scope
     state.syncSettings = sync
@@ -1008,8 +1250,11 @@ export function apply(ctx, rawConfig) {
   })
 
   // 每日重置排程：到下一个 keyResetAt（本地时间）清失效标记并把默认 key 写回，然后重新排程。
-  // 无任何条目声明 keys 时不排程（零配置零介入）。
-  if (config.tiers.some((tier) => tier.entries.some((entry) => entry.keys.length > 0))) {
+  // 无任何条目有生效 key 引用时不排程；界面新增引用后由 ensureKeyResetTimer() 补启用（无需重启）。
+  function ensureKeyResetTimer() {
+    if (state.keyResetArmed === true) return
+    if (config.tiers.some((tier) => tier.entries.some((entry) => hasRotation(entry))) !== true) return
+    state.keyResetArmed = true
     ctx.effect(() => {
       let handle
       const arm = () => {
@@ -1030,6 +1275,7 @@ export function apply(ctx, rawConfig) {
       }
     }, 'dsh-provider-failover: daily key reset timer')
   }
+  ensureKeyResetTimer()
 
   ctx.inject(['webServer'], (webCtx) => {
     const register = (path, handler) => ctx.effect(() => webCtx.webServer.register({ kind: 'exact', path: path, handler: handler }), 'dsh-provider-failover: ' + path)
@@ -1077,14 +1323,19 @@ export function apply(ctx, rawConfig) {
             registered: directoryKnown ? registeredIds.has(entry.route) : true,
             cooling: cooling(entry.route, now),
             activeRef: active,
-            keys: entry.keys.map((ref) => {
+            keysSource: Array.isArray(state.keysByEntry[entry.id]) ? 'settings' : 'patch',
+            keys: effectiveKeys(entry).map((ref) => {
               const info = state.refInfo.get(ref)
+              const mark = refFailed(ref) ? state.keyFailed.get(ref) : undefined
               return {
                 ref,
                 active: ref === active,
                 configured: info !== undefined ? info.configured : false,
                 source: info?.source,
-                failed: refFailed(ref),
+                failed: mark !== undefined,
+                failedAt: mark !== undefined ? mark.at : undefined,
+                failedCode: mark !== undefined ? mark.code : undefined,
+                failedMessage: mark !== undefined ? String(mark.message ?? '').slice(0, 120) : undefined,
               }
             }),
           }
@@ -1100,10 +1351,14 @@ export function apply(ctx, rawConfig) {
           startupPreferTier: config.startup.preferTier,
           rankingMode: config.ranking.mode,
           keyResetAt: config.keyResetAt,
+          keysByEntry: state.keysByEntry,
         },
         writable: state.settings !== undefined,
         keyResetAt: config.keyResetAt,
         nextKeyResetAt: nextResetAt(config.keyResetAt, now),
+        testTargets: testTargets(),
+        pins: [...state.pins.entries()].map(([session, pin]) => ({ session, entryId: pin.entryId, route: pin.route, model: pin.model, tier: pin.tier, at: pin.at })),
+        lastSessionId: state.lastSessionId !== undefined ? state.lastSessionId.id : undefined,
         tiers,
         providers: directoryKnown ? {
           registered: directory.registered,
@@ -1119,7 +1374,6 @@ export function apply(ctx, rawConfig) {
       if (isLocalRequest(req) !== true) return sendJson(res, 403, { ok: false, error: 'local requests only' })
       sendJson(res, 200, await snapshot())
     })
-    // 手工改状态：{entry, ref} 置位某引用；{entry} 重置该条目到默认 key；{} 重置全部。
     register(ROUTE_BASE + '/keys', async (req, res) => {
       if (isLocalRequest(req) !== true) return sendJson(res, 403, { ok: false, error: 'local requests only' })
       if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only' })
@@ -1128,7 +1382,7 @@ export function apply(ctx, rawConfig) {
       const targets = []
       for (const tier of config.tiers) {
         for (const entry of tier.entries) {
-          if (entry.keys.length === 0) continue
+          if (hasRotation(entry) !== true) continue
           if (wanted !== undefined && entry.id !== wanted) continue
           targets.push(entry)
         }
@@ -1139,9 +1393,10 @@ export function apply(ctx, rawConfig) {
       state.keyFailed.clear()
       const results = []
       for (const entry of targets) {
-        const ref = typeof body.ref === 'string' && body.ref.length > 0 ? body.ref : entry.keys[0]
-        if (entry.keys.indexOf(ref) < 0) {
-          results.push({ entry: entry.id, ok: false, ref, error: 'ref is not declared in entry.keys' })
+        const keys = effectiveKeys(entry)
+        const ref = typeof body.ref === 'string' && body.ref.length > 0 ? body.ref : keys[0]
+        if (keys.indexOf(ref) < 0) {
+          results.push({ entry: entry.id, ok: false, ref, error: 'ref is not declared in the entry key list' })
           continue
         }
         const info = await refConfigured(ref)
@@ -1168,11 +1423,13 @@ export function apply(ctx, rawConfig) {
       if (state.settings === undefined) return sendJson(res, 503, { ok: false, error: 'settings service is not composed; edit the profile patch instead' })
       const body = await readJsonBody(req)
       const patch = {}
-      for (const key of ['enabled', 'minSwitchIntervalMs', 'maxSwitchesPerTurn', 'startupPreferTier', 'rankingMode', 'keyResetAt']) {
+      for (const key of ['enabled', 'minSwitchIntervalMs', 'maxSwitchesPerTurn', 'startupPreferTier', 'rankingMode', 'keyResetAt', 'keysByEntry']) {
         if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
       }
       if (Object.keys(patch).length === 0) return sendJson(res, 400, { ok: false, error: 'no editable field in request' })
       if (patch.keyResetAt !== undefined && parseClock(patch.keyResetAt) === undefined) return sendJson(res, 400, { ok: false, error: 'keyResetAt must be HH:MM in 24-hour local time' })
+      const keyErrors = validateKeysByEntry(patch.keysByEntry)
+      if (keyErrors.length > 0) return sendJson(res, 400, { ok: false, error: keyErrors.join('; '), errors: keyErrors })
       try {
         await state.settings.update(patch)
       } catch (error) {
@@ -1187,10 +1444,38 @@ export function apply(ctx, rawConfig) {
           startupPreferTier: config.startup.preferTier,
           rankingMode: config.ranking.mode,
           keyResetAt: config.keyResetAt,
+          keysByEntry: state.keysByEntry,
           ...patch,
         }, 'updated')
       }
       sendJson(res, 200, await snapshot())
+    })
+    // 测试切换：{entry?, sessionId?, clear?}；缺 sessionId 时用最近一次活跃会话。
+    register(ROUTE_BASE + '/test', async (req, res) => {
+      if (isLocalRequest(req) !== true) return sendJson(res, 403, { ok: false, error: 'local requests only' })
+      if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only' })
+      const body = await readJsonBody(req)
+      const rawSessionId = typeof body.sessionId === 'string' && body.sessionId.length > 0
+        ? body.sessionId
+        : (state.lastSessionId !== undefined ? state.lastSessionId.id : undefined)
+      if (rawSessionId === undefined) return sendJson(res, 400, { ok: false, error: 'no session to test: pass sessionId or send a request in a session first' })
+      if (body.clear === true) {
+        state.pins.delete(pinKeyOf(rawSessionId))
+        return sendJson(res, 200, { ok: true, cleared: true, sessionId: String(pinKeyOf(rawSessionId)), status: await snapshot() })
+      }
+      const spec = typeof body.entry === 'string' ? body.entry : ''
+      // HTTP 路径不知道会话当前路由：空 spec 时从启用序列首项开始（与指令路径不同，指令用会话请求头定位）。
+      const target = resolveTestTarget(config.tiers, spec, undefined)
+      if (target === undefined) {
+        const available = testTargets().map((item) => item.id).join(', ')
+        return sendJson(res, 400, { ok: false, error: 'unknown test target: ' + (spec.length > 0 ? spec : '(empty)') + '; available entries: ' + available + ' or tier:N' })
+      }
+      try {
+        const pin = await applyTestSwitch(rawSessionId, target, 'http:' + (spec.length > 0 ? spec : 'next'))
+        return sendJson(res, 200, { ok: true, sessionId: String(pinKeyOf(rawSessionId)), pin, status: await snapshot() })
+      } catch (error) {
+        return sendJson(res, 400, { ok: false, error: messageOf(error) })
+      }
     })
   })
 
@@ -1212,4 +1497,4 @@ export function normalize(raw) {
 export { masked }
 
 /** 内部纯函数，供冒烟测试断言（不属于对外契约）。 */
-export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef }
+export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef, resolveTestTarget }

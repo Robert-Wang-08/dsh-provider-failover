@@ -39,6 +39,14 @@ window.__ModuleLoader__.load({
       ".pf-row>input[type=number],.pf-row>input[type=text],.pf-row>select{width:168px;padding:4px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}",
       ".pf-hint{color:var(--dsw-alias-label-secondary);font-size:12px}",
       ".pf-warn{color:var(--dsw-alias-state-error-primary);font-size:12px}",
+      ".pf-keyrow{display:flex;align-items:center;gap:8px}",
+      ".pf-keyrow>input{flex:1 1 auto;padding:4px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-mono,monospace);font-size:12px}",
+      ".pf-badge{flex:0 0 auto;font-size:12px;padding:1px 6px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1)}",
+      ".pf-badge-active{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}",
+      ".pf-badge-failed{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}",
+      ".pf-badge-muted{color:var(--dsw-alias-label-secondary)}",
+      ".pf-entry{border-top:1px solid var(--dsw-alias-border-l1);padding-top:8px;display:flex;flex-direction:column;gap:6px}",
+      ".pf-entry:first-of-type{border-top:0;padding-top:0}",
       ".pf-actions{display:flex;align-items:center;gap:10px}",
       ".pf-btn{padding:5px 12px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);cursor:pointer}",
       ".pf-btn[disabled]{opacity:.5;cursor:default}",
@@ -70,6 +78,12 @@ window.__ModuleLoader__.load({
         headers: { "content-type": "application/json" },
         body: JSON.stringify(patch),
       });
+    const testSwitch = (body) =>
+      apiFetch(ROUTE + "/test", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
     const resetKeys = (body) =>
       apiFetch(ROUTE + "/keys", {
         method: "POST",
@@ -88,15 +102,33 @@ window.__ModuleLoader__.load({
     function ProviderFailoverPanel() {
       const [status, setStatus] = react.useState(null);
       const [form, setForm] = react.useState(null);
+      const [keyDraft, setKeyDraft] = react.useState(null);
+      const [testTarget, setTestTarget] = react.useState("");
+      const [testMsg, setTestMsg] = react.useState("");
+      const [testMsgKind, setTestMsgKind] = react.useState("ok");
       const [error, setError] = react.useState("");
+      const [keyError, setKeyError] = react.useState("");
       const [saved, setSaved] = react.useState("");
       const [busy, setBusy] = react.useState(false);
+
+      /** 由状态快照构造 key 草稿：条目 id → 引用名数组（生效值，含 patch 回退）。 */
+      const draftOf = (data) => {
+        const draft = {};
+        for (const tier of data.tiers) {
+          for (const entry of tier.entries) {
+            const declared = data.editable.keysByEntry === undefined ? undefined : data.editable.keysByEntry[entry.id];
+            draft[entry.id] = Array.isArray(declared) ? declared.slice() : entry.keys.map((item) => item.ref);
+          }
+        }
+        return draft;
+      };
 
       const load = react.useCallback(async () => {
         try {
           const data = await getStatus();
           setStatus(data);
           setForm(data.editable);
+          setKeyDraft(draftOf(data));
           setError("");
         } catch (err) {
           setError(err.message);
@@ -110,7 +142,7 @@ window.__ModuleLoader__.load({
       if (error.length > 0 && status === null) {
         return h("div", { className: "pf-root" }, h("div", { className: "pf-err" }, "无法读取状态：" + error));
       }
-      if (status === null || form === null) {
+      if (status === null || form === null || keyDraft === null) {
         return h("div", { className: "pf-root" }, h("div", { className: "pf-sub" }, "读取中…"));
       }
 
@@ -136,10 +168,135 @@ window.__ModuleLoader__.load({
           const data = await saveConfig(patch);
           setStatus(data);
           setForm(data.editable);
+          setKeyDraft(draftOf(data));
           setError("");
           setSaved("已保存并即时生效");
         } catch (err) {
           setError(err.message);
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      /** key 草稿编辑：改名 / 增行 / 删行。 */
+      const setKeyRef = (entryId, index, value) =>
+        setKeyDraft((prev) => Object.assign({}, prev, { [entryId]: prev[entryId].map((ref, at) => at === index ? value : ref) }));
+      const addKeyRef = (entryId) =>
+        setKeyDraft((prev) => Object.assign({}, prev, { [entryId]: prev[entryId].concat([""]) }));
+      const removeKeyRef = (entryId, index) =>
+        setKeyDraft((prev) => Object.assign({}, prev, { [entryId]: prev[entryId].filter((ref, at) => at !== index) }));
+
+      /** 提交：只保留有内容的引用；某条目全部清空 = 删除该覆盖，回退 profile patch。 */
+      const saveKeys = async () => {
+        const map = {};
+        for (const entryId of Object.keys(keyDraft)) {
+          const refs = keyDraft[entryId].map((ref) => String(ref).trim()).filter((ref) => ref.length > 0);
+          if (refs.length > 0) map[entryId] = refs;
+        }
+        setBusy(true);
+        try {
+          const data = await saveConfig({ keysByEntry: map });
+          setStatus(data);
+          setForm(data.editable);
+          setKeyDraft(draftOf(data));
+          setKeyError("");
+          setSaved("key 列表已保存并即时生效");
+        } catch (err) {
+          setKeyError(err.message);
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      /** 某引用在当前快照里的状态徽标（只用快照里的字段，界面不接触密钥值）。 */
+      const refBadge = (entry, ref) => {
+        const item = entry.keys.find((key) => key.ref === ref);
+        if (item === undefined) {
+          return h("span", { className: "pf-badge pf-badge-muted" }, "未保存");
+        }
+        if (item.failed === true) {
+          const when = item.failedAt === undefined ? "" : new Date(item.failedAt).toLocaleTimeString();
+          const why = [item.failedCode, item.failedMessage].filter((part) => part !== undefined && String(part).length > 0).join(" · ");
+          return h("span", { className: "pf-badge pf-badge-failed", title: why }, "失效 " + when + (why.length > 0 ? " · " + why : ""));
+        }
+        if (item.configured !== true) {
+          return h("span", { className: "pf-badge pf-badge-muted", title: "宿主凭据库中没有这个引用" }, "未配置");
+        }
+        return h("span", { className: "pf-badge " + (item.active === true ? "pf-badge-active" : "pf-badge-muted") },
+          item.active === true ? "在用" : "可用",
+          item.source === "env" ? " · 环境" : "");
+      };
+
+      const keyCard = h("div", { className: "pf-card" },
+        h("div", { className: "pf-hint" }, "单 provider 多 key（凭据引用名）——填环境变量名，不要填密钥值；值请在 .credentials.yaml 或环境变量里提供。列表顺序即轮换顺序，首项为默认 key。"),
+        status.tiers.map((tier) => tier.entries.map((entry) =>
+          h("div", { className: "pf-entry", key: entry.id },
+            h("div", { className: "pf-row" },
+              h("label", null, String(entry.id) + " → " + String(entry.route) + "/" + String(entry.model)),
+              h("span", { className: "pf-hint" }, entry.keysSource === "settings" ? "来源：设置" : "来源：profile patch")),
+            keyDraft[entry.id].map((ref, index) =>
+              h("div", { className: "pf-keyrow", key: entry.id + "-" + String(index) },
+                h("input", {
+                  type: "text",
+                  value: ref,
+                  placeholder: "MY_PROVIDER_API_KEY_2",
+                  onChange: (event) => { setKeyRef(entry.id, index, event.target.value); setSaved(""); setKeyError(""); },
+                }),
+                refBadge(entry, String(ref).trim()),
+                h("button", { className: "pf-btn", disabled: busy === true, onClick: () => removeKeyRef(entry.id, index) }, "移除"))),
+            h("div", { className: "pf-actions" },
+              h("button", { className: "pf-btn", disabled: busy === true, onClick: () => addKeyRef(entry.id) }, "+ 添加 key 引用"),
+              h("span", { className: "pf-hint" }, keyDraft[entry.id].length === 0 ? "（无 key 引用：该条目不参与轮换）" : ""))))),
+        h("div", { className: "pf-actions" },
+          h("button", { className: "pf-btn", disabled: busy === true, onClick: saveKeys }, busy === true ? "保存中…" : "保存 key 列表"),
+          h("span", { className: "pf-hint" }, "清空某条目的全部引用 = 删除该覆盖，回退 profile patch 的 keys"),
+          keyError.length > 0 ? h("span", { className: "pf-err" }, keyError) : null));
+
+      const testCard = h("div", { className: "pf-card" },
+        h("div", { className: "pf-hint" }, "测试切换（会话级）——把当前会话所选 provider/模型切到指定条目，验证档位是否可用；也可在对话窗输入 /failover-test [tier:N|条目 id|clear]。"),
+        h("div", { className: "pf-row" },
+          h("label", { htmlFor: "pf-test-target" }, "目标条目"),
+          h("select", { id: "pf-test-target", value: testTarget, onChange: (event) => { setTestTarget(event.target.value); setTestMsg(""); } },
+            h("option", { value: "" }, "（下一个启用条目）"),
+            (status.testTargets === undefined ? [] : status.testTargets).map((item) =>
+              h("option", { key: item.id, value: item.id }, String(item.id) + " → " + String(item.route) + "/" + String(item.model) + "（档 " + String(item.tier) + "）")))),
+        h("div", { className: "pf-actions" },
+          h("button", { className: "pf-btn", disabled: busy === true, onClick: runTestSwitch }, busy === true ? "切换中…" : "测试切换"),
+          h("button", { className: "pf-btn", disabled: busy === true, onClick: clearTestSwitch }, "解除测试切换"),
+          status.pins === undefined || status.pins.length === 0
+            ? h("span", { className: "pf-hint" }, "当前无测试切换")
+            : h("span", { className: "pf-hint" }, "当前 pin：" + status.pins.map((pin) => String(pin.session) + " → " + String(pin.route) + "/" + String(pin.model)).join("、")),
+          testMsg.length > 0 ? h("span", { className: testMsgKind === "error" ? "pf-err" : "pf-ok" }, testMsg) : null),
+        h("div", { className: "pf-hint" }, "说明：目标会话默认取最近活跃会话；切换走官方模型选择通路，会同时把该选择存为默认模型；pin 30 分钟后自动失效。"));
+
+      /** 测试切换：切到目标条目（空 = 下一个启用条目），并展示结果。 */
+      const runTestSwitch = async () => {
+        setBusy(true);
+        try {
+          const data = await testSwitch(testTarget.length > 0 ? { entry: testTarget } : {});
+          setStatus(data.status);
+          setForm(data.status.editable);
+          setTestMsgKind("ok");
+          setTestMsg("已切换：" + String(data.pin.route) + "/" + String(data.pin.model) + "（会话 " + String(data.sessionId) + "）");
+        } catch (err) {
+          setTestMsgKind("error");
+          setTestMsg(err.message);
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      /** 解除本插件设置的会话级测试 pin。 */
+      const clearTestSwitch = async () => {
+        setBusy(true);
+        try {
+          const data = await testSwitch({ clear: true });
+          setStatus(data.status);
+          setTestMsgKind("ok");
+          setTestMsg("已解除测试切换");
+        } catch (err) {
+          setTestMsgKind("error");
+          setTestMsg(err.message);
         } finally {
           setBusy(false);
         }
@@ -157,6 +314,7 @@ window.__ModuleLoader__.load({
           const data = await resetKeys({});
           setStatus(data.status);
           setForm(data.status.editable);
+          setKeyDraft(draftOf(data.status));
           setError("");
           setSaved("已重置全部 key 状态");
         } catch (err) {
@@ -165,18 +323,6 @@ window.__ModuleLoader__.load({
           setBusy(false);
         }
       };
-
-      /** 条目内 key 引用的一行说明：只显示引用名与状态，永不显示值。 */
-      const keyLine = (entry) =>
-        entry.keys.length === 0
-          ? null
-          : h("div", { className: "pf-hint" },
-              "key：" + entry.keys.map((key) =>
-                key.ref
-                + (key.active === true ? "（生效）" : "")
-                + (key.failed === true ? "［本周期失效］" : "")
-                + (key.configured !== true ? "［未配置］" : "")
-                + (key.source === "env" ? "［环境·只读］" : "")).join(" → "));
 
       const resetAtRow =
         h("div", { className: "pf-row" },
@@ -213,6 +359,10 @@ window.__ModuleLoader__.load({
           error.length > 0 ? h("span", { className: "pf-err" }, error) : null,
           status.writable !== true ? h("span", { className: "pf-err" }, "settings 服务未装载，无法在此保存") : null),
 
+        keyCard,
+
+        testCard,
+
         h("div", { className: "pf-card" },
           h("div", { className: "pf-hint" }, "档位表（只读，与宿主 provider 目录实时关联）"),
           h("ul", { className: "pf-list pf-mono" },
@@ -222,7 +372,6 @@ window.__ModuleLoader__.load({
                 index > 0 ? "、" : "",
                 String(entry.id) + " → " + String(entry.route) + "/" + String(entry.model),
                 entry.registered !== true ? h("span", { className: "pf-warn" }, "［宿主未注册］") : null,
-                keyLine(entry),
                 entry.cooling === true ? h("span", { className: "pf-hint" }, "［冷却中］") : null))))) ),
 
         h("div", { className: "pf-card" },
