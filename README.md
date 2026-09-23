@@ -160,7 +160,7 @@ dsh plugin --profile <profile> add "<本仓库路径>"
 dsh plugin --profile <profile> remove dsh-deepseek-keypool
 ```
 
-安装后需重启 `dsh web` 生效。
+安装后需重启 `dsh web` 生效；**客户端半（`client.js`）的改动同样必须重启后才生效**（`/plugins/??dsh-deepseek-keypool/client.js` 按内容哈希 `rev` 供包，旧 `rev` 直接 404）。`dsh web` 每次启动都会打印**带新 token 的地址**（`http://127.0.0.1:3080/?token=…`），重启后旧标签页的 token 已失效——在 UI 上往往表现为「页面或某个插件小节空白」，所以**重启后必须用新打印的地址重开**。
 
 ## 诊断
 
@@ -186,6 +186,17 @@ dsh 设置页新增「Provider 故障转移」小节：**总开关** + 常用参
 - 档位表与宿主 provider 目录**实时关联**：条目显示 `id → route/model` 并标注「宿主未注册／冷却中」；同时列出未纳入任何档位的 provider 与「档位引用但未注册」的警告。目录不可用（llm 未就绪）时不做关联判断，不误标。
 - 客户端半仅注册这一个设置小节；路由决策完全在 Host 半。
 
+## 客户端半的渲染约束（2026-09-23 修复）
+
+设置页小节由 `client.js` 以经典脚本 + `window.__ModuleLoader__.load` 注册。**席位（slot）边界会吞掉渲染期异常**：组件抛错时不会有红色报错页，整个小节就是空白，控制台之外看不到线索。因此客户端半有一条硬约束——**渲染期会被直接读取的绑定，必须在读取点之前完成初始化**（`const`/`let` 的 TDZ 在这里是致命错误，不是风格问题）。
+
+- **已修缺陷**：`testCard` 卡片在构造时就读取 `onClick: runTestSwitch` / `onClick: clearTestSwitch`，而这两个处理函数用 `const` 声明在其后，于是**数据加载完成后的首次完整渲染**抛 `ReferenceError: Cannot access 'runTestSwitch' before initialization`（`ProviderFailoverPanel`）。首屏 `status === null` 会早退渲染「读取中…」，不经过该路径，所以表现为「设置 → Provider 故障转移**整块空白**」，且刷新多少次都一样。
+- **修法**：把 `runTestSwitch` / `clearTestSwitch` 前移到 `testCard` 之前，并在该处注释说明顺序是硬约束；界面文案与渲染结构零变化。
+- **验证**：
+  - 离线渲染桩（Node + React 桩 + 真实 `GET /provider-failover/status` 载荷）：修复前第 1 次完整渲染即抛上述 `ReferenceError`；修复后稳定渲染 8 个子块。
+  - 真实宿主（`dsh web`）：打开 设置 → Provider 故障转移，面板完整渲染（标题 / 启用开关 / 最小切换间隔 / 单 turn 上限 / 启动对齐档位 / 档内排序模式 / key 列表 / 档位表），控制台无 `exception`。
+- **生效条件**：客户端半改动必须重启 `dsh web`，并用启动时打印的新 token 地址重开页面（见「安装与回滚」）。
+
 ## 开发
 
 ```powershell
@@ -196,3 +207,12 @@ node probe/mock-llm.mjs 8799     # 本地 mock LLM 端点（配合 probe/dsh-fai
 ```
 
 `probe/` 内全部凭据均为假值，不依赖任何真实服务。
+
+## 宿主兼容性（2026-09-23 复查：dsh 0.1.5-rc.3 + dsh-permission-compat）
+
+宿主升级 `0.1.5-rc.2 → rc.3`（npm latest）并打上全局 `dsh-permission-compat` 沙箱补丁（改 `dsh-sandbox` + 三个工具守卫）后复查，**本插件零改动可用**：
+
+- 与补丁无关：源码不引用 `sandbox_permissions` / `justification` / `approveEscalation` / `WIDER_MODES` 等提权 API（grep 零命中）。补丁只把「冗余提权声明」这一类原本会抛错的调用归一化，**不改写任何 LLM 失败码与错误文案**，`QUOTA`/`AUTH`/`RATE_LIMIT`/`SERVER` 归一化判定与消息模式兜底不受影响；本插件观察的是 `agent/request-error`（LLM 层），不是工具结果层。
+- 与 rc.3 无关：`agent/request`（`dsh-agent`、`dsh-agent-loop`）与 `agent/request-error`（`dsh-agent-loop`、`dsh-llm-retry`）在 rc.3 内核逐字存在；`dsh-agent-loop` / `dsh-agent` / `dsh-llm-retry` 的 rc.2↔rc.3 发布包仅 package.json 版本号差异，waterfall 语义未变。
+
+复查记录见 vault `70-WorkSpace/dsh工具维护日志.md` 2026-09-23 条目；复装说明见 `70-WorkSpace/dsh复装说明.md`。

@@ -252,23 +252,6 @@ window.__ModuleLoader__.load({
           h("span", { className: "pf-hint" }, "清空某条目的全部引用 = 删除该覆盖，回退 profile patch 的 keys"),
           keyError.length > 0 ? h("span", { className: "pf-err" }, keyError) : null));
 
-      const testCard = h("div", { className: "pf-card" },
-        h("div", { className: "pf-hint" }, "测试切换（会话级）——把当前会话所选 provider/模型切到指定条目，验证档位是否可用；也可在对话窗输入 /failover-test [tier:N|条目 id|clear]。"),
-        h("div", { className: "pf-row" },
-          h("label", { htmlFor: "pf-test-target" }, "目标条目"),
-          h("select", { id: "pf-test-target", value: testTarget, onChange: (event) => { setTestTarget(event.target.value); setTestMsg(""); } },
-            h("option", { value: "" }, "（下一个启用条目）"),
-            (status.testTargets === undefined ? [] : status.testTargets).map((item) =>
-              h("option", { key: item.id, value: item.id }, String(item.id) + " → " + String(item.route) + "/" + String(item.model) + "（档 " + String(item.tier) + "）")))),
-        h("div", { className: "pf-actions" },
-          h("button", { className: "pf-btn", disabled: busy === true, onClick: runTestSwitch }, busy === true ? "切换中…" : "测试切换"),
-          h("button", { className: "pf-btn", disabled: busy === true, onClick: clearTestSwitch }, "解除测试切换"),
-          status.pins === undefined || status.pins.length === 0
-            ? h("span", { className: "pf-hint" }, "当前无测试切换")
-            : h("span", { className: "pf-hint" }, "当前 pin：" + status.pins.map((pin) => String(pin.session) + " → " + String(pin.route) + "/" + String(pin.model)).join("、")),
-          testMsg.length > 0 ? h("span", { className: testMsgKind === "error" ? "pf-err" : "pf-ok" }, testMsg) : null),
-        h("div", { className: "pf-hint" }, "说明：目标会话默认取最近活跃会话；切换走官方模型选择通路，会同时把该选择存为默认模型；pin 30 分钟后自动失效。"));
-
       /** 测试切换：切到目标条目（空 = 下一个启用条目），并展示结果。 */
       const runTestSwitch = async () => {
         setBusy(true);
@@ -301,6 +284,30 @@ window.__ModuleLoader__.load({
           setBusy(false);
         }
       };
+
+      /**
+       * 测试切换卡片。必须定义在 `runTestSwitch` / `clearTestSwitch` 之后：
+       * 本对象在渲染期就被构造，`onClick: runTestSwitch` 会立刻读取该绑定，
+       * 若两个处理函数仍在 TDZ 中，整个面板渲染会抛
+       * `Cannot access 'runTestSwitch' before initialization`，该设置小节
+       * 因而整体空白（首屏「读取中…」不触发，故不易察觉）。
+       */
+      const testCard = h("div", { className: "pf-card" },
+        h("div", { className: "pf-hint" }, "测试切换（会话级）——把当前会话所选 provider/模型切到指定条目，验证档位是否可用；也可在对话窗输入 /failover-test [tier:N|条目 id|clear]。"),
+        h("div", { className: "pf-row" },
+          h("label", { htmlFor: "pf-test-target" }, "目标条目"),
+          h("select", { id: "pf-test-target", value: testTarget, onChange: (event) => { setTestTarget(event.target.value); setTestMsg(""); } },
+            h("option", { value: "" }, "（下一个启用条目）"),
+            (status.testTargets === undefined ? [] : status.testTargets).map((item) =>
+              h("option", { key: item.id, value: item.id }, String(item.id) + " → " + String(item.route) + "/" + String(item.model) + "（档 " + String(item.tier) + "）")))),
+        h("div", { className: "pf-actions" },
+          h("button", { className: "pf-btn", disabled: busy === true, onClick: runTestSwitch }, busy === true ? "切换中…" : "测试切换"),
+          h("button", { className: "pf-btn", disabled: busy === true, onClick: clearTestSwitch }, "解除测试切换"),
+          status.pins === undefined || status.pins.length === 0
+            ? h("span", { className: "pf-hint" }, "当前无测试切换")
+            : h("span", { className: "pf-hint" }, "当前 pin：" + status.pins.map((pin) => String(pin.session) + " → " + String(pin.route) + "/" + String(pin.model)).join("、")),
+          testMsg.length > 0 ? h("span", { className: testMsgKind === "error" ? "pf-err" : "pf-ok" }, testMsg) : null),
+        h("div", { className: "pf-hint" }, "说明：目标会话默认取最近活跃会话；切换走官方模型选择通路，会同时把该选择存为默认模型；pin 30 分钟后自动失效。"));
 
       const numberRow = (key, label, hint) =>
         h("div", { className: "pf-row", key: key },
