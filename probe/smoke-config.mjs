@@ -259,7 +259,7 @@ check('resolveTestTarget 跳过未启用档位', __test.resolveTestTarget(TEST_T
 check('resolveTestTarget 无匹配当前 provider 时从首项开始', __test.resolveTestTarget(TEST_TIERS, '', 'unknown').entry.id === 'ais')
 
 // 最小同构 ctx：只挂测试切换需要的能力（settings / webServer / commands / sessionController）
-const makeSwitchEnv = (controller, patch) => {
+const makeSwitchEnv = (controller, patch, resolveModelInfo) => {
   const routes = {}
   const disposers = []
   const handlers = {}
@@ -268,7 +268,7 @@ const makeSwitchEnv = (controller, patch) => {
     logger: { warn: () => {} },
     effect: (fn) => { const d = fn(); if (typeof d === 'function') disposers.push(d); return () => {} },
     on: (event, fn) => { handlers[event] = fn },
-    get: (n) => n === 'llm' ? { listProviders: () => [], listConfigurableProviders: () => [] } : n === 'sessionController' ? controller : undefined,
+    get: (n) => n === 'llm' ? { listProviders: () => [], listConfigurableProviders: () => [], ...(resolveModelInfo === undefined ? {} : { resolveModelInfo }) } : n === 'sessionController' ? controller : undefined,
     inject: (deps, cb) => {
       if (deps.includes('settings')) cb({ settings: { register: () => ({ get: () => ({ enabled: true, minSwitchIntervalMs: 1000, maxSwitchesPerTurn: 6, startupPreferTier: 1, rankingMode: 'keywords', keyResetAt: '06:00', keysByEntry: {} }), watch: () => () => {}, update: async () => {} }) } })
       if (deps.includes('webServer')) cb({ webServer: { register: (r) => { routes[r.path] = r.handler; return () => {} } } })
@@ -320,6 +320,42 @@ const env15 = makeSwitchEnv(undefined, SWITCH_PATCH)
 const noController = await postTest(env15, { sessionId: 's5', entry: 'relay' })
 check('sessionController 未组合时报错而非静默', noController.status === 400 && String(noController.body.error).includes('session controller'), JSON.stringify(noController.body))
 for (const env of [env12, env13, env14, env15]) for (const dispose of env.disposers) dispose()
+
+// 2026-09-24：宿主对不支持的推理层级抛 UNSUPPORTED_REASONING_EFFORT（实测
+// `ais-2dsglm/deepseek-v4.1-flash` 未声明 reasoningEfforts），插件必须自己拦住。
+console.log('条目推理层级与模型目录一致性（UNSUPPORTED_REASONING_EFFORT 防护）:')
+const noReasoning = {}
+check('未声明 reasoningEffort 的条目一致', __test.unsupportedReasoningEffort({ reasoningEffort: undefined }, noReasoning) === undefined)
+check('模型无 reasoning 时任何层级都不支持', __test.unsupportedReasoningEffort({ reasoningEffort: 'medium' }, noReasoning) !== undefined)
+check('层级不在 efforts 中即不支持', __test.unsupportedReasoningEffort({ reasoningEffort: 'medium' }, { reasoning: { efforts: [{ id: 'high' }] } }) !== undefined)
+check('层级在 efforts 中即支持', __test.unsupportedReasoningEffort({ reasoningEffort: 'medium' }, { reasoning: { efforts: [{ id: 'low' }, { id: 'medium' }] } }) === undefined)
+
+// 预检路径：首条目声明了模型不支持的层级 → 跳过，落到下一个可用条目（而不是打断整轮）。
+const PRECHECK_TIERS = [{
+  tier: 1,
+  enabled: true,
+  entries: [
+    { id: 'unsupported', route: 'r-bad', model: 'm-bad', reasoningEffort: 'medium', enabled: true },
+    { id: 'fallback', route: 'r-ok', model: 'm-ok', enabled: true },
+  ],
+}]
+const env16 = makeSwitchEnv(undefined, { probeTarget: true, startup: { preferTier: 1 }, tiers: PRECHECK_TIERS }, async () => noReasoning)
+const aligned16 = await env16.handlers['agent/request']({ agent: { session: { id: 'p1' } }, turn: 1, step: 1 }, async () => ({ provider: 'r-other', model: 'm-other' }))
+check('预检跳过不支持推理层级的候选', aligned16.provider === 'r-ok' && aligned16.model === 'm-ok', JSON.stringify(aligned16))
+check('跳过后不下发任何 reasoningEffort', aligned16.reasoningEffort === undefined, JSON.stringify(aligned16))
+const env17 = makeSwitchEnv(undefined, { probeTarget: true, startup: { preferTier: 1 }, tiers: PRECHECK_TIERS }, async () => ({ reasoning: { efforts: [{ id: 'medium' }] } }))
+const aligned17 = await env17.handlers['agent/request']({ agent: { session: { id: 'p2' } }, turn: 1, step: 1 }, async () => ({ provider: 'r-other', model: 'm-other' }))
+check('层级受支持时候选正常下发 reasoningEffort', aligned17.provider === 'r-bad' && aligned17.reasoningEffort === 'medium', JSON.stringify(aligned17))
+
+// 测试切换路径：条目层级不受支持时丢弃（官方 selectModel 会校验并抛错）。
+const DROP_TIERS = [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm1', reasoningEffort: 'medium', enabled: true }] }]
+const dropSelections = []
+const dropController = { selectModel: async (request) => { dropSelections.push(request); return { selected: { provider: request.provider, model: request.model } } } }
+const env18 = makeSwitchEnv(dropController, { startup: { preferTier: 1 }, tiers: DROP_TIERS }, async () => noReasoning)
+const res18 = await postTest(env18, { sessionId: 's6', entry: 'ais' })
+check('测试切换丢弃模型不支持的推理层级', res18.status === 200 && dropSelections.at(-1).reasoningEffort === undefined, JSON.stringify(dropSelections.at(-1)))
+check('pin 也不带被丢弃的层级', res18.body.pin.reasoningEffort === undefined, JSON.stringify(res18.body.pin))
+for (const env of [env16, env17, env18]) for (const dispose of env.disposers) dispose()
 
 console.log(failures.length === 0 ? '\nALL PASSED' : '\nFAILURES: ' + failures.length)
 process.exitCode = failures.length === 0 ? 0 : 1

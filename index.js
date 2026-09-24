@@ -219,6 +219,22 @@ function isCredentialRef(value) {
   return typeof value === 'string' && KEY_REF_PATTERN.test(value)
 }
 
+/**
+ * 条目 `reasoningEffort` 与模型目录声明的一致性检查（纯函数）。
+ * 口径与宿主 `dsh-llm` 一致：模型未暴露 reasoning 时**任何**层级都不支持；暴露时层级必须
+ * 出现在 `reasoning.efforts` 中。返回「不支持」的原因文本；一致或条目未声明层级时返回 undefined。
+ */
+function unsupportedReasoningEffort(entry, info) {
+  const requested = isPlainObject(entry) ? entry.reasoningEffort : undefined
+  if (requested === undefined) return undefined
+  const reasoning = isPlainObject(info) ? info.reasoning : undefined
+  if (isPlainObject(reasoning) !== true) return 'but the model exposes no reasoning levels'
+  const efforts = Array.isArray(reasoning.efforts) ? reasoning.efforts : []
+  if (efforts.some((effort) => isPlainObject(effort) && effort.id === requested)) return undefined
+  const exposed = efforts.map((effort) => String(isPlainObject(effort) ? effort.id : effort)).filter((id) => id.length > 0)
+  return 'but the model exposes: ' + (exposed.length > 0 ? exposed.join(', ') : '(none)')
+}
+
 /** 条目内 key 轮换序列的纯函数：从 `active` 之后环形前进，返回第一个 `isUsable` 的引用。 */
 function selectNextRef(keys, active, isUsable) {
   if (Array.isArray(keys) !== true || keys.length === 0) return undefined
@@ -693,15 +709,16 @@ export function apply(ctx, rawConfig) {
       throw new Error('session controller is not composed; cannot switch the session model')
     }
     const entry = target.entry
+    const effort = await usableEffort(entry)
     const request = { sessionId, provider: entry.route, model: entry.model }
-    if (entry.reasoningEffort !== undefined) request.reasoningEffort = entry.reasoningEffort
+    if (effort !== undefined) request.reasoningEffort = effort
     const result = await controller.selectModel(request)
     const selected = result !== null && typeof result === 'object' && result.selected !== undefined ? result.selected : {}
     const pin = {
       entryId: entry.id,
       route: String(selected.provider ?? entry.route),
       model: String(selected.model ?? entry.model),
-      reasoningEffort: selected.reasoningEffort ?? entry.reasoningEffort,
+      reasoningEffort: selected.reasoningEffort ?? effort,
       tier: target.tier.tier,
       at: Date.now(),
     }
@@ -889,18 +906,48 @@ export function apply(ctx, rawConfig) {
     if (state.switchLog.length > 50) state.switchLog.length = 50
   }
 
-  /** 目标预检：路由/模型必须能被解析；失败即视为候选不合格。 */
+  /**
+   * 目标预检：路由/模型必须能被解析；声明了 `reasoningEffort` 的条目还必须确认该层级受模型支持。
+   * 任一不满足即视为候选不合格——跳过候选，而不是把 `UNSUPPORTED_REASONING_EFFORT` 抛给宿主打断整轮。
+   */
   async function serviceable(entry, signal) {
     if (config.probeTarget !== true) return true
     const service = llm()
     if (service === undefined || typeof service.resolveModelInfo !== 'function') return true
+    let info
     try {
-      await service.resolveModelInfo(entry.route, entry.model, signal)
-      return true
+      info = await service.resolveModelInfo(entry.route, entry.model, signal)
     } catch (error) {
       console.warn('[dsh-provider-failover] candidate skipped (unresolvable): ' + entry.route + '/' + entry.model + ' — ' + messageOf(error))
       return false
     }
+    const unsupported = unsupportedReasoningEffort(entry, info)
+    if (unsupported !== undefined) {
+      console.warn('[dsh-provider-failover] candidate skipped (unsupported reasoning effort): ' + entry.route + '/' + entry.model + ' reasoningEffort "' + String(entry.reasoningEffort) + '" ' + unsupported)
+      return false
+    }
+    return true
+  }
+
+  /**
+   * 测试切换下发的推理层级：条目声明了 `reasoningEffort` 但模型目录不支持时**丢弃并警告**。
+   * 官方 `selectModel` 会按模型能力校验层级并抛错，不能让一次测试切换打断会话。
+   * 解析服务不可用时保持原样，交由官方通路自行判定。
+   */
+  async function usableEffort(entry) {
+    if (entry.reasoningEffort === undefined) return undefined
+    const service = llm()
+    if (service === undefined || typeof service.resolveModelInfo !== 'function') return entry.reasoningEffort
+    let info
+    try {
+      info = await service.resolveModelInfo(entry.route, entry.model)
+    } catch (error) {
+      return entry.reasoningEffort
+    }
+    const unsupported = unsupportedReasoningEffort(entry, info)
+    if (unsupported === undefined) return entry.reasoningEffort
+    console.warn('[dsh-provider-failover] test switch drops reasoning effort: ' + entry.route + '/' + entry.model + ' reasoningEffort "' + String(entry.reasoningEffort) + '" ' + unsupported)
+    return undefined
   }
 
   function compatible(entry, needs) {
@@ -1497,4 +1544,4 @@ export function normalize(raw) {
 export { masked }
 
 /** 内部纯函数，供冒烟测试断言（不属于对外契约）。 */
-export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef, resolveTestTarget }
+export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef, resolveTestTarget, unsupportedReasoningEffort }
