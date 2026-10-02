@@ -43,6 +43,7 @@ window.__ModuleLoader__.load({
       ".pf-keyrow>input{flex:1 1 auto;padding:4px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-mono,monospace);font-size:12px}",
       ".pf-badge{flex:0 0 auto;font-size:12px;padding:1px 6px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1)}",
       ".pf-badge-active{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}",
+      ".pf-badge-ok{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}",
       ".pf-badge-failed{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}",
       ".pf-badge-muted{color:var(--dsw-alias-label-secondary)}",
       ".pf-entry{border-top:1px solid var(--dsw-alias-border-l1);padding-top:8px;display:flex;flex-direction:column;gap:6px}",
@@ -56,8 +57,8 @@ window.__ModuleLoader__.load({
       ".pf-list{margin:0;padding-left:18px}",
     ].join("");
 
-    async function apiFetch(url, options) {
-      const response = await fetch(url, Object.assign({}, options, { signal: AbortSignal.timeout(15000) }));
+    async function apiFetch(url, options, timeoutMs) {
+      const response = await fetch(url, Object.assign({}, options, { signal: AbortSignal.timeout(timeoutMs === undefined ? 15000 : timeoutMs) }));
       let data = null;
       try {
         data = await response.json();
@@ -90,6 +91,13 @@ window.__ModuleLoader__.load({
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body === undefined ? {} : body),
       });
+    // 全量测试是顺序真实请求，可能耗时较久（每目标最长 20s），因此放宽客户端超时到 10 分钟。
+    const probeAll = () =>
+      apiFetch(ROUTE + "/probe", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      }, 600000);
 
     function describeSwitch(entry) {
       if (entry === null || entry === undefined) return "";
@@ -110,6 +118,10 @@ window.__ModuleLoader__.load({
       const [keyError, setKeyError] = react.useState("");
       const [saved, setSaved] = react.useState("");
       const [busy, setBusy] = react.useState(false);
+      const [probeReport, setProbeReport] = react.useState(null);
+      const [probeMsg, setProbeMsg] = react.useState("");
+      const [probeMsgKind, setProbeMsgKind] = react.useState("ok");
+      const [probeBusy, setProbeBusy] = react.useState(false);
 
       /** 由状态快照构造 key 草稿：条目 id → 引用名数组（生效值，含 patch 回退）。 */
       const draftOf = (data) => {
@@ -129,6 +141,7 @@ window.__ModuleLoader__.load({
           setStatus(data);
           setForm(data.editable);
           setKeyDraft(draftOf(data));
+          if (data.lastProbe !== undefined && data.lastProbe !== null) setProbeReport(data.lastProbe);
           setError("");
         } catch (err) {
           setError(err.message);
@@ -309,6 +322,50 @@ window.__ModuleLoader__.load({
           testMsg.length > 0 ? h("span", { className: testMsgKind === "error" ? "pf-err" : "pf-ok" }, testMsg) : null),
         h("div", { className: "pf-hint" }, "说明：目标会话默认取最近活跃会话；切换走官方模型选择通路，会同时把该选择存为默认模型；pin 30 分钟后自动失效。"));
 
+      /** 全量测试：对启用档位的每个 provider/model 发最小真实请求，展示状态。 */
+      const runProbeAll = async () => {
+        setProbeBusy(true);
+        setProbeMsgKind("ok");
+        setProbeMsg("测试中…（向每个启用条目发送真实最小请求，可能耗时数十秒）");
+        try {
+          const data = await probeAll();
+          setProbeReport(data);
+          setProbeMsgKind("ok");
+          setProbeMsg("完成：" + String(data.summary.ok) + "/" + String(data.summary.total) + " 正常，用时 " + String(data.elapsedMs) + "ms");
+        } catch (err) {
+          setProbeMsgKind("error");
+          setProbeMsg(err.message);
+        } finally {
+          setProbeBusy(false);
+        }
+      };
+
+      const probeBadge = (item) =>
+        h("span", {
+          className: "pf-badge " + (item.status === "OK"
+            ? "pf-badge-ok"
+            : (item.status === "TIMEOUT" || item.status === "UNSUPPORTED_REASONING_EFFORT" ? "pf-badge-muted" : "pf-badge-failed")),
+          title: item.message === undefined ? "" : String(item.message),
+        }, String(item.label));
+
+      const probeCard = h("div", { className: "pf-card" },
+        h("div", { className: "pf-hint" }, "全量测试——对「启用档位」下的每个 provider/model 发送一条最小真实请求，列出返回状态（额度不足 / 凭据 / 限流 / 网络 / 超时等）。会在真实路由上消耗少量额度；也可在对话窗输入 /failover-probe。"),
+        h("div", { className: "pf-actions" },
+          h("button", { className: "pf-btn", disabled: probeBusy === true, onClick: runProbeAll }, probeBusy === true ? "测试中…" : "开始全量测试"),
+          probeMsg.length > 0 ? h("span", { className: probeMsgKind === "error" ? "pf-err" : "pf-ok" }, probeMsg) : null),
+        probeReport === null || probeReport === undefined
+          ? h("div", { className: "pf-sub" }, "暂无全量测试结果")
+          : h("div", null,
+              h("div", { className: "pf-hint" }, "时间：" + new Date(probeReport.at).toLocaleString() + " · 用时 " + String(probeReport.elapsedMs) + "ms · 每目标超时 " + String(probeReport.timeoutMs) + "ms"),
+              h("ul", { className: "pf-list" }, probeReport.results.map((item, index) =>
+                h("li", { key: String(item.id) + "-" + String(index), className: "pf-mono" },
+                  String(item.id) + " → " + String(item.route) + "/" + String(item.model) + " ",
+                  probeBadge(item),
+                  " " + String(item.ms) + "ms",
+                  item.ok === true
+                    ? h("span", { className: "pf-hint" }, " · " + String(item.reply))
+                    : h("span", { className: "pf-err" }, " · " + String(item.message)))))));
+
       const numberRow = (key, label, hint) =>
         h("div", { className: "pf-row", key: key },
           h("label", { htmlFor: "pf-" + key }, label),
@@ -369,6 +426,8 @@ window.__ModuleLoader__.load({
         keyCard,
 
         testCard,
+
+        probeCard,
 
         h("div", { className: "pf-card" },
           h("div", { className: "pf-hint" }, "档位表（只读，与宿主 provider 目录实时关联）"),

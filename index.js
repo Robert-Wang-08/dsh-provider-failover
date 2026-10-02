@@ -176,6 +176,11 @@ const DEFAULT_TIERS = [
 /** 排序请求的输出预算：推理型模型会把较多 token 花在推理上，预算过小会导致可见输出为空。 */
 const RANKING_MAX_TOKENS = 512
 
+/** 全量测试：每个目标发送的最小探测请求参数与默认超时。 */
+const PROBE_TIMEOUT_MS = 20000
+const PROBE_MAX_TOKENS = 32
+const PROBE_PROMPT = 'Reply with the single word: ok'
+
 const DEFAULT_CONFIG = {
   enabled: true,
   terminalCodes: DEFAULT_TERMINAL_CODES,
@@ -457,16 +462,67 @@ function masked(value) {
   return text.slice(0, 6) + '····' + text.slice(-4)
 }
 
-/** 该失败是否属于「可切换」。code 命中集合或消息命中模式都算。 */
+/**
+ * 该失败是否属于「可切换」，并给设置页一个明确的“不切换原因”。
+ * 内容/安全策略拒绝必须先于通用 INVALID_REQUEST 判断：轮换 key 或 provider 不会修复提示词，
+ * 也不应把故障转移误用为绕过上游策略的机制。
+ */
 function isSwitchable(config, code, message) {
   const normalized = typeof code === 'string' ? code.toUpperCase() : ''
-  if (config.terminalCodes.has(normalized)) return { hit: true, how: 'code:' + normalized }
-  if (normalized === 'CONTEXT_WINDOW_EXCEEDED' || normalized === 'INVALID_REQUEST') return { hit: false, how: '' }
   const haystack = (String(message ?? '') + ' ' + normalized).toLowerCase()
-  for (const pattern of config.failurePatterns) {
-    if (haystack.indexOf(pattern) >= 0) return { hit: true, how: 'pattern:' + pattern }
+  const policyCodes = new Set(['CONTENT_POLICY_VIOLATION', 'MODERATION_BLOCKED', 'PROMPT_BLOCKED', 'SAFETY'])
+  const policyPatterns = ['usage policy', 'content policy', 'safety policy', 'potentially violating', 'prompt was flagged']
+  if (policyCodes.has(normalized) || policyPatterns.some((pattern) => haystack.includes(pattern))) {
+    return {
+      hit: false,
+      category: 'policy',
+      reason: '提示词被上游内容/安全策略拒绝；不会轮换密钥或切换 Provider，请修改提示词后重试。',
+    }
   }
-  return { hit: false, how: '' }
+  if (normalized === 'CONTEXT_WINDOW_EXCEEDED') {
+    return { hit: false, category: 'context', reason: '上下文窗口超限；切换密钥无效，请缩短上下文或先压缩。' }
+  }
+  if (normalized === 'INVALID_REQUEST') {
+    return { hit: false, category: 'invalid-request', reason: '请求参数无效；切换密钥无效，请修正请求配置。' }
+  }
+  if (normalized === 'UNSUPPORTED_REASONING_EFFORT') {
+    return { hit: false, category: 'configuration', reason: '模型不支持当前推理档位；请关闭推理档位或选择兼容模型。' }
+  }
+  if (config.terminalCodes.has(normalized)) return { hit: true, how: 'code:' + normalized, category: 'switchable' }
+  for (const pattern of config.failurePatterns) {
+    if (haystack.indexOf(pattern) >= 0) return { hit: true, how: 'pattern:' + pattern, category: 'switchable' }
+  }
+  return { hit: false, category: 'other', reason: '该错误不属于额度、凭据、过载或限流故障；保持当前模型。' }
+}
+
+/** 全量测试的状态标签：失败编码 → 中文状态（供设置页/指令展示）。 */
+const PROBE_STATUS_LABELS = {
+  QUOTA: '额度不足',
+  AUTH: '凭据无效',
+  INVALID_CREDENTIAL: '凭据无效',
+  MISSING_CREDENTIAL: '凭据缺失',
+  NO_ADAPTER: '路由未注册/无适配器',
+  RATE_LIMIT: '限流',
+  SERVER: '服务端/网络异常',
+  CONTEXT_WINDOW_EXCEEDED: '上下文超限',
+  INVALID_REQUEST: '请求无效',
+  UNSUPPORTED_REASONING_EFFORT: '推理档位不支持',
+}
+
+/**
+ * 把一次探测失败的编码/消息归类成可展示状态（纯函数）。
+ * 归一化编码优先；未归一化时按消息（超时/中断关键词）兜底。
+ */
+function classifyProbeFailure(code, message) {
+  const normalized = typeof code === 'string' ? code.toUpperCase() : ''
+  const haystack = (String(message ?? '') + ' ' + normalized).toLowerCase()
+  const detail = String(message ?? '').slice(0, 200)
+  if (haystack.includes('timeout') || haystack.includes('timed out') || haystack.includes('aborted')) {
+    return { status: 'TIMEOUT', label: '超时/无响应', message: detail.length > 0 ? detail : 'no response in time' }
+  }
+  const label = PROBE_STATUS_LABELS[normalized]
+  if (label !== undefined) return { status: normalized, label, message: detail }
+  return { status: normalized.length > 0 ? normalized : 'UNKNOWN', label: '未知错误', message: detail.length > 0 ? detail : 'no failure message' }
 }
 
 function tierOf(config, route) {
@@ -544,6 +600,8 @@ export function apply(ctx, rawConfig) {
     routeHealth: new Map(),
     /** 最近转移记录（上限 50） */
     switchLog: [],
+    /** 最近未切换决策（策略拒绝、参数错误等；上限 50） */
+    ignoredLog: [],
     /** stepKey -> { attempted:Set<'entryId@route#ref'>, target, switches, needs, at } */
     steps: new Map(),
     /** key 候选的预检警告去重（每引用每进程一次，避免刷屏） */
@@ -570,8 +628,16 @@ export function apply(ctx, rawConfig) {
     rankingCache: new Map(),
     /** 进行中的排序请求 signal 集合（钩子据此豁免自身调用；支持并发） */
     rankingSignals: new Set(),
+    /** 进行中的全量测试请求 signal 集合（同样豁免插件钩子，避免污染 pendingNeeds） */
+    probeSignals: new Set(),
+    /** 一次全量测试进行中：避免并发重入 */
+    probeRunning: false,
+    /** 最近一次全量测试报告（内存态，供 /status 与设置页回显） */
+    lastProbe: undefined,
     /** 最近一次会话身份 { id, at }，供旁路排序调用使用（短 TTL） */
     lastSessionId: undefined,
+    /** 已完成“启动对齐”判定的 live Agent；只判定一次，避免覆盖会话内显式选模。 */
+    startupHandled: new WeakSet(),
     /** settings scope（settings 服务未组合时为 undefined） */
     settings: undefined,
     /** settings 同步函数，/config 路由保存后用它立即预演，避免响应竞态 */
@@ -728,17 +794,121 @@ export function apply(ctx, rawConfig) {
     return pin
   }
 
-  /** 可用测试目标清单（供界面下拉与指令报错提示）。 */
-  function testTargets() {
-    const targets = []
+  /** 启用档位下的启用条目（「打开状态」的 provider+model），保留 tier/entry 引用。 */
+  function enabledTargets() {
+    const list = []
     for (const tier of config.tiers) {
       if (tier.enabled !== true) continue
       for (const entry of tier.entries) {
         if (entry.enabled !== true) continue
-        targets.push({ id: entry.id, route: entry.route, model: entry.model, tier: tier.tier })
+        list.push({ tier, entry })
       }
     }
-    return targets
+    return list
+  }
+
+  /** 可用测试目标清单（供界面下拉与指令报错提示）。 */
+  function testTargets() {
+    return enabledTargets().map((item) => ({ id: item.entry.id, route: item.entry.route, model: item.entry.model, tier: item.tier.tier }))
+  }
+
+  /**
+   * 全量测试单个目标：发送一条最小真实请求并读回首个可见文本；
+   * 返回统一结构 { id, route, model, reasoningEffort?, tier?, ok, status, label, ms, reply?, message? }。
+   * 不复用 agent 循环，直连 `ctx.llm.stream`；用专用 signal 让本插件钩子跳过它。
+   * 条目声明的推理层级若确认不被模型支持，直接判为配置问题（不消耗额度）。
+   */
+  async function probeOne(entry, timeoutMs, signal) {
+    const base = { id: entry.id, route: entry.route, model: entry.model, reasoningEffort: entry.reasoningEffort, checkedAt: Date.now() }
+    const service = llm()
+    if (service === undefined || typeof service.stream !== 'function') {
+      return { ...base, ok: false, ms: 0, status: 'NO_LLM', label: 'LLM 服务不可用', message: 'llm service is not composed' }
+    }
+    if (entry.reasoningEffort !== undefined && typeof service.resolveModelInfo === 'function') {
+      try {
+        const info = await service.resolveModelInfo(entry.route, entry.model, signal)
+        const unsupported = unsupportedReasoningEffort(entry, info)
+        if (unsupported !== undefined) {
+          return { ...base, ok: false, ms: 0, status: 'UNSUPPORTED_REASONING_EFFORT', label: '推理档位不支持', message: 'reasoningEffort "' + String(entry.reasoningEffort) + '" ' + unsupported }
+        }
+      } catch (error) {
+        // 解析服务不可用不阻断真实探测，交给请求本身判定。
+      }
+    }
+    const controller = new AbortController()
+    const startedAt = Date.now()
+    const timer = setTimeout(() => controller.abort(new Error('probe timeout')), timeoutMs)
+    if (signal !== undefined) signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true })
+    let text = ''
+    let blockText = ''
+    let streamFailure
+    let thrown
+    try {
+      state.probeSignals.add(controller.signal)
+      const request = { provider: entry.route, model: entry.model, messages: [{ role: 'user', content: [{ type: 'text', text: PROBE_PROMPT }] }], maxTokens: PROBE_MAX_TOKENS, signal: controller.signal }
+      if (entry.reasoningEffort !== undefined) request.reasoningEffort = entry.reasoningEffort
+      // 会话作用域的路由需要把会话身份带给适配器（否则 400 MissingSessionID）；只带最近 1 小时内的身份。
+      const session = state.lastSessionId
+      if (session !== undefined && Date.now() - session.at < 3600000) request.sessionId = session.id
+      const stream = service.stream(request)
+      for await (const chunk of stream) {
+        if (chunk === null || chunk === undefined) continue
+        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
+        else if (chunk.type === 'block-end' && chunk.block?.type === 'text' && typeof chunk.block.text === 'string') blockText += chunk.block.text
+        else if (chunk.type === 'finish' && (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted')) {
+          streamFailure = chunk.reason.failure ?? { message: 'stream ' + String(chunk.reason.kind) }
+        }
+      }
+      if (text.length === 0) text = blockText
+    } catch (error) {
+      thrown = error
+    } finally {
+      clearTimeout(timer)
+      state.probeSignals.delete(controller.signal)
+    }
+    const ms = Date.now() - startedAt
+    if (controller.signal.aborted) {
+      return { ...base, ok: false, ms, status: 'TIMEOUT', label: '超时/无响应', message: '超过 ' + String(timeoutMs) + 'ms 未完成' }
+    }
+    if (streamFailure !== undefined) {
+      const cls = classifyProbeFailure(streamFailure.code, streamFailure.message)
+      return { ...base, ok: false, ms, status: cls.status, label: cls.label, message: cls.message }
+    }
+    if (thrown !== undefined) {
+      const cls = classifyProbeFailure(thrown.code, messageOf(thrown))
+      return { ...base, ok: false, ms, status: cls.status, label: cls.label, message: cls.message }
+    }
+    const reply = String(text).trim().slice(0, 120)
+    return { ...base, ok: true, ms, status: 'OK', label: '正常', reply: reply.length > 0 ? reply : '(空回复)', message: '' }
+  }
+
+  /** 全量测试：顺序探测所有「打开状态」的目标，返回汇总报告并记入 state.lastProbe。 */
+  async function probeAll(options) {
+    const opts = isPlainObject(options) ? options : {}
+    if (state.probeRunning === true) return { ok: false, error: 'a probe run is already in progress', results: [] }
+    const wanted = optionalString(opts.entry)
+    const targets = enabledTargets().filter((item) => wanted === undefined || item.entry.id === wanted)
+    if (targets.length === 0) {
+      return { ok: false, error: wanted === undefined ? 'no enabled entry to test (enable a tier/entry first)' : 'no enabled entry with id ' + wanted, results: [] }
+    }
+    const timeoutMs = positiveNumber(opts.timeoutMs) ? opts.timeoutMs : PROBE_TIMEOUT_MS
+    state.probeRunning = true
+    const startedAt = Date.now()
+    const results = []
+    try {
+      for (const item of targets) {
+        const result = await probeOne(item.entry, timeoutMs, opts.signal)
+        result.tier = item.tier.tier
+        results.push(result)
+        console.warn('[dsh-provider-failover] probe ' + item.entry.id + ' ' + item.entry.route + '/' + item.entry.model + ' -> ' + result.status + ' (' + String(result.ms) + 'ms)')
+      }
+    } finally {
+      state.probeRunning = false
+    }
+    const okCount = results.filter((item) => item.ok === true).length
+    const report = { ok: true, at: Date.now(), elapsedMs: Date.now() - startedAt, timeoutMs, results, summary: { total: results.length, ok: okCount, failed: results.length - okCount } }
+    state.lastProbe = report
+    return report
   }
 
   function warnRefOnce(ref, detail) {
@@ -907,6 +1077,62 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
+   * 记录一次「保持当前路由」的决策，供设置页回答“为什么没换 key/换 provider”。
+   * 同一 (turn, step, route, category) 只保留一条，避免宿主重试刷屏。
+   */
+  function pushIgnored(record) {
+    const signature = [record.turn, record.step, record.provider, record.category].join('|')
+    if (state.ignoredLog.some((item) => [item.turn, item.step, item.provider, item.category].join('|') === signature)) return
+    state.ignoredLog.unshift(record)
+    if (state.ignoredLog.length > 50) state.ignoredLog.length = 50
+  }
+
+  /**
+   * 会话是否已有用户显式选择、但尚未被某次请求真正执行（durable model/selection 投影）。
+   * 投影服务缺失时失败闭合为 undefined——此时继续走 base/options/header 判定，不静默改写。
+   */
+  function pendingSelectionOf(agent) {
+    if (agent === null || agent === undefined) return undefined
+    const registry = ctx.get('sessionProjections') ?? agent.ctx?.get?.('sessionProjections')
+    const session = agent.session
+    if (registry === undefined || session === undefined || typeof registry.stateOf !== 'function') return undefined
+    try {
+      const stateOf = registry.stateOf(session, 'modelSelection')
+      const pending = stateOf?.pending
+      return pending !== null && pending !== undefined && typeof pending.provider === 'string' ? pending : undefined
+    } catch (error) {
+      return undefined
+    }
+  }
+
+  /** 该 Agent 是否已有过真实请求头（有任何 request/header 的会话都不是“新会话”）。 */
+  function hasLoggedHeader(agent) {
+    try {
+      return agent?.session?.requestHeader?.() !== undefined
+    } catch (error) {
+      return false
+    }
+  }
+
+  /**
+   * 启动对齐只判定一次：Agent 已判定过、存在显式 pending 选择、已有持久化请求头、
+   * 或上游链已把请求路由改到非 Agent 声明路由，都视为“用户/宿主意图优先”，不介入。
+   * 返回 true 表示本插件可以执行启动对齐。
+   */
+  function startupAlignAllowed(agent, base) {
+    if (agent === null || agent === undefined) return false
+    if (state.startupHandled.has(agent)) return false
+    state.startupHandled.add(agent)
+    if (pendingSelectionOf(agent) !== undefined) return false
+    if (hasLoggedHeader(agent)) return false
+    const declaredProvider = typeof agent.options?.provider === 'string' ? agent.options.provider : ''
+    const declaredModel = typeof agent.options?.model === 'string' ? agent.options.model : ''
+    if (declaredProvider.length > 0 && base.provider !== declaredProvider) return false
+    if (declaredModel.length > 0 && base.model !== declaredModel) return false
+    return true
+  }
+
+  /**
    * 目标预检：路由/模型必须能被解析；声明了 `reasoningEffort` 的条目还必须确认该层级受模型支持。
    * 任一不满足即视为候选不合格——跳过候选，而不是把 `UNSUPPORTED_REASONING_EFFORT` 抛给宿主打断整轮。
    */
@@ -947,6 +1173,30 @@ export function apply(ctx, rawConfig) {
     const unsupported = unsupportedReasoningEffort(entry, info)
     if (unsupported === undefined) return entry.reasoningEffort
     console.warn('[dsh-provider-failover] test switch drops reasoning effort: ' + entry.route + '/' + entry.model + ' reasoningEffort "' + String(entry.reasoningEffort) + '" ' + unsupported)
+    return undefined
+  }
+
+  /**
+   * 插件改写 provider/model 时同步推理层级。旧模型（或会话持久化选择）上的
+   * `reasoningEffort` 不能原样带到新模型：目标模型不支持时宿主会在联网前抛
+   * `UNSUPPORTED_REASONING_EFFORT`，而该编码不属于可切换失败，整轮会被打断、
+   * 且待生效的会话选模永远 commit 不了——表现为「切换 provider 时持续卡在前一个故障中」。
+   * 规则：条目声明的层级最优先；否则继承层级仅在目标模型支持时保留，不支持则丢弃。
+   * 模型信息不可用（解析服务缺失/抛错）时保持原样，交由宿主自行判定。
+   */
+  async function reconcileEffort(entry, inheritedEffort, signal) {
+    if (entry.reasoningEffort !== undefined) return entry.reasoningEffort
+    if (inheritedEffort === undefined) return undefined
+    const service = llm()
+    if (service === undefined || typeof service.resolveModelInfo !== 'function') return inheritedEffort
+    let info
+    try {
+      info = await service.resolveModelInfo(entry.route, entry.model, signal)
+    } catch (error) {
+      return inheritedEffort
+    }
+    if (unsupportedReasoningEffort({ reasoningEffort: inheritedEffort }, info) === undefined) return inheritedEffort
+    console.warn('[dsh-provider-failover] dropping inherited reasoning effort "' + inheritedEffort + '" for ' + entry.route + '/' + entry.model + ' (model does not support it)')
     return undefined
   }
 
@@ -1083,8 +1333,8 @@ export function apply(ctx, rawConfig) {
   // ---------------------------------------------------------------- 钩子一
   // 每次尝试前决定本次实际使用的路由/模型/推理层级。
   ctx.on('llm/stream', (options, next) => {
-    // 插件自身的排序请求不参与路由编排（集合判断，支持并发排序）。
-    if (options?.signal !== undefined && state.rankingSignals.has(options.signal)) return next()
+    // 插件自身的排序/全量测试请求不参与路由编排（集合判断，支持并发）。
+    if (options?.signal !== undefined && (state.rankingSignals.has(options.signal) || state.probeSignals.has(options.signal))) return next()
     // 记下会话身份（带时间戳）：排序等旁路调用需要把它带给适配器（会话作用域路由会校验）。
     if (options?.sessionId !== undefined) state.lastSessionId = { id: options.sessionId, at: Date.now() }
     // 记录本步的能力需求（工具/图片），供候选兼容性过滤使用。
@@ -1113,12 +1363,17 @@ export function apply(ctx, rawConfig) {
     // 会话级测试 pin：有效期内直接下发该目标并跳过启动对齐（否则会被拉回目标档）。
     const pin = activePin(sessionIdOf(payload?.agent))
     if (pin !== undefined) {
+      const agent = payload?.agent
+      if (agent !== null && typeof agent === 'object') state.startupHandled.add(agent)
       const pinnedConfig = { ...base, provider: pin.route, model: pin.model }
-      if (pin.reasoningEffort !== undefined) pinnedConfig.reasoningEffort = pin.reasoningEffort
+      const pinEffort = await reconcileEffort({ route: pin.route, model: pin.model, reasoningEffort: pin.reasoningEffort }, base.reasoningEffort, payload?.signal)
+      if (pinEffort === undefined) delete pinnedConfig.reasoningEffort
+      else pinnedConfig.reasoningEffort = pinEffort
       return pinnedConfig
     }
-    if (target === undefined && config.startup.preferTier > 0) {
+    if (target === undefined && config.startup.preferTier > 0 && startupAlignAllowed(payload?.agent, base)) {
       // 启动对齐（口径 B）：当前路由已属于目标档则不改写，否则对齐到该档排序最前的可用条目。
+      // 它只作用于“无持久化请求、无显式选择”的全新 Agent 首个请求；之后永不覆盖会话内选模。
       const current = tierOf(config, base.provider)
       const wanted = config.tiers.find((tier) => tier.tier === config.startup.preferTier)
       if (wanted !== undefined && wanted.enabled === true && (current === undefined || current.tier !== wanted.tier)) {
@@ -1135,7 +1390,10 @@ export function apply(ctx, rawConfig) {
     if (target === undefined) return base
     // 路由与模型由条目决定；key 轮换不改这两者（只改该路由的 apiKeyEnv 引用）。
     const switchedConfig = { ...base, provider: target.entry.route, model: target.entry.model }
-    if (target.entry.reasoningEffort !== undefined) switchedConfig.reasoningEffort = target.entry.reasoningEffort
+    // 同步推理层级：条目声明的优先，否则仅在目标模型支持时保留继承层级（见 reconcileEffort）。
+    const effort = await reconcileEffort(target.entry, base.reasoningEffort, payload?.signal)
+    if (effort === undefined) delete switchedConfig.reasoningEffort
+    else switchedConfig.reasoningEffort = effort
     return switchedConfig
   })
 
@@ -1143,11 +1401,24 @@ export function apply(ctx, rawConfig) {
   ctx.on('agent/request-error', async (payload, next) => {
     if (config.enabled !== true || config.tiers.length === 0) return next()
     const failure = payload?.failure
-    const decision = isSwitchable(config, failure?.code, failure?.message)
-    if (decision.hit !== true) return next()
-
     const turn = payload?.turn ?? 0
     const step = payload?.step ?? 0
+    const decision = isSwitchable(config, failure?.code, failure?.message)
+    if (decision.hit !== true) {
+      // 记录「为什么不切换」，避免设置页/日志只看到沉默；不改变宿主原有失败路径。
+      pushIgnored({
+        at: Date.now(),
+        provider: typeof payload?.provider === 'string' ? payload.provider : '',
+        category: decision.category ?? 'other',
+        reason: decision.reason ?? '',
+        code: typeof failure?.code === 'string' ? failure.code : '',
+        message: String(failure?.message ?? '').slice(0, 200),
+        turn,
+        step,
+      })
+      return next()
+    }
+
     const record = stepState(turn, step)
     const failedRoute = typeof payload?.provider === 'string' ? payload.provider : ''
     const code = typeof failure?.code === 'string' ? failure.code.toUpperCase() : ''
@@ -1260,6 +1531,28 @@ export function apply(ctx, rawConfig) {
           }
         } catch (error) {
           return { kind: 'error', text: messageOf(error) }
+        }
+      },
+    })
+    // 对话指令：/failover-probe [条目 id]
+    // 对启用档位下的每个 provider/model 发最小真实请求，列出额度/凭据/限流/网络等状态。
+    commandsCtx.commands.register({
+      name: 'failover-probe',
+      description: '全量测试：对启用档位的每个 provider/model 发送最小请求并列出状态（额度不足/凭据/限流/网络等）',
+      handler: async (invocation) => {
+        const spec = String(invocation?.rawInput ?? '').trim()
+        if (spec === 'clear') {
+          state.lastProbe = undefined
+          return { kind: 'success', text: '已清除上一次全量测试结果。' }
+        }
+        const report = await probeAll({ entry: spec.length > 0 ? spec : undefined })
+        if (report.ok !== true) return { kind: 'error', text: report.error }
+        const lines = report.results.map((item) =>
+          '- ' + item.id + '（' + item.route + '/' + item.model + '）· ' + item.label + ' · ' + String(item.ms) + 'ms'
+          + (item.ok === true ? (item.reply !== undefined && item.reply.length > 0 ? ' · ' + item.reply : '') : ' · ' + String(item.message ?? '')))
+        return {
+          kind: 'success',
+          text: '全量测试 ' + String(report.summary.ok) + '/' + String(report.summary.total) + ' 正常，用时 ' + String(report.elapsedMs) + 'ms（超时 ' + String(report.timeoutMs) + 'ms/目标）：\n' + lines.join('\n'),
         }
       },
     })
@@ -1414,6 +1707,9 @@ export function apply(ctx, rawConfig) {
           missing: [...assigned].filter((route) => registeredIds.has(route) !== true),
         } : null,
         switches: state.switchLog.slice(-LOG_LIMIT),
+        ignored: state.ignoredLog.slice(-LOG_LIMIT),
+        lastProbe: state.lastProbe,
+        probeTimeoutMs: PROBE_TIMEOUT_MS,
         cooling: [...state.routeHealth.entries()].map(([route, health]) => ({ route: route, code: health.code, until: health.coolingUntil })),
       }
     }
@@ -1524,6 +1820,17 @@ export function apply(ctx, rawConfig) {
         return sendJson(res, 400, { ok: false, error: messageOf(error) })
       }
     })
+    // 全量测试：{entry?, timeoutMs?}；对启用档位下的每个 provider/model 发最小真实请求并列出状态。
+    register(ROUTE_BASE + '/probe', async (req, res) => {
+      if (isLocalRequest(req) !== true) return sendJson(res, 403, { ok: false, error: 'local requests only' })
+      if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only' })
+      const body = await readJsonBody(req)
+      const report = await probeAll({
+        entry: typeof body.entry === 'string' && body.entry.length > 0 ? body.entry : undefined,
+        timeoutMs: body.timeoutMs,
+      })
+      sendJson(res, report.ok === true ? 200 : 400, report)
+    })
   })
 
   const configured = config.tiers.map((tier) => String(tier.tier) + (tier.enabled ? '' : '(off)') + ':' + tier.entries.map((entry) => entry.id).join(',')).join(' | ')
@@ -1544,4 +1851,4 @@ export function normalize(raw) {
 export { masked }
 
 /** 内部纯函数，供冒烟测试断言（不属于对外契约）。 */
-export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef, resolveTestTarget, unsupportedReasoningEffort }
+export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef, resolveTestTarget, unsupportedReasoningEffort, classifyProbeFailure }

@@ -216,10 +216,10 @@ const env9 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, re
 apply(env9.ctx, { tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm' }] }] })
 const res9 = await statusOf(env9)
 check('设置层 keys 覆盖 patch keys', res9.body.tiers[0].entries[0].keys.length === 2 && res9.body.tiers[0].entries[0].keysSource === 'settings', JSON.stringify(res9.body.tiers[0].entries[0]))
-check('patch 无 keys 时默认不排程、有覆盖时按需排程', env9.disposers.length === 5, String(env9.disposers.length))
+check('patch 无 keys 时默认不排程、有覆盖时按需排程', env9.disposers.length === 6, String(env9.disposers.length))
 const noKeys = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true } } })
 apply(noKeys.ctx, { tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm' }] }] })
-check('无任何 key 引用时不排程每日重置', noKeys.disposers.length === 4, String(noKeys.disposers.length))
+check('无任何 key 引用时不排程每日重置', noKeys.disposers.length === 5, String(noKeys.disposers.length))
 
 // b) 轮换使用设置层 keys
 const rotated9 = await env9.handlers['agent/request-error'](failure, async () => 'NEXT')
@@ -259,7 +259,7 @@ check('resolveTestTarget 跳过未启用档位', __test.resolveTestTarget(TEST_T
 check('resolveTestTarget 无匹配当前 provider 时从首项开始', __test.resolveTestTarget(TEST_TIERS, '', 'unknown').entry.id === 'ais')
 
 // 最小同构 ctx：只挂测试切换需要的能力（settings / webServer / commands / sessionController）
-const makeSwitchEnv = (controller, patch, resolveModelInfo) => {
+const makeSwitchEnv = (controller, patch, resolveModelInfo, streamFn) => {
   const routes = {}
   const disposers = []
   const handlers = {}
@@ -268,7 +268,7 @@ const makeSwitchEnv = (controller, patch, resolveModelInfo) => {
     logger: { warn: () => {} },
     effect: (fn) => { const d = fn(); if (typeof d === 'function') disposers.push(d); return () => {} },
     on: (event, fn) => { handlers[event] = fn },
-    get: (n) => n === 'llm' ? { listProviders: () => [], listConfigurableProviders: () => [], ...(resolveModelInfo === undefined ? {} : { resolveModelInfo }) } : n === 'sessionController' ? controller : undefined,
+    get: (n) => n === 'llm' ? { listProviders: () => [], listConfigurableProviders: () => [], ...(resolveModelInfo === undefined ? {} : { resolveModelInfo }), ...(streamFn === undefined ? {} : { stream: streamFn }) } : n === 'sessionController' ? controller : undefined,
     inject: (deps, cb) => {
       if (deps.includes('settings')) cb({ settings: { register: () => ({ get: () => ({ enabled: true, minSwitchIntervalMs: 1000, maxSwitchesPerTurn: 6, startupPreferTier: 1, rankingMode: 'keywords', keyResetAt: '06:00', keysByEntry: {} }), watch: () => () => {}, update: async () => {} }) } })
       if (deps.includes('webServer')) cb({ webServer: { register: (r) => { routes[r.path] = r.handler; return () => {} } } })
@@ -356,6 +356,84 @@ const res18 = await postTest(env18, { sessionId: 's6', entry: 'ais' })
 check('测试切换丢弃模型不支持的推理层级', res18.status === 200 && dropSelections.at(-1).reasoningEffort === undefined, JSON.stringify(dropSelections.at(-1)))
 check('pin 也不带被丢弃的层级', res18.body.pin.reasoningEffort === undefined, JSON.stringify(res18.body.pin))
 for (const env of [env16, env17, env18]) for (const dispose of env.disposers) dispose()
+
+// 2026-10-02：插件改写 provider/model 时必须同步推理层级。旧模型（或会话持久化选择）
+// 的 reasoningEffort 带到不支持它的目标模型会抛 UNSUPPORTED_REASONING_EFFORT（不可切换），
+// 表现为「切换 provider 时持续卡在前一个故障中」。
+console.log('改写路由时的推理层级同步（继承层级不兼容即丢弃）:')
+const EFFORT_TIERS = [{ tier: 1, enabled: true, entries: [{ id: 'noeff', route: 'r-nr', model: 'm-nr', enabled: true }] }]
+const freshAgent = (id) => ({ session: { id } })
+const env19 = makeSwitchEnv(undefined, { probeTarget: true, startup: { preferTier: 1 }, tiers: EFFORT_TIERS }, async () => noReasoning)
+const out19 = await env19.handlers['agent/request']({ agent: freshAgent('e1'), turn: 1, step: 1 }, async () => ({ provider: 'r-old', model: 'm-old', reasoningEffort: 'high' }))
+check('启动对齐：目标模型不支持时丢弃继承层级', out19.provider === 'r-nr' && out19.reasoningEffort === undefined, JSON.stringify(out19))
+
+const env20 = makeSwitchEnv(undefined, { probeTarget: true, startup: { preferTier: 1 }, tiers: EFFORT_TIERS }, async () => ({ reasoning: { efforts: [{ id: 'high' }] } }))
+const out20 = await env20.handlers['agent/request']({ agent: freshAgent('e2'), turn: 1, step: 1 }, async () => ({ provider: 'r-old', model: 'm-old', reasoningEffort: 'high' }))
+check('启动对齐：目标模型支持时保留继承层级', out20.provider === 'r-nr' && out20.reasoningEffort === 'high', JSON.stringify(out20))
+
+const DECLARED_TIERS = [{ tier: 1, enabled: true, entries: [{ id: 'decl', route: 'r-d', model: 'm-d', reasoningEffort: 'medium', enabled: true }] }]
+const env21 = makeSwitchEnv(undefined, { probeTarget: true, startup: { preferTier: 1 }, tiers: DECLARED_TIERS }, async () => ({ reasoning: { efforts: [{ id: 'medium' }, { id: 'high' }] } }))
+const out21 = await env21.handlers['agent/request']({ agent: freshAgent('e3'), turn: 1, step: 1 }, async () => ({ provider: 'r-old', model: 'm-old', reasoningEffort: 'high' }))
+check('启动对齐：条目声明层级优先于继承层级', out21.provider === 'r-d' && out21.reasoningEffort === 'medium', JSON.stringify(out21))
+for (const env of [env19, env20, env21]) for (const dispose of env.disposers) dispose()
+
+// 不可切换失败必须给出原因（ignored 决策），可切换失败不得写入。
+console.log('不可切换失败的诊断记录（ignored）:')
+const IGNORE_TIERS = [{ tier: 1, enabled: true, entries: [{ id: 'a', route: 'r1', model: 'm1', enabled: true }] }]
+const env22 = makeSwitchEnv(undefined, { startup: { preferTier: 1 }, tiers: IGNORE_TIERS })
+const ignoredOut = await env22.handlers['agent/request-error']({ failure: { code: 'UNSUPPORTED_REASONING_EFFORT', message: 'does not support reasoning effort "high"' }, provider: 'r1', turn: 2, step: 2 }, async () => 'NEXT')
+const status22 = await statusOf(env22)
+check('不可切换失败交回宿主', ignoredOut === 'NEXT')
+check('记录 ignored 决策并标注 configuration', status22.body.ignored?.some((item) => item.category === 'configuration' && item.code === 'UNSUPPORTED_REASONING_EFFORT') === true, JSON.stringify(status22.body.ignored))
+const env23 = makeSwitchEnv(undefined, { startup: { preferTier: 1 }, tiers: IGNORE_TIERS })
+await env23.handlers['agent/request-error']({ failure: { code: 'QUOTA', message: 'quota exceeded' }, provider: 'r1', turn: 1, step: 1 }, async () => 'NEXT')
+const status23 = await statusOf(env23)
+check('可切换失败不写 ignored', (status23.body.ignored?.length ?? 0) === 0, JSON.stringify(status23.body.ignored))
+for (const env of [env22, env23]) for (const dispose of env.disposers) dispose()
+
+// 2026-10-02：全量测试——对启用档位的每个 provider/model 发最小真实请求并列出状态。
+console.log('全量测试（真实最小请求 + 状态分类）:')
+check('classifyProbeFailure 额度不足', __test.classifyProbeFailure('QUOTA', 'quota exceeded').label === '额度不足')
+check('classifyProbeFailure 超时兜底', __test.classifyProbeFailure(undefined, 'request timed out').status === 'TIMEOUT')
+check('classifyProbeFailure 未知编码', __test.classifyProbeFailure(undefined, 'weird thing').label === '未知错误')
+
+const PROBE_TIERS = [
+  { tier: 1, enabled: true, entries: [
+    { id: 'good', route: 'r-good', model: 'm-good', enabled: true },
+    { id: 'bad', route: 'r-bad', model: 'm-bad', enabled: true },
+    { id: 'off', route: 'r-off', model: 'm-off', enabled: false },
+  ] },
+  { tier: 2, enabled: false, entries: [{ id: 'offtier', route: 'r-x', model: 'm-x', enabled: true }] },
+]
+const streamStub = (request) => (async function* () {
+  if (request.provider === 'r-good') {
+    yield { type: 'text-delta', text: 'ok' }
+    yield { type: 'finish', reason: { kind: 'completed' } }
+  } else {
+    yield { type: 'finish', reason: { kind: 'error', failure: { code: 'QUOTA', message: 'insufficient balance' } } }
+  }
+})()
+const postProbe = async (env, body) => {
+  const req = { method: 'POST', socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify(body ?? {})) } }
+  const res = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
+  await env.routes['/provider-failover/probe'](req, res)
+  return res
+}
+const env24 = makeSwitchEnv(undefined, { tiers: PROBE_TIERS }, undefined, streamStub)
+const probeRes24 = await postProbe(env24, {})
+check('全量测试只覆盖启用档位的启用条目', probeRes24.body.results.length === 2 && probeRes24.body.results.every((item) => item.id !== 'off' && item.id !== 'offtier'), JSON.stringify(probeRes24.body.results.map((item) => item.id)))
+check('正常目标回报 OK + 回复', probeRes24.body.results.find((item) => item.id === 'good')?.status === 'OK' && probeRes24.body.results.find((item) => item.id === 'good')?.reply === 'ok', JSON.stringify(probeRes24.body.results.find((item) => item.id === 'good')))
+check('额度不足目标回报 QUOTA', probeRes24.body.results.find((item) => item.id === 'bad')?.status === 'QUOTA' && probeRes24.body.results.find((item) => item.id === 'bad')?.label === '额度不足', JSON.stringify(probeRes24.body.results.find((item) => item.id === 'bad')))
+check('全量测试汇总', probeRes24.body.summary.total === 2 && probeRes24.body.summary.ok === 1 && probeRes24.body.summary.failed === 1, JSON.stringify(probeRes24.body.summary))
+const status24 = await statusOf(env24)
+check('status 暴露 lastProbe 与 probeTimeoutMs', status24.body.lastProbe?.results?.length === 2 && typeof status24.body.probeTimeoutMs === 'number', JSON.stringify(status24.body.lastProbe?.summary))
+const single24 = await postProbe(env24, { entry: 'bad' })
+check('单条目过滤', single24.body.results.length === 1 && single24.body.results[0].id === 'bad', JSON.stringify(single24.body.results.map((item) => item.id)))
+check('未知条目报错', (await postProbe(env24, { entry: 'nope' })).status === 400)
+const probeCmd = env24.registered.find((def) => def.name === 'failover-probe')
+const cmdProbe = await probeCmd.handler({ rawInput: '', agent: { session: { id: 'x' } } })
+check('指令 /failover-probe 返回汇总文本', cmdProbe.kind === 'success' && cmdProbe.text.includes('1/2'), String(cmdProbe.text))
+for (const dispose of env24.disposers) dispose()
 
 console.log(failures.length === 0 ? '\nALL PASSED' : '\nFAILURES: ' + failures.length)
 process.exitCode = failures.length === 0 ? 0 : 1
