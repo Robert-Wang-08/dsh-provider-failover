@@ -442,5 +442,37 @@ const cmdProbe = await probeCmd.handler({ rawInput: '', agent: { session: { id: 
 check('指令 /failover-probe 返回汇总文本', cmdProbe.kind === 'success' && cmdProbe.text.includes('1/2'), String(cmdProbe.text))
 for (const dispose of env24.disposers) dispose()
 
+// 2026-10-02：跨会话状态隔离——steps 与 pendingNeeds 按 sessionId 分键。
+console.log('跨会话状态隔离:')
+const ISO_TIERS = [{ tier: 1, enabled: true, entries: [
+  { id: 'a', route: 'r1', model: 'm1', enabled: true },
+  { id: 'b', route: 'r2', model: 'm2', enabled: true },
+] }]
+const envIso = makeSwitchEnv(undefined, { startup: { preferTier: 1 }, tiers: ISO_TIERS })
+const agentA = { session: { id: 'sess-A', requestHeader: () => undefined } }
+const agentB = { session: { id: 'sess-B', requestHeader: () => undefined } }
+await envIso.handlers['agent/request-error']({ agent: agentA, failure: { code: 'QUOTA', message: 'quota exceeded' }, provider: 'r1', turn: 1, step: 1 }, async () => 'NEXT')
+const aReq = await envIso.handlers['agent/request']({ agent: agentA, turn: 1, step: 1 }, async () => ({ provider: 'r1', model: 'm1' }))
+check('会话 A 的失败切换只作用于 A', aReq.provider === 'r2' && aReq.model === 'm2', JSON.stringify(aReq))
+const bReq = await envIso.handlers['agent/request']({ agent: agentB, turn: 1, step: 1 }, async () => ({ provider: 'r1', model: 'm1' }))
+check('同 turn/step 的会话 B 不受 A 的切换影响', bReq.provider === 'r1' && bReq.model === 'm1', JSON.stringify(bReq))
+for (const dispose of envIso.disposers) dispose()
+
+const NEED_TIERS = [{ tier: 1, enabled: true, entries: [{ id: 'noimg', route: 'r-noimg', model: 'm', enabled: true, compatible: { tools: true, images: false } }] }]
+const envNeeds = makeSwitchEnv(undefined, { startup: { preferTier: 0 }, tiers: NEED_TIERS })
+envNeeds.handlers['llm/stream']({ sessionId: 'sess-A', messages: [{ role: 'user', content: [{ type: 'image' }] }] }, () => undefined)
+await envNeeds.handlers['agent/request']({ agent: { session: { id: 'sess-A' } }, turn: 1, step: 1 }, async () => ({ provider: 'r-old', model: 'm' }))
+const aErr = await envNeeds.handlers['agent/request-error']({ agent: { session: { id: 'sess-A' } }, failure: { code: 'QUOTA', message: 'quota exceeded' }, provider: 'r-old', turn: 1, step: 1 }, async () => 'NEXT')
+check('会话 A 的图片需求使不兼容候选被跳过', aErr === 'NEXT', JSON.stringify(aErr))
+envNeeds.handlers['llm/stream']({ sessionId: 'sess-B', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }, () => undefined)
+await envNeeds.handlers['agent/request']({ agent: { session: { id: 'sess-B' } }, turn: 2, step: 1 }, async () => ({ provider: 'r-old', model: 'm' }))
+const bErr = await envNeeds.handlers['agent/request-error']({ agent: { session: { id: 'sess-B' } }, failure: { code: 'QUOTA', message: 'quota exceeded' }, provider: 'r-old', turn: 2, step: 1 }, async () => 'NEXT')
+check('会话 B 不受 A 的图片需求影响（正常切换）', bErr?.kind === 'retry', JSON.stringify(bErr))
+for (const dispose of envNeeds.disposers) dispose()
+
+// 设置页需渲染 Host 的 ignored 诊断（client.js 静态检查）。
+const { readFileSync } = await import('node:fs')
+check('client.js 渲染「最近未切换原因」（status.ignored）', readFileSync(new URL('../client.js', import.meta.url), 'utf8').includes('status.ignored'))
+
 console.log(failures.length === 0 ? '\nALL PASSED' : '\nFAILURES: ' + failures.length)
 process.exitCode = failures.length === 0 ? 0 : 1

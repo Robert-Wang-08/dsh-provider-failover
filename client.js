@@ -107,6 +107,25 @@ window.__ModuleLoader__.load({
       return String(entry.from) + " → " + String(entry.to) + "（档 " + String(entry.tier) + "，" + String(entry.code) + "）";
     }
 
+    /** 未切换原因的分类中文标签（对应 Host 半 isSwitchable 的 category）。 */
+    const IGNORED_LABELS = {
+      policy: "策略拒绝",
+      context: "上下文超限",
+      "invalid-request": "请求无效",
+      configuration: "推理档位不兼容",
+      other: "其他",
+    };
+    function ignoredLabel(category) {
+      return IGNORED_LABELS[category] === undefined ? "其他" : IGNORED_LABELS[category];
+    }
+    function describeIgnored(item) {
+      const when = item.at === undefined ? "" : new Date(item.at).toLocaleTimeString();
+      const where = String(item.provider) + " · turn " + String(item.turn) + "/step " + String(item.step);
+      const code = item.code === undefined || String(item.code).length === 0 ? "" : " · " + String(item.code);
+      const why = item.reason !== undefined && String(item.reason).length > 0 ? String(item.reason) : String(item.message === undefined ? "" : item.message);
+      return "[" + ignoredLabel(item.category) + "] " + where + code + " · " + why + "（" + when + "）";
+    }
+
     function ProviderFailoverPanel() {
       const [status, setStatus] = react.useState(null);
       const [form, setForm] = react.useState(null);
@@ -459,6 +478,13 @@ window.__ModuleLoader__.load({
                   ? null
                   : h("div", { className: "pf-err" }, "档位引用了宿主未注册的路由：" + status.providers.missing.join(", ")),
               ]),
+
+        h("div", { className: "pf-card" },
+          h("div", { className: "pf-hint" }, "最近未切换原因（最多 10 条，内存态）——请求失败但插件判断不应换 key/换 provider 时记录：策略拒绝 / 请求无效 / 推理档位不兼容 等。"),
+          status.ignored === undefined || status.ignored.length === 0
+            ? h("div", { className: "pf-sub" }, "暂无记录")
+            : h("ul", { className: "pf-list pf-mono" }, status.ignored.map((entry, index) =>
+                h("li", { key: index, title: String(entry.message === undefined ? "" : entry.message) }, describeIgnored(entry))))),
 
         h("div", { className: "pf-card" },
           h("div", { className: "pf-hint" }, "最近转移（最多 10 条，内存态）"),

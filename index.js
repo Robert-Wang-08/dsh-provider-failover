@@ -624,7 +624,16 @@ export function apply(ctx, rawConfig) {
     pins: new Map(),
     /** 引用描述缓存：ref -> { configured, source, at }（短 TTL，仅用于状态展示） */
     refInfo: new Map(),
-    lastSwitchAt: 0,
+    /**
+     * 每会话的最近切换时刻（最小切换间隔护栏按会话计，避免一个会话压制另一个）。
+     * sessionId -> 毫秒时间戳。
+     */
+    lastSwitchAt: new Map(),
+    /**
+     * 每会话最近一次观测到的能力需求（工具/图片），在 llm/stream 写入、下一次
+     * agent/request 取用，作为该会话步骤的需求粘滞。sessionId -> { needs, at }。
+     */
+    pendingNeeds: new Map(),
     /** 排序结果缓存：hash -> { ids, at } */
     rankingCache: new Map(),
     /** 进行中的排序请求 signal 集合（钩子据此豁免自身调用；支持并发） */
@@ -645,7 +654,10 @@ export function apply(ctx, rawConfig) {
     syncSettings: undefined,
   }
 
-  const stepKeyOf = (turn, step) => String(turn) + '/' + String(step)
+  // 步骤记账按会话隔离：同一 (turn, step) 在两个会话里是两条独立记录，
+  // 避免并行标签页/子代理共享切换目标、尝试次数与能力需求。
+  const stepKeyOf = (sessionId, turn, step) => String(sessionId ?? '-') + '/' + String(turn) + '/' + String(step)
+  const sessionKeyOf = (sessionId) => sessionId === undefined || sessionId === null ? '-' : String(sessionId)
 
   // ------------------------------------------------------- 单路由多 key（凭据引用轮换）
 
@@ -1057,8 +1069,8 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  function stepState(turn, step) {
-    const key = stepKeyOf(turn, step)
+  function stepState(sessionId, turn, step) {
+    const key = stepKeyOf(sessionId, turn, step)
     let record = state.steps.get(key)
     if (record === undefined) {
       record = { attempted: new Set(), target: undefined, switches: 0, needs: { tools: false, images: false }, at: 0 }
@@ -1329,8 +1341,8 @@ export function apply(ctx, rawConfig) {
     return orderEntries(tier.entries, context)
   }
 
-  async function pickCandidate(turn, step, context, signal, excludeRoute) {
-    const record = stepState(turn, step)
+  async function pickCandidate(sessionId, turn, step, context, signal, excludeRoute) {
+    const record = stepState(sessionId, turn, step)
     const now = Date.now()
     for (const tier of config.tiers) {
       if (tier.enabled !== true) continue
@@ -1362,22 +1374,35 @@ export function apply(ctx, rawConfig) {
     } catch (error) {
       // 需求探测失败不应影响请求本身。
     }
-    state.pendingNeeds = needs
+    // 按会话记录，避免并行会话互相污染能力需求；带时间戳用于容量淘汰。
+    const needsKey = sessionKeyOf(options?.sessionId)
+    state.pendingNeeds.set(needsKey, { needs, at: Date.now() })
+    if (state.pendingNeeds.size > 128) {
+      let oldestKey
+      let oldestAt = Number.POSITIVE_INFINITY
+      for (const [k, v] of state.pendingNeeds) {
+        if (v.at < oldestAt) { oldestAt = v.at; oldestKey = k }
+      }
+      if (oldestKey !== undefined) state.pendingNeeds.delete(oldestKey)
+    }
     return next()
   })
 
   ctx.on('agent/request', async (payload, next) => {
     const base = await next()
     if (config.enabled !== true || config.tiers.length === 0) return base
+    const sessionId = sessionIdOf(payload?.agent)
+    const sessionKey = sessionKeyOf(sessionId)
     const turn = payload?.turn ?? 0
     const step = payload?.step ?? 0
-    const record = stepState(turn, step)
+    const record = stepState(sessionId, turn, step)
     // 需求在 llm/stream 里观测、在 request 里取用；同一 turn 内保持粘滞，避免第一步没有需求信息。
-    if (state.pendingNeeds !== undefined) record.needs = state.pendingNeeds
+    const pending = state.pendingNeeds.get(sessionKey)
+    if (pending !== undefined) record.needs = pending.needs
 
     let target = record.target
     // 会话级测试 pin：有效期内直接下发该目标并跳过启动对齐（否则会被拉回目标档）。
-    const pin = activePin(sessionIdOf(payload?.agent))
+    const pin = activePin(sessionId)
     if (pin !== undefined) {
       const agent = payload?.agent
       if (agent !== null && typeof agent === 'object') state.startupHandled.add(agent)
@@ -1393,7 +1418,7 @@ export function apply(ctx, rawConfig) {
       const current = tierOf(config, base.provider)
       const wanted = config.tiers.find((tier) => tier.tier === config.startup.preferTier)
       if (wanted !== undefined && wanted.enabled === true && (current === undefined || current.tier !== wanted.tier)) {
-        const picked = await pickCandidate(turn, step, base.provider + '/' + base.model + ' startup', payload?.signal, undefined)
+        const picked = await pickCandidate(sessionId, turn, step, base.provider + '/' + base.model + ' startup', payload?.signal, undefined)
         if (picked !== undefined) {
           target = { entry: picked.entry, tier: picked.tier, reason: 'startup-align' }
           record.target = target
@@ -1417,6 +1442,8 @@ export function apply(ctx, rawConfig) {
   ctx.on('agent/request-error', async (payload, next) => {
     if (config.enabled !== true || config.tiers.length === 0) return next()
     const failure = payload?.failure
+    const sessionId = sessionIdOf(payload?.agent)
+    const sessionKey = sessionKeyOf(sessionId)
     const turn = payload?.turn ?? 0
     const step = payload?.step ?? 0
     const decision = isSwitchable(config, failure?.code, failure?.message)
@@ -1424,6 +1451,7 @@ export function apply(ctx, rawConfig) {
       // 记录「为什么不切换」，避免设置页/日志只看到沉默；不改变宿主原有失败路径。
       pushIgnored({
         at: Date.now(),
+        session: sessionKey === '-' ? '' : sessionKey,
         provider: typeof payload?.provider === 'string' ? payload.provider : '',
         category: decision.category ?? 'other',
         reason: decision.reason ?? '',
@@ -1435,12 +1463,12 @@ export function apply(ctx, rawConfig) {
       return next()
     }
 
-    const record = stepState(turn, step)
+    const record = stepState(sessionId, turn, step)
     const failedRoute = typeof payload?.provider === 'string' ? payload.provider : ''
     const code = typeof failure?.code === 'string' ? failure.code.toUpperCase() : ''
 
     const now = Date.now()
-    if (now - state.lastSwitchAt < config.minSwitchIntervalMs) return next()
+    if (now - (state.lastSwitchAt.get(sessionKey) ?? 0) < config.minSwitchIntervalMs) return next()
     if (record.switches >= config.maxSwitchesPerTurn) return next()
 
     const failedLoc = failedRoute.length > 0 ? locateRoute(config, failedRoute) : undefined
@@ -1455,7 +1483,7 @@ export function apply(ctx, rawConfig) {
       if (rotatedTo !== undefined) {
         record.target = { entry: failedEntry, tier: failedLoc.tier, reason: 'key:' + code }
         record.switches += 1
-        state.lastSwitchAt = now
+        state.lastSwitchAt.set(sessionKey, now)
         pushLog({
           at: now,
           kind: 'key-rotate',
@@ -1486,12 +1514,12 @@ export function apply(ctx, rawConfig) {
     }
 
     const context = String(failure?.code ?? '') + ' ' + String(failure?.message ?? '') + (record.needs.tools ? ' tools' : '') + (record.needs.images ? ' images' : '')
-    const picked = await pickCandidate(turn, step, context, payload?.signal, failedRoute)
+    const picked = await pickCandidate(sessionId, turn, step, context, payload?.signal, failedRoute)
     if (picked === undefined) return next()
 
     record.target = { entry: picked.entry, tier: picked.tier, reason: decision.how }
     record.switches += 1
-    state.lastSwitchAt = now
+    state.lastSwitchAt.set(sessionKey, now)
     pushLog({
       at: now,
       kind: 'failover',
