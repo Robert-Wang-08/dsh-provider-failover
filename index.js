@@ -27,6 +27,7 @@
  */
 
 import z from '@deepseek-ai/schemastery'
+import { randomUUID } from 'node:crypto'
 
 export const name = 'dsh-provider-failover'
 
@@ -813,12 +814,26 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
+   * 探测用的会话身份。会话作用域路由（如 opencode-go）要求 `x-opencode-session`
+   * 才会被有效路由，缺失即 400 `MissingSessionID`；而 pi-ai 只在 options.sessionId 存在时
+   * 才补该标头（pi-ai/dist/providers/opencode-headers.js）。因此优先级：
+   * 显式传入 > 最近 1 小时内的活跃会话 > 新生成随机 id（保证标头始终存在）。
+   */
+  function probeSessionId(explicit) {
+    const wanted = optionalString(explicit)
+    if (wanted !== undefined) return wanted
+    const session = state.lastSessionId
+    if (session !== undefined && Date.now() - session.at < 3600000) return String(session.id)
+    return randomUUID()
+  }
+
+  /**
    * 全量测试单个目标：发送一条最小真实请求并读回首个可见文本；
    * 返回统一结构 { id, route, model, reasoningEffort?, tier?, ok, status, label, ms, reply?, message? }。
    * 不复用 agent 循环，直连 `ctx.llm.stream`；用专用 signal 让本插件钩子跳过它。
    * 条目声明的推理层级若确认不被模型支持，直接判为配置问题（不消耗额度）。
    */
-  async function probeOne(entry, timeoutMs, signal) {
+  async function probeOne(entry, timeoutMs, sessionId, signal) {
     const base = { id: entry.id, route: entry.route, model: entry.model, reasoningEffort: entry.reasoningEffort, checkedAt: Date.now() }
     const service = llm()
     if (service === undefined || typeof service.stream !== 'function') {
@@ -847,9 +862,9 @@ export function apply(ctx, rawConfig) {
       state.probeSignals.add(controller.signal)
       const request = { provider: entry.route, model: entry.model, messages: [{ role: 'user', content: [{ type: 'text', text: PROBE_PROMPT }] }], maxTokens: PROBE_MAX_TOKENS, signal: controller.signal }
       if (entry.reasoningEffort !== undefined) request.reasoningEffort = entry.reasoningEffort
-      // 会话作用域的路由需要把会话身份带给适配器（否则 400 MissingSessionID）；只带最近 1 小时内的身份。
-      const session = state.lastSessionId
-      if (session !== undefined && Date.now() - session.at < 3600000) request.sessionId = session.id
+      // 会话身份始终带上：会话作用域路由（opencode-go）靠它生成 x-opencode-session，
+      // 缺失会被网关以 400 MissingSessionID 拒绝。
+      if (sessionId !== undefined && sessionId !== null && String(sessionId).length > 0) request.sessionId = String(sessionId)
       const stream = service.stream(request)
       for await (const chunk of stream) {
         if (chunk === null || chunk === undefined) continue
@@ -892,12 +907,13 @@ export function apply(ctx, rawConfig) {
       return { ok: false, error: wanted === undefined ? 'no enabled entry to test (enable a tier/entry first)' : 'no enabled entry with id ' + wanted, results: [] }
     }
     const timeoutMs = positiveNumber(opts.timeoutMs) ? opts.timeoutMs : PROBE_TIMEOUT_MS
+    const sessionId = probeSessionId(opts.sessionId)
     state.probeRunning = true
     const startedAt = Date.now()
     const results = []
     try {
       for (const item of targets) {
-        const result = await probeOne(item.entry, timeoutMs, opts.signal)
+        const result = await probeOne(item.entry, timeoutMs, sessionId, opts.signal)
         result.tier = item.tier.tier
         results.push(result)
         console.warn('[dsh-provider-failover] probe ' + item.entry.id + ' ' + item.entry.route + '/' + item.entry.model + ' -> ' + result.status + ' (' + String(result.ms) + 'ms)')
@@ -906,7 +922,7 @@ export function apply(ctx, rawConfig) {
       state.probeRunning = false
     }
     const okCount = results.filter((item) => item.ok === true).length
-    const report = { ok: true, at: Date.now(), elapsedMs: Date.now() - startedAt, timeoutMs, results, summary: { total: results.length, ok: okCount, failed: results.length - okCount } }
+    const report = { ok: true, at: Date.now(), elapsedMs: Date.now() - startedAt, timeoutMs, sessionId, results, summary: { total: results.length, ok: okCount, failed: results.length - okCount } }
     state.lastProbe = report
     return report
   }
@@ -1545,7 +1561,7 @@ export function apply(ctx, rawConfig) {
           state.lastProbe = undefined
           return { kind: 'success', text: '已清除上一次全量测试结果。' }
         }
-        const report = await probeAll({ entry: spec.length > 0 ? spec : undefined })
+        const report = await probeAll({ entry: spec.length > 0 ? spec : undefined, sessionId: sessionIdOf(invocation?.agent) })
         if (report.ok !== true) return { kind: 'error', text: report.error }
         const lines = report.results.map((item) =>
           '- ' + item.id + '（' + item.route + '/' + item.model + '）· ' + item.label + ' · ' + String(item.ms) + 'ms'
@@ -1828,6 +1844,7 @@ export function apply(ctx, rawConfig) {
       const report = await probeAll({
         entry: typeof body.entry === 'string' && body.entry.length > 0 ? body.entry : undefined,
         timeoutMs: body.timeoutMs,
+        sessionId: typeof body.sessionId === 'string' && body.sessionId.length > 0 ? body.sessionId : undefined,
       })
       sendJson(res, report.ok === true ? 200 : 400, report)
     })

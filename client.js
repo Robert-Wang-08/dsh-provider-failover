@@ -92,11 +92,11 @@ window.__ModuleLoader__.load({
         body: JSON.stringify(body === undefined ? {} : body),
       });
     // 全量测试是顺序真实请求，可能耗时较久（每目标最长 20s），因此放宽客户端超时到 10 分钟。
-    const probeAll = () =>
+    const probeAll = (body) =>
       apiFetch(ROUTE + "/probe", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({}),
+        body: JSON.stringify(body === undefined ? {} : body),
       }, 600000);
 
     function describeSwitch(entry) {
@@ -328,7 +328,8 @@ window.__ModuleLoader__.load({
         setProbeMsgKind("ok");
         setProbeMsg("测试中…（向每个启用条目发送真实最小请求，可能耗时数十秒）");
         try {
-          const data = await probeAll();
+          const body = status.lastSessionId === undefined || status.lastSessionId === null ? {} : { sessionId: String(status.lastSessionId) };
+          const data = await probeAll(body);
           setProbeReport(data);
           setProbeMsgKind("ok");
           setProbeMsg("完成：" + String(data.summary.ok) + "/" + String(data.summary.total) + " 正常，用时 " + String(data.elapsedMs) + "ms");

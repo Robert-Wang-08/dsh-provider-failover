@@ -405,14 +405,18 @@ const PROBE_TIERS = [
   ] },
   { tier: 2, enabled: false, entries: [{ id: 'offtier', route: 'r-x', model: 'm-x', enabled: true }] },
 ]
-const streamStub = (request) => (async function* () {
-  if (request.provider === 'r-good') {
-    yield { type: 'text-delta', text: 'ok' }
-    yield { type: 'finish', reason: { kind: 'completed' } }
-  } else {
-    yield { type: 'finish', reason: { kind: 'error', failure: { code: 'QUOTA', message: 'insufficient balance' } } }
-  }
-})()
+const probeSeen = []
+const streamStub = (request) => {
+  probeSeen.push(request)
+  return (async function* () {
+    if (request.provider === 'r-good') {
+      yield { type: 'text-delta', text: 'ok' }
+      yield { type: 'finish', reason: { kind: 'completed' } }
+    } else {
+      yield { type: 'finish', reason: { kind: 'error', failure: { code: 'QUOTA', message: 'insufficient balance' } } }
+    }
+  })()
+}
 const postProbe = async (env, body) => {
   const req = { method: 'POST', socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify(body ?? {})) } }
   const res = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
@@ -430,6 +434,9 @@ check('status 暴露 lastProbe 与 probeTimeoutMs', status24.body.lastProbe?.res
 const single24 = await postProbe(env24, { entry: 'bad' })
 check('单条目过滤', single24.body.results.length === 1 && single24.body.results[0].id === 'bad', JSON.stringify(single24.body.results.map((item) => item.id)))
 check('未知条目报错', (await postProbe(env24, { entry: 'nope' })).status === 400)
+check('探测请求始终携带会话身份（opencode-go 需 x-opencode-session）', probeSeen.length >= 2 && probeSeen.every((request) => typeof request.sessionId === 'string' && request.sessionId.length > 0), JSON.stringify(probeSeen.map((request) => request.sessionId)))
+const explicit24 = await postProbe(env24, { entry: 'good', sessionId: 'sess-explicit' })
+check('显式 sessionId 透传到探测请求与报告', explicit24.body.sessionId === 'sess-explicit' && probeSeen.at(-1).sessionId === 'sess-explicit', String(probeSeen.at(-1).sessionId))
 const probeCmd = env24.registered.find((def) => def.name === 'failover-probe')
 const cmdProbe = await probeCmd.handler({ rawInput: '', agent: { session: { id: 'x' } } })
 check('指令 /failover-probe 返回汇总文本', cmdProbe.kind === 'success' && cmdProbe.text.includes('1/2'), String(cmdProbe.text))
