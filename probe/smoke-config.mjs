@@ -23,7 +23,7 @@ console.log('defaults:')
 const defaults = defaultConfig()
 check('one example tier (disabled, zero-intervention)', defaults.tiers.length === 1 && defaults.tiers[0].enabled === false, JSON.stringify(defaults.tiers))
 check('example entry is placeholder', defaults.tiers[0].entries.length === 1 && defaults.tiers[0].entries[0].id === 'example' && defaults.tiers[0].entries[0].route === 'example-provider', JSON.stringify(defaults.tiers[0].entries))
-check('startup preferTier = 1', defaults.startup.preferTier === 1)
+check('startup preferTier 默认 0（关闭启动对齐，保持会话选择）', defaults.startup.preferTier === 0, String(defaults.startup.preferTier))
 check('terminal codes include SERVER + RATE_LIMIT', defaults.terminalCodes.includes('SERVER') && defaults.terminalCodes.includes('RATE_LIMIT'))
 check('no credential field anywhere', JSON.stringify(defaults).toLowerCase().indexOf('apikeyenv') < 0)
 

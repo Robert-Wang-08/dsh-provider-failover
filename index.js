@@ -47,7 +47,7 @@ const FailoverSettingsSchema = z.object({
   enabled: z.boolean().default(true),
   minSwitchIntervalMs: z.number().step(1).min(0).default(1000),
   maxSwitchesPerTurn: z.number().step(1).min(1).default(6),
-  startupPreferTier: z.number().step(1).min(0).default(1),
+  startupPreferTier: z.number().step(1).min(0).default(0),
   rankingMode: z.union(['declared', 'keywords', 'llm']).default('keywords'),
   keyResetAt: z.string().default('06:00'),
   /**
@@ -191,7 +191,9 @@ const DEFAULT_CONFIG = {
   probeTarget: true,
   // key 状态每日重置时刻（本地时间）：清空失效标记并把默认 key 写回。
   keyResetAt: '06:00',
-  startup: { preferTier: 1 },
+  // 启动对齐档位：默认 0（关闭）——新会话保持宿主默认/最近一次选择，不自动拉回第一档；
+  // 需要“启动时优先某档”时在 profile patch 里显式设为 >=1。
+  startup: { preferTier: 0 },
   ranking: {
     mode: 'keywords',
     // 实测：真实排序模型一次排序可达秒级（5-15s），默认超时按此设定；过小会导致 llm 模式永远回退。
