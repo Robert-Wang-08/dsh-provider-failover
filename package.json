@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-keypool",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "description": "DSH Provider 分档故障转移 —— 模型请求以额度/凭据/过载/限流等可切换失败结束时，按配置表档位顺序切换 harness 路由（provider）；凭据类失败先在条目内轮换 key（改写该路由的 apiKeyEnv 引用名，路由与模型不变），并按每日重置时刻恢复默认 key。设置页可查看并编辑每个条目的 key 引用（凭据引用名）与状态（在用/可用/失效[时间·错误]/未配置），并可做会话级测试切换（/failover-test 指令或按钮）。不持有也不读写任何凭据值。",
   "type": "module",
   "main": "index.js",
@@ -36,5 +36,16 @@
     "provider-failover",
     "failover"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "metadata": {
+    "origin": "self",
+    "author": "wang",
+    "created": "2026-09-22",
+    "updated": "2026-10-05",
+    "version": "3.2.1",
+    "managed-by": "skillhub",
+    "source": "skillhub",
+    "asset-type": "registry-entry",
+    "changelog": "Recognize Codex usage-limit PI_AI_ERROR wording and fail over within the same agent step."
+  }
 }

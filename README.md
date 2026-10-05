@@ -17,7 +17,9 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 
 默认集合：`QUOTA`、`AUTH`、`INVALID_CREDENTIAL`、`MISSING_CREDENTIAL`、`NO_ADAPTER`、`SERVER`、`RATE_LIMIT`。
 
-另有**消息模式兜底**（编码未归一化时按文本匹配）：`insufficient balance`、`insufficient_quota`、`quota exceeded`、`balance`、`overloaded`、`invalid api key`、`token limit`、`rate limit`。
+另有**消息模式兜底**（编码未归一化时按文本匹配）：`insufficient balance`、`insufficient_quota`、`quota exceeded`、`usage limit`、`usage_limit`、`balance`、`overloaded`、`invalid api key`、`token limit`、`rate limit`。
+
+其中 `usage limit` / `usage_limit` 覆盖 Codex OAuth 常见额度耗尽文案 `The usage limit has been reached` 与 `usage_limit_reached`。部分宿主版本会把前者归成通用 `PI_AI_ERROR`，插件必须依靠消息模式兜底，不能只看 `QUOTA` 编码。
 
 `CONTEXT_WINDOW_EXCEEDED` 与 `INVALID_REQUEST` 默认**不**触发（换 provider 不解决问题）。
 

@@ -25,6 +25,10 @@ check('one example tier (disabled, zero-intervention)', defaults.tiers.length ==
 check('example entry is placeholder', defaults.tiers[0].entries.length === 1 && defaults.tiers[0].entries[0].id === 'example' && defaults.tiers[0].entries[0].route === 'example-provider', JSON.stringify(defaults.tiers[0].entries))
 check('startup preferTier 默认 0（关闭启动对齐，保持会话选择）', defaults.startup.preferTier === 0, String(defaults.startup.preferTier))
 check('terminal codes include SERVER + RATE_LIMIT', defaults.terminalCodes.includes('SERVER') && defaults.terminalCodes.includes('RATE_LIMIT'))
+check('message fallbacks include Codex usage-limit wording', defaults.failurePatterns.includes('usage limit') && defaults.failurePatterns.includes('usage_limit'))
+const switchableShape = (value) => ({ terminalCodes: new Set(value.terminalCodes), failurePatterns: value.failurePatterns })
+check('Codex natural-language usage limit is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'Codex error: The usage limit has been reached').how === 'pattern:usage limit')
+check('Codex snake-case usage limit is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'usage_limit_reached').how === 'pattern:usage_limit')
 check('no credential field anywhere', JSON.stringify(defaults).toLowerCase().indexOf('apikeyenv') < 0)
 
 console.log('normalize:')
@@ -389,7 +393,22 @@ const env23 = makeSwitchEnv(undefined, { startup: { preferTier: 1 }, tiers: IGNO
 await env23.handlers['agent/request-error']({ failure: { code: 'QUOTA', message: 'quota exceeded' }, provider: 'r1', turn: 1, step: 1 }, async () => 'NEXT')
 const status23 = await statusOf(env23)
 check('可切换失败不写 ignored', (status23.body.ignored?.length ?? 0) === 0, JSON.stringify(status23.body.ignored))
-for (const env of [env22, env23]) for (const dispose of env.disposers) dispose()
+
+// Codex OAuth 的额度耗尽文案可能被宿主归成 PI_AI_ERROR；消息兜底必须实际触发
+// provider 切换和同一步 retry，而不只是纯函数命中。
+const USAGE_LIMIT_TIERS = [{ tier: 1, enabled: true, entries: [
+  { id: 'official', route: 'r1', model: 'm1', enabled: true },
+  { id: 'fallback', route: 'r2', model: 'm2', enabled: true },
+] }]
+const envUsage = makeSwitchEnv(undefined, { probeTarget: false, minSwitchIntervalMs: 0, startup: { preferTier: 0 }, tiers: USAGE_LIMIT_TIERS })
+const usageAgent = freshAgent('usage-limit-session')
+const usageDecision = await envUsage.handlers['agent/request-error']({ agent: usageAgent, failure: { code: 'PI_AI_ERROR', message: 'Codex error: The usage limit has been reached' }, provider: 'r1', turn: 1, step: 1 }, async () => 'NEXT')
+const usageRoute = await envUsage.handlers['agent/request']({ agent: usageAgent, turn: 1, step: 1 }, async () => ({ provider: 'r1', model: 'm1' }))
+const usageStatus = await statusOf(envUsage)
+check('PI_AI_ERROR usage-limit 文案触发同一步 retry', usageDecision?.kind === 'retry', JSON.stringify(usageDecision))
+check('PI_AI_ERROR usage-limit 文案切换到其他 provider', usageRoute.provider === 'r2' && usageRoute.model === 'm2', JSON.stringify(usageRoute))
+check('PI_AI_ERROR usage-limit 命中后不写 ignored', (usageStatus.body.ignored?.length ?? 0) === 0, JSON.stringify(usageStatus.body.ignored))
+for (const env of [env22, env23, envUsage]) for (const dispose of env.disposers) dispose()
 
 // 2026-10-02：全量测试——对启用档位的每个 provider/model 发最小真实请求并列出状态。
 console.log('全量测试（真实最小请求 + 状态分类）:')

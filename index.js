@@ -153,6 +153,10 @@ const DEFAULT_FAILURE_PATTERNS = [
   'insufficient balance',
   'insufficient_quota',
   'quota exceeded',
+  // Codex OAuth may surface an exhausted subscription as generic PI_AI_ERROR:
+  // "The usage limit has been reached" or a snake-case usage_limit_reached code.
+  'usage limit',
+  'usage_limit',
   'balance',
   'overloaded',
   'invalid api key',
