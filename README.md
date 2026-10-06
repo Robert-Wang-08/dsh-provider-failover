@@ -232,3 +232,10 @@ node probe/mock-llm.mjs 8799     # 本地 mock LLM 端点（配合 probe/dsh-fai
 **回归**：`probe/smoke-config.mjs` 新增「先跑满 200 个 step 再触发 usage-limit 切换」用例——修复前切换不作用于下一步请求（收到 `r1`），修复后作用于 `r2`。
 
 **生效条件**：`index.js` 为 Host 半代码，改动**必须重启 `dsh web`**（重启后用启动打印的新 token 地址重开页面）。
+
+**同类排查（2026-10-06）**：全量审计有界集合后，`steps` 之外另修两处——
+
+- `status` 的 `switches`/`ignored` 用 `slice(-LOG_LIMIT)` 取到的是**最旧** 10 条（`switchLog` 为 `unshift` 的 newest-first），超过 10 条后设置页展示陈旧记录；改为 `slice(0, LOG_LIMIT)`。
+- `pendingNeeds` 淘汰与 `steps` 同形，因入表时已写 `at: Date.now()` 故未触发，但仍补上排除当前 key（`if (k === needsKey) continue`）以固化不变量。
+
+其余有界集合无此问题：`switchLog`/`ignoredLog` 的 50 条上限方向正确；`rankingCache` 按插入序 FIFO 淘汰（新键追加在尾，不会被自身淘汰，`at` 仅用于 TTL）；`startupHandled` 为 `WeakSet` 不阻止 GC；`lastSwitchAt`/`pins` 随会话增长但非淘汰逻辑缺陷。

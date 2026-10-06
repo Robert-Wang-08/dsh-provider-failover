@@ -426,6 +426,18 @@ check('超过 128 步后 usage-limit 仍触发 retry', evictDecision?.kind === '
 check('超过 128 步后切换仍作用于下一步请求', evictRoute.provider === 'r2' && evictRoute.model === 'm2', JSON.stringify(evictRoute))
 for (const dispose of envEvict.disposers) dispose()
 
+// 2026-10-06：status 的「最近 10 条」必须是最近 10 条。switchLog 是 newest-first（unshift），
+// 切片方向曾用 slice(-LOG_LIMIT) 取到最旧的 10 条，超过 10 条后设置页展示的是陈旧记录。
+const envLog = makeSwitchEnv(undefined, { probeTarget: false, minSwitchIntervalMs: 0, startup: { preferTier: 0 }, tiers: USAGE_LIMIT_TIERS })
+for (let step = 1; step <= 12; step++) {
+  await envLog.handlers['agent/request-error']({ agent: freshAgent('log-order-' + step), failure: { code: 'QUOTA', message: 'quota exceeded' }, provider: 'r1', turn: 1, step }, async () => 'NEXT')
+}
+const logStatus = await statusOf(envLog)
+const logSwitches = logStatus.body.switches
+check('status.switches 只保留最近 10 条', logSwitches.length === 10, String(logSwitches.length))
+check('status.switches 首条为最新（newest-first）', logSwitches[0]?.step === 12 && logSwitches.at(-1)?.step === 3, JSON.stringify(logSwitches.map((item) => item.step)))
+for (const dispose of envLog.disposers) dispose()
+
 const POLICY_TIERS = [{ tier: 1, enabled: true, entries: [
   { id: 'policy-source', route: 'r-policy', model: 'm-policy', enabled: true },
   { id: 'policy-fallback', route: 'r-policy-fallback', model: 'm-policy-fallback', enabled: true },

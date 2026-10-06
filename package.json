@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-keypool",
-  "version": "3.2.2",
+  "version": "3.2.3",
   "description": "DSH Provider 分档故障转移 —— 模型请求以额度/凭据/过载/限流等可切换失败结束时，按配置表档位顺序切换 harness 路由（provider）；凭据类失败先在条目内轮换 key（改写该路由的 apiKeyEnv 引用名，路由与模型不变），并按每日重置时刻恢复默认 key。设置页可查看并编辑每个条目的 key 引用（凭据引用名）与状态（在用/可用/失效[时间·错误]/未配置），并可做会话级测试切换（/failover-test 指令或按钮）。不持有也不读写任何凭据值。",
   "type": "module",
   "main": "index.js",
@@ -42,10 +42,10 @@
     "author": "wang",
     "created": "2026-09-22",
     "updated": "2026-10-06",
-    "version": "3.2.2",
+    "version": "3.2.3",
     "managed-by": "skillhub",
     "source": "skillhub",
     "asset-type": "registry-entry",
-    "changelog": "Fix step-state eviction: past 128 (turn, step) records a fresh record was evicted by its own at:0, dropping the failover target so long sessions kept using the failed provider."
+    "changelog": "Eviction audit follow-up: status now returns the newest 10 log records (was the oldest 10), and pendingNeeds eviction skips the just-written key."
   }
 }

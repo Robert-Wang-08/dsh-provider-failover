@@ -1393,6 +1393,7 @@ export function apply(ctx, rawConfig) {
       let oldestKey
       let oldestAt = Number.POSITIVE_INFINITY
       for (const [k, v] of state.pendingNeeds) {
+        if (k === needsKey) continue
         if (v.at < oldestAt) { oldestAt = v.at; oldestKey = k }
       }
       if (oldestKey !== undefined) state.pendingNeeds.delete(oldestKey)
@@ -1762,8 +1763,8 @@ export function apply(ctx, rawConfig) {
           unassigned: directory.registered.filter((item) => assigned.has(item.id) !== true),
           missing: [...assigned].filter((route) => registeredIds.has(route) !== true),
         } : null,
-        switches: state.switchLog.slice(-LOG_LIMIT),
-        ignored: state.ignoredLog.slice(-LOG_LIMIT),
+        switches: state.switchLog.slice(0, LOG_LIMIT),
+        ignored: state.ignoredLog.slice(0, LOG_LIMIT),
         lastProbe: state.lastProbe,
         probeTimeoutMs: PROBE_TIMEOUT_MS,
         cooling: [...state.routeHealth.entries()].map(([route, health]) => ({ route: route, code: health.code, until: health.coolingUntil })),
