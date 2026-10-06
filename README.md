@@ -21,7 +21,9 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 
 其中 `usage limit` / `usage_limit` 覆盖 Codex OAuth 常见额度耗尽文案 `The usage limit has been reached` 与 `usage_limit_reached`。部分宿主版本会把前者归成通用 `PI_AI_ERROR`，插件必须依靠消息模式兜底，不能只看 `QUOTA` 编码。
 
-`CONTEXT_WINDOW_EXCEEDED` 与 `INVALID_REQUEST` 默认**不**触发（换 provider 不解决问题）。
+策略拒绝（例如 `Invalid prompt ... flagged as potentially violating our usage policy`）默认按 `policyFailover: true` 进入下一条已配置 Provider，不轮换 key；仍受候选预检、冷却、单 turn 切换上限和最小间隔约束。设为 `policyFailover: false` 可恢复为终止本轮并提示修改提示词。
+
+`CONTEXT_WINDOW_EXCEEDED` 与 `INVALID_REQUEST` 默认**不**触发（换 provider 不解决问题）。策略拒绝单独由 `policyFailover` 控制。
 
 ## 分档配置表
 
@@ -58,7 +60,7 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
           - { id: fallback, route: my-provider-2, model: my-model-2, cooldownMs: 60000 }
 ```
 
-字段：顶层 `enabled` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
+字段：顶层 `enabled` / `policyFailover` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
 
 ## 单路由多 key（`keys` = 同一路由的凭据引用名）
 
@@ -218,3 +220,15 @@ node probe/mock-llm.mjs 8799     # 本地 mock LLM 端点（配合 probe/dsh-fai
 - 与 rc.3 无关：`agent/request`（`dsh-agent`、`dsh-agent-loop`）与 `agent/request-error`（`dsh-agent-loop`、`dsh-llm-retry`）在 rc.3 内核逐字存在；`dsh-agent-loop` / `dsh-agent` / `dsh-llm-retry` 的 rc.2↔rc.3 发布包仅 package.json 版本号差异，waterfall 语义未变。
 
 复查记录见 vault `70-WorkSpace/dsh工具维护日志.md` 2026-09-23 条目；复装说明见 `70-WorkSpace/dsh复装说明.md`。
+
+## 缺陷修复：长会话超过 128 步后切换不生效（2026-10-06）
+
+**现象**：`agent/request-error` 已记录 `switch <from> -> <to>`（例如 Codex 额度耗尽 `PI_AI_ERROR` / `pattern:usage limit`），但同一 `(turn, step)` 的下一次请求仍走原 provider，整轮最终仍以原错误失败；且同一 `(turn, step)` 的切换次数远超 `maxSwitchesPerTurn`。
+
+**根因**：`stepState` 为新的 `(turn, step)` 建记账时先用 `at: 0` 入表，随后在同一函数内做容量淘汰（`state.steps.size > 128`）。淘汰扫描取最小 `at`，而刚插入的记账 `at` 恰为 0，于是**它总是被自己这一轮淘汰删除**。一旦会话累计步数超过 128（长会话很常见；实测 turn 30 已 480+ 步），每个新记账都建后即删——`request-error` 写入的 `target` 落在被删除的对象上，`request` 再次取到的是一条全新空记账，因此切换只记日志、不生效；`switches` 计数同样每次归零，`maxSwitchesPerTurn` 形同失效。
+
+**修法**：新建记账直接写 `at: Date.now()`，并在淘汰扫描中排除当前 key（`if (k === key) continue`），确保活跃记账不会被同毫秒并列误删。
+
+**回归**：`probe/smoke-config.mjs` 新增「先跑满 200 个 step 再触发 usage-limit 切换」用例——修复前切换不作用于下一步请求（收到 `r1`），修复后作用于 `r2`。
+
+**生效条件**：`index.js` 为 Host 半代码，改动**必须重启 `dsh web`**（重启后用启动打印的新 token 地址重开页面）。

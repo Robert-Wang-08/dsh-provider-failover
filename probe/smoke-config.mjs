@@ -29,6 +29,8 @@ check('message fallbacks include Codex usage-limit wording', defaults.failurePat
 const switchableShape = (value) => ({ terminalCodes: new Set(value.terminalCodes), failurePatterns: value.failurePatterns })
 check('Codex natural-language usage limit is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'Codex error: The usage limit has been reached').how === 'pattern:usage limit')
 check('Codex snake-case usage limit is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'usage_limit_reached').how === 'pattern:usage_limit')
+check('prompt policy refusal is switchable by default', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'Invalid prompt: your prompt was flagged as potentially violating our usage policy').how === 'policy:prompt')
+check('prompt policy refusal can remain terminal explicitly', __test.isSwitchable({ ...switchableShape(defaults), policyFailover: false }, 'PI_AI_ERROR', 'Invalid prompt: your prompt was flagged as potentially violating our usage policy').category === 'policy')
 check('no credential field anywhere', JSON.stringify(defaults).toLowerCase().indexOf('apikeyenv') < 0)
 
 console.log('normalize:')
@@ -409,6 +411,32 @@ check('PI_AI_ERROR usage-limit 文案触发同一步 retry', usageDecision?.kind
 check('PI_AI_ERROR usage-limit 文案切换到其他 provider', usageRoute.provider === 'r2' && usageRoute.model === 'm2', JSON.stringify(usageRoute))
 check('PI_AI_ERROR usage-limit 命中后不写 ignored', (usageStatus.body.ignored?.length ?? 0) === 0, JSON.stringify(usageStatus.body.ignored))
 for (const env of [env22, env23, envUsage]) for (const dispose of env.disposers) dispose()
+
+// 2026-10-06：状态记账淘汰回归。超过 128 个 (turn, step) 后，新建记账不得被自身的
+// 淘汰扫描误删（at:0 会是最小值，导致 target 在 request-error 与 request 之间丢失）。
+// 触发场景：长会话（实测 turn 30 / 480+ 步）里切换只记日志、不生效，最终仍以原 provider 失败。
+const envEvict = makeSwitchEnv(undefined, { probeTarget: false, minSwitchIntervalMs: 0, startup: { preferTier: 0 }, tiers: USAGE_LIMIT_TIERS })
+const evictAgent = freshAgent('eviction-session')
+for (let step = 1; step <= 200; step++) {
+  await envEvict.handlers['agent/request']({ agent: evictAgent, turn: 1, step }, async () => ({ provider: 'r1', model: 'm1' }))
+}
+const evictDecision = await envEvict.handlers['agent/request-error']({ agent: evictAgent, failure: { code: 'PI_AI_ERROR', message: 'You have hit your ChatGPT usage limit (plus plan). Try again in ~151 min.' }, provider: 'r1', turn: 2, step: 1 }, async () => 'NEXT')
+const evictRoute = await envEvict.handlers['agent/request']({ agent: evictAgent, turn: 2, step: 1 }, async () => ({ provider: 'r1', model: 'm1' }))
+check('超过 128 步后 usage-limit 仍触发 retry', evictDecision?.kind === 'retry', JSON.stringify(evictDecision))
+check('超过 128 步后切换仍作用于下一步请求', evictRoute.provider === 'r2' && evictRoute.model === 'm2', JSON.stringify(evictRoute))
+for (const dispose of envEvict.disposers) dispose()
+
+const POLICY_TIERS = [{ tier: 1, enabled: true, entries: [
+  { id: 'policy-source', route: 'r-policy', model: 'm-policy', enabled: true },
+  { id: 'policy-fallback', route: 'r-policy-fallback', model: 'm-policy-fallback', enabled: true },
+] }]
+const envPolicy = makeSwitchEnv(undefined, { probeTarget: false, minSwitchIntervalMs: 0, startup: { preferTier: 0 }, tiers: POLICY_TIERS })
+const policyAgent = freshAgent('policy-session')
+const policyDecision = await envPolicy.handlers['agent/request-error']({ agent: policyAgent, failure: { code: 'PI_AI_ERROR', message: 'Invalid prompt: your prompt was flagged as potentially violating our usage policy' }, provider: 'r-policy', turn: 1, step: 1 }, async () => 'NEXT')
+const policyRoute = await envPolicy.handlers['agent/request']({ agent: policyAgent, turn: 1, step: 1 }, async () => ({ provider: 'r-policy', model: 'm-policy' }))
+check('policy refusal triggers controlled provider retry', policyDecision?.kind === 'retry', JSON.stringify(policyDecision))
+check('policy refusal switches to next configured provider', policyRoute.provider === 'r-policy-fallback' && policyRoute.model === 'm-policy-fallback', JSON.stringify(policyRoute))
+for (const dispose of envPolicy.disposers) dispose()
 
 // 2026-10-02：全量测试——对启用档位的每个 provider/model 发最小真实请求并列出状态。
 console.log('全量测试（真实最小请求 + 状态分类）:')

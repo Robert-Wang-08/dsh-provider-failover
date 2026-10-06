@@ -188,6 +188,7 @@ const PROBE_PROMPT = 'Reply with the single word: ok'
 
 const DEFAULT_CONFIG = {
   enabled: true,
+  policyFailover: true,
   terminalCodes: DEFAULT_TERMINAL_CODES,
   failurePatterns: DEFAULT_FAILURE_PATTERNS,
   minSwitchIntervalMs: 1000,
@@ -289,6 +290,7 @@ function normalizeConfig(raw) {
   const input = isPlainObject(raw) ? raw : {}
   const config = {
     enabled: input.enabled === undefined ? DEFAULT_CONFIG.enabled : input.enabled === true,
+    policyFailover: input.policyFailover === undefined ? DEFAULT_CONFIG.policyFailover : input.policyFailover === true,
     terminalCodes: new Set((strings(input.terminalCodes).length > 0 ? strings(input.terminalCodes) : DEFAULT_TERMINAL_CODES).map((code) => code.toUpperCase())),
     failurePatterns: (strings(input.failurePatterns).length > 0 ? strings(input.failurePatterns) : DEFAULT_FAILURE_PATTERNS).map((pattern) => pattern.toLowerCase()),
     minSwitchIntervalMs: input.minSwitchIntervalMs === undefined ? DEFAULT_CONFIG.minSwitchIntervalMs : input.minSwitchIntervalMs,
@@ -480,6 +482,7 @@ function isSwitchable(config, code, message) {
   const policyCodes = new Set(['CONTENT_POLICY_VIOLATION', 'MODERATION_BLOCKED', 'PROMPT_BLOCKED', 'SAFETY'])
   const policyPatterns = ['usage policy', 'content policy', 'safety policy', 'potentially violating', 'prompt was flagged']
   if (policyCodes.has(normalized) || policyPatterns.some((pattern) => haystack.includes(pattern))) {
+    if (config.policyFailover !== false) return { hit: true, how: 'policy:prompt', category: 'switchable', policy: true }
     return {
       hit: false,
       category: 'policy',
@@ -1079,13 +1082,16 @@ export function apply(ctx, rawConfig) {
     const key = stepKeyOf(sessionId, turn, step)
     let record = state.steps.get(key)
     if (record === undefined) {
-      record = { attempted: new Set(), target: undefined, switches: 0, needs: { tools: false, images: false }, at: 0 }
+      record = { attempted: new Set(), target: undefined, switches: 0, needs: { tools: false, images: false }, at: Date.now() }
       state.steps.set(key, record)
       if (state.steps.size > 128) {
         // 按 lastAccess 淘汰：不得误删活跃 step 的记账（R5 语义）。
+        // 必须排除刚创建的 key：它的 at 是本轮最新，若参与比较会因同毫秒并列被误删，
+        // 使该 (turn, step) 的 target/记账在 request 与 request-error 之间丢失。
         let oldestKey
         let oldestAt = Number.POSITIVE_INFINITY
         for (const [k, v] of state.steps) {
+          if (k === key) continue
           if (v.at < oldestAt) {
             oldestAt = v.at
             oldestKey = k
