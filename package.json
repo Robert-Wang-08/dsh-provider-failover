@@ -41,11 +41,11 @@
     "origin": "self",
     "author": "wang",
     "created": "2026-09-22",
-    "updated": "2026-10-06",
-    "version": "3.2.3",
+    "updated": "2026-10-08",
+    "version": "3.2.4",
     "managed-by": "skillhub",
     "source": "skillhub",
     "asset-type": "registry-entry",
-    "changelog": "Eviction audit follow-up: status now returns the newest 10 log records (was the oldest 10), and pendingNeeds eviction skips the just-written key."
+    "changelog": "Correct the isSwitchable policy comment to match the default policyFailover: true behavior (comment-only; no runtime change)."
   }
 }
