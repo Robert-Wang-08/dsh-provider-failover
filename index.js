@@ -28,6 +28,9 @@
 
 import z from '@deepseek-ai/schemastery'
 import { randomUUID } from 'node:crypto'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 
 export const name = 'dsh-provider-failover'
 
@@ -40,8 +43,8 @@ const LOG_LIMIT = 10
 
 /**
  * 设置页可编辑项（总开关 + 常用参数）。schema 即取值契约：
- * 用户层的值落在 `$DSH_HOME/settings.yaml` 的 `provider-failover:` 段，
- * 生效时机为 resolved 值变更（默认 live），无需重启。
+ * 用户层的值落在插件自有文件 `$DSH_HOME/plugins/provider-failover/settings.json`
+ * （0.2 起 dsh-settings 不再提供按插件命名空间 store），生效时机为写入后即时同步，无需重启。
  */
 const FailoverSettingsSchema = z.object({
   enabled: z.boolean().default(true),
@@ -217,6 +220,62 @@ const DEFAULT_CONFIG = {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && Array.isArray(value) !== true
+}
+
+/** 插件自有设置文件：`$DSH_HOME/plugins/<namespace>/settings.json`。 */
+function settingsFilePath() {
+  const home = process.env.DSH_HOME !== undefined && process.env.DSH_HOME.trim() !== ''
+    ? process.env.DSH_HOME
+    : join(homedir(), '.dsh')
+  return join(home, 'plugins', SETTINGS_NAMESPACE, 'settings.json')
+}
+
+/** 读取设置用户层（容错：缺失/损坏一律回退空对象）。 */
+function readSettingsOverrides(file) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    return isPlainObject(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * 插件自有设置 scope（get/update/watch）。
+ *
+ * 0.2 移除了 `@deepseek-ai/dsh-settings` 的按插件命名空间 store
+ * （`ctx.settings.register`），故用户层改为插件自有 JSON 文件；`base` 仍是
+ * profile patch 派生的配置，语义与旧的 settings scope 一致（base 打底、用户层覆盖、
+ * 变更实时通知）。
+ */
+function createFileSettingsScope({ file, base }) {
+  const listeners = new Set()
+  const notify = (value) => {
+    for (const listener of listeners) {
+      try {
+        listener(value)
+      } catch (error) {
+        console.warn('[dsh-provider-failover] settings listener failed: ' + messageOf(error))
+      }
+    }
+  }
+  return {
+    get() {
+      return { ...base, ...readSettingsOverrides(file) }
+    },
+    async update(patch) {
+      const next = { ...readSettingsOverrides(file), ...patch }
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(file, JSON.stringify(next, null, 2) + '\n', 'utf8')
+      notify({ ...base, ...next })
+    },
+    watch(listener) {
+      listeners.add(listener)
+      return () => {
+        listeners.delete(listener)
+      }
+    },
+  }
 }
 
 function positiveNumber(value) {
@@ -1615,8 +1674,11 @@ export function apply(ctx, rawConfig) {
     })
   })
 
-  ctx.inject(['settings'], (settingsCtx) => {
-    const scope = settingsCtx.settings.register(SETTINGS_NAMESPACE, FailoverSettingsSchema, {
+  // 0.2 移除了按插件的 settings namespace store（`ctx.settings.register`）；
+  // 设置改为插件自有的 JSON 文件，base/sync/端点语义保持不变。
+  {
+    const scope = createFileSettingsScope({
+      file: settingsFilePath(),
       base: {
         enabled: config.enabled,
         minSwitchIntervalMs: config.minSwitchIntervalMs,
@@ -1644,7 +1706,7 @@ export function apply(ctx, rawConfig) {
     state.syncSettings = sync
     sync(scope.get(), 'loaded')
     scope.watch((next) => { sync(next, 'updated') })
-  })
+  }
 
   // 每日重置排程：到下一个 keyResetAt（本地时间）清失效标记并把默认 key 写回，然后重新排程。
   // 无任何条目有生效 key 引用时不排程；界面新增引用后由 ensureKeyResetTimer() 补启用（无需重启）。
