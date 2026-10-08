@@ -473,8 +473,9 @@ function masked(value) {
 
 /**
  * 该失败是否属于「可切换」，并给设置页一个明确的“不切换原因”。
- * 内容/安全策略拒绝必须先于通用 INVALID_REQUEST 判断：轮换 key 或 provider 不会修复提示词，
- * 也不应把故障转移误用为绕过上游策略的机制。
+ * 内容/安全策略拒绝必须先于通用 INVALID_REQUEST 判断：它不是请求参数问题。
+ * 默认 `policyFailover: true` 时按受限策略进入下一条已配置 Provider（不轮换 key，
+ * 仍受候选预检/冷却/单 turn 切换上限/最小间隔约束）；设为 false 才终止本轮并提示修改提示词。
  */
 function isSwitchable(config, code, message) {
   const normalized = typeof code === 'string' ? code.toUpperCase() : ''
