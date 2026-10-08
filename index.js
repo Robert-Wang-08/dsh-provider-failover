@@ -26,7 +26,6 @@
  *   - 未配置/未启用时零介入；无法解析目标时交回宿主，不做隐式降级。
  */
 
-import z from '@deepseek-ai/schemastery'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -42,23 +41,13 @@ const ROUTE_BASE = '/provider-failover'
 const LOG_LIMIT = 10
 
 /**
- * 设置页可编辑项（总开关 + 常用参数）。schema 即取值契约：
+ * 设置页可编辑项（总开关 + 常用参数）的取值契约：
  * 用户层的值落在插件自有文件 `$DSH_HOME/plugins/provider-failover/settings.json`
- * （0.2 起 dsh-settings 不再提供按插件命名空间 store），生效时机为写入后即时同步，无需重启。
+ * （0.2 起 dsh-settings 不再提供按插件命名空间 store，见 createFileSettingsScope），
+ * 键集为 `enabled / minSwitchIntervalMs / maxSwitchesPerTurn / startupPreferTier /
+ * rankingMode / keyResetAt / keysByEntry`；生效时机为写入后即时同步，无需重启。
+ * 字段合法性由 /config 端点与 normalize 校验，不再维护独立的 schema 定义。
  */
-const FailoverSettingsSchema = z.object({
-  enabled: z.boolean().default(true),
-  minSwitchIntervalMs: z.number().step(1).min(0).default(1000),
-  maxSwitchesPerTurn: z.number().step(1).min(1).default(6),
-  startupPreferTier: z.number().step(1).min(0).default(0),
-  rankingMode: z.union(['declared', 'keywords', 'llm']).default('keywords'),
-  keyResetAt: z.string().default('06:00'),
-  /**
-   * 设置页可编辑的单 provider 多 key：条目 id → 凭据引用名列表（有序，首项为默认 key）。
-   * 存在的条目以此为准，未声明的条目回退 profile patch 的 `keys`。只存引用名，不存值。
-   */
-  keysByEntry: z.dict(z.array(z.string())).default({}),
-})
 
 /** 只读状态接口与设置页共用的 JSON 助手。 */
 function sendJson(res, status, payload) {
@@ -736,10 +725,12 @@ export function apply(ctx, rawConfig) {
   /** 实时读取某路由当前的凭据引用名（不缓存：用户手工改 settings 立即被采纳）。 */
   function activeRefOf(route) {
     const service = settingsService()
-    if (service === undefined || typeof service.get !== 'function') return undefined
+    if (service === undefined || typeof service.describe !== 'function') return undefined
     let section
     try {
-      section = service.get(PI_AI_NAMESPACE)
+      // 0.2 的 SettingsForms 没有按命名空间的 get()；活动表单经 describe() 读取，
+      // 只有声明了 volatile 字段的条目（llm-pi-ai 的 providers 即是）才会出现。
+      section = service.describe().find((row) => row.ns === PI_AI_NAMESPACE)?.value
     } catch (error) {
       return undefined
     }

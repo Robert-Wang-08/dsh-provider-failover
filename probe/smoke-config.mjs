@@ -1,8 +1,19 @@
 /**
  * M1 冒烟测试（不依赖 dsh 运行时）：校验 index.js 的导出形状与配置归一化。
  *   node probe/smoke-config.mjs
+ *
+ * 设置走插件自有文件 scope：每个用例在独立的临时 DSH_HOME 里跑 apply
+ * （settingsFilePath 在 apply 内读取该变量），断言落盘内容后整体清理，
+ * 绝不触碰真实 ~/.dsh。
  */
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { apply, defaultConfig, name, inject, normalize, __test } from '../index.js'
+
+// 真实设置文件的守卫基线：整个探针期间它的存在性必须保持不变。
+const realSettingsFile = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'plugins', 'provider-failover', 'settings.json')
+const realFileExisted = existsSync(realSettingsFile)
 
 const failures = []
 const check = (label, ok, extra) => {
@@ -12,6 +23,31 @@ const check = (label, ok, extra) => {
     console.log('  FAIL ' + label + (extra === undefined ? '' : ' — ' + extra))
   }
 }
+
+// 每个用例独立 DSH_HOME：仅包住 apply 调用（路径在该时刻解析），返回设置文件位置。
+const probeHomes = []
+function isolatedApply(ctx, rawConfig, seed) {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-keypool-probe-'))
+  probeHomes.push(home)
+  const settingsFile = join(home, 'plugins', 'provider-failover', 'settings.json')
+  if (seed !== undefined) {
+    mkdirSync(dirname(settingsFile), { recursive: true })
+    writeFileSync(settingsFile, JSON.stringify(seed, null, 2) + '\n', 'utf8')
+  }
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    apply(ctx, rawConfig)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+  return { home, settingsFile }
+}
+function cleanupHomes() {
+  for (const home of probeHomes) rmSync(home, { recursive: true, force: true })
+}
+const readScope = (settingsFile) => (existsSync(settingsFile) ? JSON.parse(readFileSync(settingsFile, 'utf8')) : undefined)
 
 console.log('exports:')
 check('name', name === 'dsh-provider-failover', name)
@@ -110,25 +146,18 @@ console.log('sanitizeForRanking:')
 check('redacts key-like fragments', __test.sanitizeForRanking('failed with sk-abcdef123456789', 200).indexOf('sk-abcdef123456789') < 0)
 check('truncates to limit', __test.sanitizeForRanking('x'.repeat(500), 100).length === 100)
 
-console.log('apply 假 ctx（settings/webServer/provider 目录关联）:')
+console.log('apply 假 ctx（webServer/provider 目录关联，设置走隔离文件 scope）:')
 const makeCtx = (providers, options) => {
   const opts = options ?? {}
-  const namespaces = []
   const routes = {}
-  const updated = []
   const mutations = []
   const handlers = {}
   const disposers = []
   const providerSection = { providers: opts.providerSection ?? {} }
   const refInfo = opts.refInfo ?? {}
-  const settingsScope = {
-    get: () => ({ enabled: true, minSwitchIntervalMs: 1000, maxSwitchesPerTurn: 6, startupPreferTier: 1, rankingMode: 'keywords', keyResetAt: '06:00', keysByEntry: opts.keysByEntry ?? {} }),
-    watch: () => () => {},
-    update: async (patch) => { updated.push(patch) },
-  }
+  // 0.2 SettingsForms 形状：跨命名空间读走 describe()，写走 mutate()。
   const settingsProvider = {
-    register: (ns) => { namespaces.push(ns); return settingsScope },
-    get: (ns) => ns === 'llm-pi-ai' ? providerSection : undefined,
+    describe: () => [{ ns: 'llm-pi-ai', value: providerSection }],
     mutate: async (ns, ops) => { mutations.push({ ns, ops }) },
   }
   const credentials = { describe: async (ref) => refInfo[ref] ?? { configured: false } }
@@ -138,27 +167,29 @@ const makeCtx = (providers, options) => {
     on: (event, fn) => { handlers[event] = fn },
     get: (n) => n === 'llm' ? providers : n === 'settings' ? settingsProvider : n === 'credentials' ? credentials : undefined,
     inject: (deps, cb) => {
-      if (deps.includes('settings')) cb({ settings: settingsProvider })
       if (deps.includes('webServer')) cb({ webServer: { register: (r) => { routes[r.path] = r.handler; return () => {} } } })
     },
   }
-  return { ctx, namespaces, routes, updated, mutations, handlers, disposers }
+  return { ctx, routes, mutations, handlers, disposers }
 }
 const res1 = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
 const env1 = makeCtx({ listProviders: () => [{ id: 'example-provider', name: 'Example' }, { id: 'other-provider', name: 'Other' }], listConfigurableProviders: () => [] })
-apply(env1.ctx, {})
-check('注册 settings 命名空间 provider-failover', env1.namespaces.includes('provider-failover'), JSON.stringify(env1.namespaces))
+Object.assign(env1, isolatedApply(env1.ctx, {}))
+check('apply 只读不写盘（设置文件尚未创建）', !existsSync(env1.settingsFile))
 check('注册 status/config/keys 三条路由', env1.routes['/provider-failover/status'] !== undefined && env1.routes['/provider-failover/config'] !== undefined && env1.routes['/provider-failover/keys'] !== undefined)
+await env1.routes['/provider-failover/status']({ socket: { remoteAddress: '127.0.0.1' } }, res1)
+check('status 暴露 writable（文件 scope 可写）', res1.body.writable === true, String(res1.body.writable))
 await env1.routes['/provider-failover/status']({ socket: { remoteAddress: '127.0.0.1' } }, res1)
 check('snapshot 用 route 名关联目录', res1.body.tiers[0].entries[0].route === 'example-provider' && res1.body.tiers[0].entries[0].registered === true, JSON.stringify(res1.body.tiers?.[0]))
 check('snapshot 计算 unassigned/missing', Array.isArray(res1.body.providers.unassigned) && res1.body.providers.unassigned.some((p) => p.id === 'other-provider') && res1.body.providers.missing.length === 0, JSON.stringify(res1.body.providers))
 const postReq = { method: 'POST', socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify({ enabled: false, evil: 1 })) } }
 const res2 = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
 await env1.routes['/provider-failover/config'](postReq, res2)
-check('/config 只接受白名单字段', res2.status === 200 && JSON.stringify(env1.updated.at(-1)) === JSON.stringify({ enabled: false }), JSON.stringify(env1.updated.at(-1)))
+const written1 = readScope(env1.settingsFile)
+check('/config 只接受白名单字段（仅 enabled 落盘）', res2.status === 200 && JSON.stringify(written1) === JSON.stringify({ enabled: false }), JSON.stringify(written1))
 const res3 = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
 const env3 = makeCtx({ listProviders: () => [], listConfigurableProviders: () => [] })
-apply(env3.ctx, {})
+Object.assign(env3, isolatedApply(env3.ctx, {}))
 await env3.routes['/provider-failover/status']({ socket: { remoteAddress: '127.0.0.1' } }, res3)
 check('目录不可用时 providers=null 且不误标', res3.body.providers === null && res3.body.tiers[0].entries[0].registered === true, JSON.stringify(res3.body.providers) + ' ' + JSON.stringify(res3.body.tiers?.[0]?.entries?.[0]))
 
@@ -167,7 +198,7 @@ const KEY_CONFIG = { keyResetAt: '06:00', tiers: [{ tier: 1, enabled: true, entr
 const llmStub = { listProviders: () => [{ id: 'r1', name: 'R1' }], listConfigurableProviders: () => [] }
 const failure = { failure: { code: 'AUTH', message: 'invalid api key' }, provider: 'r1', turn: 1, step: 1 }
 const env4 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true, source: 'file' }, K2: { configured: true, source: 'file' } } })
-apply(env4.ctx, KEY_CONFIG)
+Object.assign(env4, isolatedApply(env4.ctx, KEY_CONFIG))
 const rotated = await env4.handlers['agent/request-error'](failure, async () => 'NEXT')
 check('凭据类失败触发条目内 key 轮换并重试', rotated?.kind === 'retry', JSON.stringify(rotated))
 check('轮换只写引用名（path/value）', JSON.stringify(env4.mutations) === JSON.stringify([{ ns: 'llm-pi-ai', ops: [{ op: 'set', path: ['providers', 'r1', 'apiKeyEnv'], value: 'K2' }] }]), JSON.stringify(env4.mutations))
@@ -179,25 +210,25 @@ check('status 报告 key 引用状态（含 active/configured）', res4.body.tie
 check('status 暴露 nextKeyResetAt', typeof res4.body.nextKeyResetAt === 'number')
 
 const env5 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true, source: 'file' } } })
-apply(env5.ctx, KEY_CONFIG)
+Object.assign(env5, isolatedApply(env5.ctx, KEY_CONFIG))
 const skipped = await env5.handlers['agent/request-error'](failure, async () => 'NEXT')
 check('未配置的备用引用被跳过并交回宿主', skipped === 'NEXT' && env5.mutations.length === 0, JSON.stringify(skipped) + ' ' + JSON.stringify(env5.mutations))
 
 const env6 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true }, K2: { configured: true } } })
-apply(env6.ctx, KEY_CONFIG)
+Object.assign(env6, isolatedApply(env6.ctx, KEY_CONFIG))
 const overload = await env6.handlers['agent/request-error']({ failure: { code: 'SERVER', message: 'overloaded' }, provider: 'r1', turn: 1, step: 1 }, async () => 'NEXT')
 check('过载不消耗 key 轮换（走 provider 切换）', env6.mutations.length === 0, JSON.stringify(env6.mutations))
 
 const res7 = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
 const manualReq = { method: 'POST', socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify({ entry: 'ais', ref: 'K2' })) } }
 const env7 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true }, K2: { configured: true } } })
-apply(env7.ctx, KEY_CONFIG)
+Object.assign(env7, isolatedApply(env7.ctx, KEY_CONFIG))
 await env7.routes['/provider-failover/keys'](manualReq, res7)
 check('手工置位写入指定引用', res7.status === 200 && res7.body.ok === true && JSON.stringify(env7.mutations[0]?.ops?.[0]?.value) === '"K2"', JSON.stringify({ status: res7.status, mutations: env7.mutations }))
 const res8 = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
 const badReq = { method: 'POST', socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify({ entry: 'ais', ref: 'NOT_DECLARED' })) } }
 const env8 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true } } })
-apply(env8.ctx, KEY_CONFIG)
+Object.assign(env8, isolatedApply(env8.ctx, KEY_CONFIG))
 await env8.routes['/provider-failover/keys'](badReq, res8)
 check('手工置位拒绝未声明的引用', res8.body.ok === false && env8.mutations.length === 0, JSON.stringify(res8.body))
 
@@ -217,14 +248,15 @@ const postConfig = async (env, body) => {
   return res
 }
 
-// a) 设置层 keys 覆盖 patch（patch 未声明 keys），并按需启用每日重置排程
-const env9 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true, source: 'file' }, K9: { configured: true, source: 'file' } }, keysByEntry: { ais: ['K1', 'K9'] } })
-apply(env9.ctx, { tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm' }] }] })
+// a) 设置层 keys 覆盖 patch（patch 未声明 keys），并按需启用每日重置排程。
+// 用户层 keysByEntry 预置进用例自己的设置文件，走真实的读取路径。
+const env9 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true, source: 'file' }, K9: { configured: true, source: 'file' } } })
+Object.assign(env9, isolatedApply(env9.ctx, { tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm' }] }] }, { keysByEntry: { ais: ['K1', 'K9'] } }))
 const res9 = await statusOf(env9)
 check('设置层 keys 覆盖 patch keys', res9.body.tiers[0].entries[0].keys.length === 2 && res9.body.tiers[0].entries[0].keysSource === 'settings', JSON.stringify(res9.body.tiers[0].entries[0]))
 check('patch 无 keys 时默认不排程、有覆盖时按需排程', env9.disposers.length === 6, String(env9.disposers.length))
 const noKeys = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true } } })
-apply(noKeys.ctx, { tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm' }] }] })
+Object.assign(noKeys, isolatedApply(noKeys.ctx, { tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm' }] }] }))
 check('无任何 key 引用时不排程每日重置', noKeys.disposers.length === 5, String(noKeys.disposers.length))
 
 // b) 轮换使用设置层 keys
@@ -238,14 +270,15 @@ check('失效 key 带时间与错误', failedKey?.failed === true && typeof fail
 
 // d) /config 校验
 const env11 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' }, r2: { apiKeyEnv: 'K2' } }, refInfo: { K1: { configured: true }, K2: { configured: true }, K3: { configured: true } } })
-apply(env11.ctx, TWO_ENTRIES)
+Object.assign(env11, isolatedApply(env11.ctx, TWO_ENTRIES))
 check('拒绝条目内重复引用', (await postConfig(env11, { keysByEntry: { ais: ['K1', 'K1'] } })).body.error?.includes('repeats') === true)
 check('拒绝非法引用名', (await postConfig(env11, { keysByEntry: { ais: ['not a ref'] } })).body.error?.includes('invalid credential reference name') === true)
 check('拒绝未知条目 id', (await postConfig(env11, { keysByEntry: { nope: ['K1'] } })).body.error?.includes('unknown entry id') === true)
 check('拒绝跨条目复用引用', (await postConfig(env11, { keysByEntry: { ais: ['K3'], codex: ['K3'] } })).body.error?.includes('used by both entry') === true)
-check('非法写入不改动现有配置', env11.updated.length === 0 && env11.mutations.length === 0, JSON.stringify(env11.updated))
+check('非法写入不落盘、不改写引用', !existsSync(env11.settingsFile) && env11.mutations.length === 0, JSON.stringify(readScope(env11.settingsFile)))
 const okConfig = await postConfig(env11, { keysByEntry: { ais: ['K1', 'K3'] } })
-check('合法写入被接受并落盘', okConfig.status === 200 && JSON.stringify(env11.updated.at(-1)) === JSON.stringify({ keysByEntry: { ais: ['K1', 'K3'] } }), JSON.stringify(env11.updated.at(-1)))
+const written11 = readScope(env11.settingsFile)
+check('合法写入被接受并落盘', okConfig.status === 200 && JSON.stringify(written11) === JSON.stringify({ keysByEntry: { ais: ['K1', 'K3'] } }), JSON.stringify(written11))
 check('写入后状态快照反映新引用', okConfig.body.tiers[0].entries[0].keys.length === 2 && okConfig.body.tiers[0].entries[0].keys[1].ref === 'K3', JSON.stringify(okConfig.body.tiers[0].entries[0].keys))
 check('快照暴露可编辑的 keysByEntry', JSON.stringify(okConfig.body.editable.keysByEntry) === JSON.stringify({ ais: ['K1', 'K3'] }), JSON.stringify(okConfig.body.editable.keysByEntry))
 for (const env of [env9, noKeys, env11]) for (const dispose of env.disposers) dispose()
@@ -264,7 +297,7 @@ check('resolveTestTarget 未知目标返回 undefined', __test.resolveTestTarget
 check('resolveTestTarget 跳过未启用档位', __test.resolveTestTarget(TEST_TIERS, 'tier:3') === undefined)
 check('resolveTestTarget 无匹配当前 provider 时从首项开始', __test.resolveTestTarget(TEST_TIERS, '', 'unknown').entry.id === 'ais')
 
-// 最小同构 ctx：只挂测试切换需要的能力（settings / webServer / commands / sessionController）
+// 最小同构 ctx：只挂测试切换需要的能力（webServer / commands / sessionController）
 const makeSwitchEnv = (controller, patch, resolveModelInfo, streamFn) => {
   const routes = {}
   const disposers = []
@@ -276,13 +309,12 @@ const makeSwitchEnv = (controller, patch, resolveModelInfo, streamFn) => {
     on: (event, fn) => { handlers[event] = fn },
     get: (n) => n === 'llm' ? { listProviders: () => [], listConfigurableProviders: () => [], ...(resolveModelInfo === undefined ? {} : { resolveModelInfo }), ...(streamFn === undefined ? {} : { stream: streamFn }) } : n === 'sessionController' ? controller : undefined,
     inject: (deps, cb) => {
-      if (deps.includes('settings')) cb({ settings: { register: () => ({ get: () => ({ enabled: true, minSwitchIntervalMs: 1000, maxSwitchesPerTurn: 6, startupPreferTier: 1, rankingMode: 'keywords', keyResetAt: '06:00', keysByEntry: {} }), watch: () => () => {}, update: async () => {} }) } })
       if (deps.includes('webServer')) cb({ webServer: { register: (r) => { routes[r.path] = r.handler; return () => {} } } })
       if (deps.includes('commands')) cb({ commands: { register: (def) => { logs.push(def); return () => {} } } })
     },
   }
-  apply(ctx, patch)
-  return { routes, disposers, handlers, registered: logs }
+  const scope = isolatedApply(ctx, patch)
+  return { routes, disposers, handlers, registered: logs, settingsFile: scope.settingsFile }
 }
 const postTest = async (env, body) => {
   const req = { method: 'POST', socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify(body)) } }
@@ -530,8 +562,10 @@ check('会话 B 不受 A 的图片需求影响（正常切换）', bErr?.kind ==
 for (const dispose of envNeeds.disposers) dispose()
 
 // 设置页需渲染 Host 的 ignored 诊断（client.js 静态检查）。
-const { readFileSync } = await import('node:fs')
 check('client.js 渲染「最近未切换原因」（status.ignored）', readFileSync(new URL('../client.js', import.meta.url), 'utf8').includes('status.ignored'))
+
+check('真实设置文件未被探针触碰', existsSync(realSettingsFile) === realFileExisted, realSettingsFile)
+cleanupHomes()
 
 console.log(failures.length === 0 ? '\nALL PASSED' : '\nFAILURES: ' + failures.length)
 process.exitCode = failures.length === 0 ? 0 : 1

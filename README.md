@@ -72,7 +72,7 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 
 - **只写引用名，永不写值**：插件经 `ctx.settings.mutate('llm-pi-ai', …)` 改写 `providers.<route>.apiKeyEnv`，不调用凭据服务的任何写接口，也不读取/缓存/打印凭据值。
 - **失败分工**：凭据类编码（`QUOTA` / `AUTH` / `INVALID_CREDENTIAL` / `MISSING_CREDENTIAL`）→ 条目内换 key；`SERVER` / `RATE_LIMIT` / `NO_ADAPTER` 与消息模式兜底 → 走 provider 切换（换 key 治不了过载，也不因一句话就消耗一把 key）。
-- **候选预检**：轮换前用 `credentials.describe(ref)` 确认目标引用已配置；未配置则跳过并每进程警告一次（`key reference skipped: …`）。全部候选不可用时交回宿主默认失败路径（`settings` 只读、命名空间未注册、写入抛错同样如此）。
+- **候选预检**：轮换前用 `credentials.describe(ref)` 确认目标引用已配置；未配置则跳过并每进程警告一次（`key reference skipped: …`）。全部候选不可用时交回宿主默认失败路径（写入设置文件失败同样如此）。
 - **有界**：记账键是 `entryId@route#ref`，同一引用每 `(turn, step)` 至多一次；轮换计入单 turn 上限与最小切换间隔；key 类失败**不给路由冷却**（否则换 key 后仍被冷却挡住）。
 - **每个引用只服务一个 provider**：同一引用名不得出现在多个条目（校验拒绝）。
 - 无 `keys` 或 `keys: []` 的条目行为与单 key 完全一致。
@@ -80,7 +80,7 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 ### 每日重置与手工状态
 
 - 顶层 `keyResetAt`（`HH:MM` 本地时间，默认 `06:00`）：到点清空全部 key 失效标记，并把「当前引用属于 `keys` 且不是首项」的条目写回 `keys[0]`，全部 key 恢复可重试。
-- **手工状态优先**：活动引用每次实时读 settings（不缓存），你直接改 `settings.yaml` 的 `apiKeyEnv` 立即生效；当前引用**不在** `keys` 内时视为手工状态，重置只清标记、不改写它。
+- **手工状态优先**：活动引用每次实时读 settings（不缓存，经 `SettingsForms.describe` 读 `llm-pi-ai` 活动表单），你直接改模型路由的 `apiKeyEnv` 立即生效；当前引用**不在** `keys` 内时视为手工状态，重置只清标记、不改写它。
 - 手工干预接口：`POST /provider-failover/keys`，body `{entry, ref}` 置位某引用、`{entry}` 重置该条目到 `keys[0]`、`{}` 重置全部（未声明或未配置的引用被拒绝）。设置页也有「重置 key 状态」按钮。
 
 配置示例（profile patch；`keys` 是引用名，不是路由名）：
@@ -96,7 +96,7 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
           - { id: first, route: my-provider, model: my-model, keys: [MY_PROVIDER_API_KEY, MY_PROVIDER_API_KEY_2], cooldownMs: 60000 }
 ```
 
-引用名对应的密钥值由你写入宿主凭据库（`.credentials.yaml` 的 `refs`，或环境变量 / 设置页的 Models 页），插件不代写。实测（本地 mock，未消耗真实额度）：路由 `probe-key-bad` 首把引用在 402 后，未配置的备选被跳过，`apiKeyEnv` 被改写为第二把引用，mock 实收 `Authorization` 从 `sk-probe-ba…` 变为 `sk-probe-go…` 并成功回答，`settings.yaml` 同步落盘。
+引用名对应的密钥值由你写入宿主凭据库（`.credentials.yaml` 的 `refs`，或环境变量 / 设置页的 Models 页），插件不代写。实测（本地 mock，未消耗真实额度）：路由 `probe-key-bad` 首把引用在 402 后，未配置的备选被跳过，`apiKeyEnv` 被改写为第二把引用，mock 实收 `Authorization` 从 `sk-probe-ba…` 变为 `sk-probe-go…` 并成功回答，改动经 settings 服务落盘。
 
 ## 测试切换（会话级 provider/模型）
 
@@ -181,7 +181,7 @@ dsh plugin --profile <profile> remove dsh-deepseek-keypool
 
 dsh 设置页新增「Provider 故障转移」小节：**总开关** + 常用参数（最小切换间隔、单 turn 上限、启动对齐档位、档内排序模式、key 每日重置时刻），保存后**即时生效，无需重启**；另有「重置 key 状态」按钮。
 
-- 持久化：写宿主 settings 命名空间 `provider-failover`，用户层落 `$DSH_HOME/settings.yaml` 的 `provider-failover:` 段；**用户层优先于 profile patch 的对应字段**（这正是开关语义；没被用户改过的项仍以 patch 为准）。
+- 持久化：写插件自有文件 `$DSH_HOME/plugins/provider-failover/settings.json`（0.2 起 dsh-settings 移除了按插件命名空间 store 与 `settings.yaml` 用户层）；**用户层优先于 profile patch 的对应字段**（这正是开关语义；没被用户改过的项仍以 patch 为准）。
 - 接口（仅本地回环）：
   - `GET /provider-failover/status`：生效值 + 档位表（含每条目 key 引用的 `ref/active/configured/source/failed` 标注）+ `nextKeyResetAt` + 最近 10 条转移/换 key 记录 + 冷却路由。
   - `POST /provider-failover/config`：字段白名单 `{enabled, minSwitchIntervalMs, maxSwitchesPerTurn, startupPreferTier, rankingMode, keyResetAt}`，经 settings 服务落盘。

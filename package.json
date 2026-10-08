@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-keypool",
-  "version": "3.2.3",
+  "version": "3.2.4",
   "description": "DSH Provider 分档故障转移 —— 模型请求以额度/凭据/过载/限流等可切换失败结束时，按配置表档位顺序切换 harness 路由（provider）；凭据类失败先在条目内轮换 key（改写该路由的 apiKeyEnv 引用名，路由与模型不变），并按每日重置时刻恢复默认 key。设置页可查看并编辑每个条目的 key 引用（凭据引用名）与状态（在用/可用/失效[时间·错误]/未配置），并可做会话级测试切换（/failover-test 指令或按钮）。不持有也不读写任何凭据值。",
   "type": "module",
   "main": "index.js",
@@ -24,9 +24,7 @@
       "inject": []
     }
   },
-  "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.2"
-  },
+  "dependencies": {},
   "keywords": [
     "dsh",
     "deepseek",
@@ -46,6 +44,6 @@
     "managed-by": "skillhub",
     "source": "skillhub",
     "asset-type": "registry-entry",
-    "changelog": "Correct the isSwitchable policy comment to match the default policyFailover: true behavior (comment-only; no runtime change)."
+    "changelog": "3.2.4: adapt to dsh 0.2 (settings moved to the plugin-owned settings.json; active key ref now read via SettingsForms.describe), probe drives the file scope in an isolated DSH_HOME, and the isSwitchable policy comment matches the default policyFailover: true behavior."
   }
 }
