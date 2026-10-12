@@ -23,6 +23,10 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 
 `websocket closed` 覆盖上游 WebSocket/SSE 中途断开（如 `WebSocket closed 1000`）：宿主 `classifyPiAiError` 只把 `WebSocket closed unexpectedly` 归一化为 `TRANSPORT`，仅带关闭码的文案会落到通用 `PI_AI_ERROR`，须靠消息模式兜底才能触发切换。传输层失败按**非凭据类**处理，直接走 provider 切换（换 key 治不了连接断开）。
 
+> ⚠️ **这两个键是「整体替换」，不是「追加」。** `terminalCodes` / `failurePatterns` 只要非空，就会**完全替换**上表的默认集合（`index.js` 的 `normalizeConfig`：`strings(input.terminalCodes).length > 0 ? strings(input.terminalCodes) : DEFAULT_TERMINAL_CODES`）。因此在 profile 里一旦列出它们却漏掉 `TRANSPORT` 或 `websocket closed`，传输层故障转移会被**静默关闭**：上游 WebSocket/SSE 中途断开时不切换，宿主日志里也不会出现 `switch` 行——看起来像「插件失效」，实际是配置把触发条件删掉了。
+>
+> **推荐根本不要写这两个键**，直接用默认表（上表即为默认表）。确需自定义时，请以上表为基线**逐项追加**，不要凭记忆重写。
+
 策略拒绝（例如 `Invalid prompt ... flagged as potentially violating our usage policy`）默认按 `policyMode: 'same'` 处理：**保留当前 provider/model**，在同一 `(turn, step)` 内原地重试（不轮换 key、不切换 provider、不给路由冷却），重试次数受 `maxPolicyRetriesPerStep`（默认 2）约束，耗尽后保持当前 provider/model 交回宿主。可用 `policyMode: 'switch'` 恢复旧的「切到下一条已配置 Provider」行为，或用 `'off'` 完全不介入。旧字段 `policyFailover` 仍兼容：未显式给出 `policyMode` 时，`true` → `switch`、`false` → `off`。
 
 `CONTEXT_WINDOW_EXCEEDED` 与 `INVALID_REQUEST` 默认**不**触发（换 provider 不解决问题）。策略拒绝单独由 `policyMode` 控制。
@@ -74,6 +78,33 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 ```
 
 字段：顶层 `enabled` / `policyMode` / `policyFailover`（兼容旧字段）/ `maxPolicyRetriesPerStep` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
+
+### 按模型族对齐档位（推荐）
+
+把**同一个 model** 的多个路由放进同一档，额度耗尽时就会先在同族内互备；跨族降级交给下一档：
+
+```yaml
+- id: dsh-deepseek-keypool
+  config:
+    ranking: { mode: declared }        # 固定档内顺序；keywords 会让「先试哪个」随失败上下文漂移
+    tiers:
+      - tier: 1                        # gpt 族互备
+        enabled: true
+        entries:
+          - { id: relay,    route: codex-relay,  model: gpt-5.6-sol, cooldownMs: 60000 }
+          - { id: official, route: openai-codex, model: gpt-5.6-sol, cooldownMs: 120000 }
+      - tier: 2                        # deepseek 族互备
+        enabled: true
+        entries:
+          - { id: ais,        route: ais-2dsglm,  model: deepseek-v4.1-flash, cooldownMs: 60000 }
+          - { id: opencodego, route: opencode-go, model: deepseek-v4.1-flash, cooldownMs: 60000 }
+      - tier: 3                        # 跨族保底
+        enabled: true
+        entries:
+          - { id: kimi, route: kimi-coding, model: k3-256k, cooldownMs: 60000 }
+```
+
+**限制（务必先读）**：`pickCandidate` 每次切换都**从第 1 档向上扫**（`for (const tier of config.tiers)`），不是从失败路由所在档开始。因此只要第 1 档还有可用条目，低档的失败就会**升到第 1 档的模型族**——同一时刻**只有一个族**能获得族内互备。上例中 `codex-relay` ↔ `openai-codex` 双向互备成立；但 `ais-2dsglm` 失败会先切到 gpt 族，只有当 gpt 族两路都不可用时，deepseek 才会在同族内互换。若需要两个方向都严格族内互备，须在 `pickCandidate` 增加一个「同 model 优先」的前置 pass（当前版本没有该能力）。
 
 ## 单路由多 key（`keys` = 同一路由的凭据引用名）
 
