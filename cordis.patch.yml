@@ -9,6 +9,8 @@
 #
 #   - id: dsh-deepseek-keypool
 #     config:
+#       policyMode: same          # same（默认，保留当前 provider/model 原地重试）| switch | off
+#       maxPolicyRetriesPerStep: 2
 #       startup: { preferTier: 1 }
 #       ranking: { mode: keywords, timeoutMs: 20000, cacheTtlMs: 60000 }
 #       tiers:

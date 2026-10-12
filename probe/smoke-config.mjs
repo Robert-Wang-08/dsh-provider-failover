@@ -65,8 +65,14 @@ check('message fallbacks include Codex usage-limit wording', defaults.failurePat
 const switchableShape = (value) => ({ terminalCodes: new Set(value.terminalCodes), failurePatterns: value.failurePatterns })
 check('Codex natural-language usage limit is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'Codex error: The usage limit has been reached').how === 'pattern:usage limit')
 check('Codex snake-case usage limit is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'usage_limit_reached').how === 'pattern:usage_limit')
-check('prompt policy refusal is switchable by default', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'Invalid prompt: your prompt was flagged as potentially violating our usage policy').how === 'policy:prompt')
+check('default terminal codes include TRANSPORT', defaults.terminalCodes.includes('TRANSPORT'))
+check('message fallbacks include WebSocket-close wording', defaults.failurePatterns.includes('websocket closed'))
+check('WebSocket close with code is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'WebSocket closed 1000').how === 'pattern:websocket closed')
+check('normalized TRANSPORT failure is switchable', __test.isSwitchable(switchableShape(defaults), 'TRANSPORT', 'socket hang up').how === 'code:TRANSPORT')
+check('prompt policy refusal is handled by default', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'Invalid prompt: your prompt was flagged as potentially violating our usage policy').how === 'policy:prompt')
 check('prompt policy refusal can remain terminal explicitly', __test.isSwitchable({ ...switchableShape(defaults), policyFailover: false }, 'PI_AI_ERROR', 'Invalid prompt: your prompt was flagged as potentially violating our usage policy').category === 'policy')
+check('policyFailover:true keeps the legacy switch semantics', __test.isSwitchable({ ...switchableShape(defaults), policyFailover: true }, 'PI_AI_ERROR', 'flagged as potentially violating our usage policy').hit === true)
+check('policyMode:off suppresses the policy takeover', __test.isSwitchable({ ...switchableShape(defaults), policyMode: 'off' }, 'PI_AI_ERROR', 'flagged as potentially violating our usage policy').category === 'policy')
 check('no credential field anywhere', JSON.stringify(defaults).toLowerCase().indexOf('apikeyenv') < 0)
 
 console.log('normalize:')
@@ -88,6 +94,14 @@ check('rejects unknown ranking mode', badMode.errors.some((error) => error.inclu
 
 const badTier = normalize({ startup: { preferTier: -1 } })
 check('rejects negative preferTier', badTier.errors.some((error) => error.includes('startup.preferTier')))
+
+const policyDefaults = normalize({})
+check('policy defaults to same-provider retry', policyDefaults.value.policyMode === 'same' && policyDefaults.value.maxPolicyRetriesPerStep === 2, JSON.stringify({ mode: policyDefaults.value.policyMode, max: policyDefaults.value.maxPolicyRetriesPerStep }))
+check('legacy policyFailover:true maps to switch', normalize({ policyFailover: true }).value.policyMode === 'switch')
+check('legacy policyFailover:false maps to off', normalize({ policyFailover: false }).value.policyMode === 'off')
+check('explicit policyMode wins over legacy field', normalize({ policyFailover: true, policyMode: 'same' }).value.policyMode === 'same')
+check('rejects unknown policyMode', normalize({ policyMode: 'bogus' }).errors.some((error) => error.includes('policyMode')))
+check('rejects non-positive maxPolicyRetriesPerStep', normalize({ maxPolicyRetriesPerStep: 0 }).errors.some((error) => error.includes('maxPolicyRetriesPerStep')))
 
 const zeroInterval = normalize({ minSwitchIntervalMs: 0 })
 check('accepts minSwitchIntervalMs 0 (guard off)', zeroInterval.errors.length === 0 && zeroInterval.value.minSwitchIntervalMs === 0, JSON.stringify(zeroInterval.errors))
@@ -474,18 +488,45 @@ const POLICY_TIERS = [{ tier: 1, enabled: true, entries: [
   { id: 'policy-source', route: 'r-policy', model: 'm-policy', enabled: true },
   { id: 'policy-fallback', route: 'r-policy-fallback', model: 'm-policy-fallback', enabled: true },
 ] }]
+const POLICY_FAILURE = { code: 'PI_AI_ERROR', message: 'Invalid prompt: your prompt was flagged as potentially violating our usage policy' }
+
+// 默认 policyMode='same'：保留当前 provider/model，在同一 (turn, step) 原地重试，不切换。
 const envPolicy = makeSwitchEnv(undefined, { probeTarget: false, minSwitchIntervalMs: 0, startup: { preferTier: 0 }, tiers: POLICY_TIERS })
 const policyAgent = freshAgent('policy-session')
-const policyDecision = await envPolicy.handlers['agent/request-error']({ agent: policyAgent, failure: { code: 'PI_AI_ERROR', message: 'Invalid prompt: your prompt was flagged as potentially violating our usage policy' }, provider: 'r-policy', turn: 1, step: 1 }, async () => 'NEXT')
+const policyDecision = await envPolicy.handlers['agent/request-error']({ agent: policyAgent, failure: POLICY_FAILURE, provider: 'r-policy', turn: 1, step: 1 }, async () => 'NEXT')
 const policyRoute = await envPolicy.handlers['agent/request']({ agent: policyAgent, turn: 1, step: 1 }, async () => ({ provider: 'r-policy', model: 'm-policy' }))
-check('policy refusal triggers controlled provider retry', policyDecision?.kind === 'retry', JSON.stringify(policyDecision))
-check('policy refusal switches to next configured provider', policyRoute.provider === 'r-policy-fallback' && policyRoute.model === 'm-policy-fallback', JSON.stringify(policyRoute))
-for (const dispose of envPolicy.disposers) dispose()
+check('policy refusal retries on the same provider by default', policyDecision?.kind === 'retry', JSON.stringify(policyDecision))
+check('policy refusal keeps the current provider/model', policyRoute.provider === 'r-policy' && policyRoute.model === 'm-policy', JSON.stringify(policyRoute))
+const policyStatus = await statusOf(envPolicy)
+check('policy retry is audited as policy-retry', policyStatus.body.switches.some((item) => item.kind === 'policy-retry' && item.from === 'r-policy' && item.to === 'r-policy') === true, JSON.stringify(policyStatus.body.switches))
+check('status reports policyMode/maxPolicyRetriesPerStep', policyStatus.body.policyMode === 'same' && policyStatus.body.maxPolicyRetriesPerStep === 2, JSON.stringify({ mode: policyStatus.body.policyMode, max: policyStatus.body.maxPolicyRetriesPerStep }))
+
+// 重试次数上限：耗尽后保持当前 provider/model 交回宿主。
+const envPolicyCap = makeSwitchEnv(undefined, { probeTarget: false, minSwitchIntervalMs: 0, startup: { preferTier: 0 }, maxPolicyRetriesPerStep: 1, tiers: POLICY_TIERS })
+const capAgent = freshAgent('policy-cap-session')
+const cap1 = await envPolicyCap.handlers['agent/request-error']({ agent: capAgent, failure: POLICY_FAILURE, provider: 'r-policy', turn: 1, step: 1 }, async () => 'NEXT')
+const cap2 = await envPolicyCap.handlers['agent/request-error']({ agent: capAgent, failure: POLICY_FAILURE, provider: 'r-policy', turn: 1, step: 1 }, async () => 'NEXT')
+check('policy retry respects maxPolicyRetriesPerStep then hands back', cap1?.kind === 'retry' && cap2 === 'NEXT', JSON.stringify([cap1, cap2]))
+
+// policyMode='switch'：保留旧行为（切到下一条 provider）。
+const envPolicySwitch = makeSwitchEnv(undefined, { probeTarget: false, minSwitchIntervalMs: 0, startup: { preferTier: 0 }, policyMode: 'switch', tiers: POLICY_TIERS })
+const swAgent = freshAgent('policy-switch-session')
+const swDecision = await envPolicySwitch.handlers['agent/request-error']({ agent: swAgent, failure: POLICY_FAILURE, provider: 'r-policy', turn: 1, step: 1 }, async () => 'NEXT')
+const swRoute = await envPolicySwitch.handlers['agent/request']({ agent: swAgent, turn: 1, step: 1 }, async () => ({ provider: 'r-policy', model: 'm-policy' }))
+check('policyMode:switch keeps the legacy provider switch', swDecision?.kind === 'retry' && swRoute.provider === 'r-policy-fallback' && swRoute.model === 'm-policy-fallback', JSON.stringify(swRoute))
+
+// policyMode='off'：不介入，交回宿主。
+const envPolicyOff = makeSwitchEnv(undefined, { probeTarget: false, minSwitchIntervalMs: 0, startup: { preferTier: 0 }, policyMode: 'off', tiers: POLICY_TIERS })
+const offDecision = await envPolicyOff.handlers['agent/request-error']({ agent: freshAgent('policy-off-session'), failure: POLICY_FAILURE, provider: 'r-policy', turn: 1, step: 1 }, async () => 'NEXT')
+check('policyMode:off hands policy failures back to the host', offDecision === 'NEXT', JSON.stringify(offDecision))
+for (const env of [envPolicy, envPolicyCap, envPolicySwitch, envPolicyOff]) for (const dispose of env.disposers) dispose()
 
 // 2026-10-02：全量测试——对启用档位的每个 provider/model 发最小真实请求并列出状态。
 console.log('全量测试（真实最小请求 + 状态分类）:')
 check('classifyProbeFailure 额度不足', __test.classifyProbeFailure('QUOTA', 'quota exceeded').label === '额度不足')
 check('classifyProbeFailure 超时兜底', __test.classifyProbeFailure(undefined, 'request timed out').status === 'TIMEOUT')
+check('classifyProbeFailure 归一化传输中断', __test.classifyProbeFailure('TRANSPORT', 'socket hang up').label === '传输中断')
+check('classifyProbeFailure WebSocket close 兜底', __test.classifyProbeFailure('PI_AI_ERROR', 'WebSocket closed 1000').status === 'TRANSPORT')
 check('classifyProbeFailure 未知编码', __test.classifyProbeFailure(undefined, 'weird thing').label === '未知错误')
 
 const PROBE_TIERS = [

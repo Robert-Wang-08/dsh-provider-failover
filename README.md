@@ -15,15 +15,28 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 
 ## 可切换失败
 
-默认集合：`QUOTA`、`AUTH`、`INVALID_CREDENTIAL`、`MISSING_CREDENTIAL`、`NO_ADAPTER`、`SERVER`、`RATE_LIMIT`。
+默认集合：`QUOTA`、`AUTH`、`INVALID_CREDENTIAL`、`MISSING_CREDENTIAL`、`NO_ADAPTER`、`SERVER`、`RATE_LIMIT`、`TRANSPORT`。
 
-另有**消息模式兜底**（编码未归一化时按文本匹配）：`insufficient balance`、`insufficient_quota`、`quota exceeded`、`usage limit`、`usage_limit`、`balance`、`overloaded`、`invalid api key`、`token limit`、`rate limit`。
+另有**消息模式兜底**（编码未归一化时按文本匹配）：`insufficient balance`、`insufficient_quota`、`quota exceeded`、`usage limit`、`usage_limit`、`balance`、`overloaded`、`invalid api key`、`token limit`、`rate limit`、`websocket closed`。
 
 其中 `usage limit` / `usage_limit` 覆盖 Codex OAuth 常见额度耗尽文案 `The usage limit has been reached` 与 `usage_limit_reached`。部分宿主版本会把前者归成通用 `PI_AI_ERROR`，插件必须依靠消息模式兜底，不能只看 `QUOTA` 编码。
 
-策略拒绝（例如 `Invalid prompt ... flagged as potentially violating our usage policy`）默认按 `policyFailover: true` 进入下一条已配置 Provider，不轮换 key；仍受候选预检、冷却、单 turn 切换上限和最小间隔约束。设为 `policyFailover: false` 可恢复为终止本轮并提示修改提示词。
+`websocket closed` 覆盖上游 WebSocket/SSE 中途断开（如 `WebSocket closed 1000`）：宿主 `classifyPiAiError` 只把 `WebSocket closed unexpectedly` 归一化为 `TRANSPORT`，仅带关闭码的文案会落到通用 `PI_AI_ERROR`，须靠消息模式兜底才能触发切换。传输层失败按**非凭据类**处理，直接走 provider 切换（换 key 治不了连接断开）。
 
-`CONTEXT_WINDOW_EXCEEDED` 与 `INVALID_REQUEST` 默认**不**触发（换 provider 不解决问题）。策略拒绝单独由 `policyFailover` 控制。
+策略拒绝（例如 `Invalid prompt ... flagged as potentially violating our usage policy`）默认按 `policyMode: 'same'` 处理：**保留当前 provider/model**，在同一 `(turn, step)` 内原地重试（不轮换 key、不切换 provider、不给路由冷却），重试次数受 `maxPolicyRetriesPerStep`（默认 2）约束，耗尽后保持当前 provider/model 交回宿主。可用 `policyMode: 'switch'` 恢复旧的「切到下一条已配置 Provider」行为，或用 `'off'` 完全不介入。旧字段 `policyFailover` 仍兼容：未显式给出 `policyMode` 时，`true` → `switch`、`false` → `off`。
+
+`CONTEXT_WINDOW_EXCEEDED` 与 `INVALID_REQUEST` 默认**不**触发（换 provider 不解决问题）。策略拒绝单独由 `policyMode` 控制。
+
+### policy 失败为什么不做 prompt 改写
+
+宿主把每次尝试的请求视为**不可变且可重建**：`dsh-agent-loop` 用 `Object.freeze` 冻结 `GenerateOptions` 与 `messages`，并注册 `llm/stream` 的 request-reconstruction invariant（`JSON.stringify(options.messages) === JSON.stringify(session.deriveMessages())`）；`agent/request` 的契约也明确「cannot mutate messages / 模型可见内容必须走 logged 渠道」。且 `RequestErrorAction` 只支持 `{ kind: 'retry' }`，无法携带改写后的消息。因此**插件不能在重试时改写 prompt**。
+
+代码原因此前评估过两条改写路径，都不可行：
+
+- 在 `llm/stream` waterfall 里 `next(modifiedOptions)` 替换参数——本版 cordis 的 `waterfall` 中 `next` 忽略入参（`next = () => (cbs.shift() ?? inner)(...args)`），参数不会透传；
+- 在监听器里就地改写 `options.messages` 后重新 `ctx.llm.stream()`——越过了 loop 的 request-reconstruction invariant，属宿主明确禁止的旁路，脆弱且可能被后续版本判失败。
+
+所以 `policyMode: 'same'` 只保证「不切走、原地再试」，不改请求内容；若上游是硬性策略拦截，重试仍可能失败，最终由 `maxPolicyRetriesPerStep` 收口交回宿主。
 
 ## 分档配置表
 
@@ -60,7 +73,7 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
           - { id: fallback, route: my-provider-2, model: my-model-2, cooldownMs: 60000 }
 ```
 
-字段：顶层 `enabled` / `policyFailover` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
+字段：顶层 `enabled` / `policyMode` / `policyFailover`（兼容旧字段）/ `maxPolicyRetriesPerStep` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
 
 ## 单路由多 key（`keys` = 同一路由的凭据引用名）
 
@@ -172,6 +185,7 @@ dsh plugin --profile <profile> remove dsh-deepseek-keypool
 
 - `[dsh-provider-failover] ready: …` 启动时的档位/条目摘要与 `startup.preferTier`、`ranking` 模式；
 - `switch <from> -> <to> tier N (<trigger>)` 每次实际转移（trigger 为 `code:XXX` 或 `pattern:xxx`）；
+- `policy retry <n>/<max> on <route> (policy:prompt, turn T step S)` policy 失败时的同 provider 原地重试（耗尽的收口记入 `ignored`，category `policy`）；
 - `key rotate <entry>@<route> <旧引用> -> <新引用> (<trigger>)` 条目内换 key（只含引用名，无凭据值）；
 - `key reset (scheduled|manual): …` 每日重置/手工重置的动作摘要；
 - `candidate skipped (unresolvable): …` / `key reference skipped: <ref> — …` 预检跳过的候选；

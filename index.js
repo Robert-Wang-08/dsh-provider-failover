@@ -86,7 +86,7 @@ function isLocalRequest(req) {
 }
 
 /** 可切换失败的默认归一化编码集合。 */
-const DEFAULT_TERMINAL_CODES = ['QUOTA', 'AUTH', 'INVALID_CREDENTIAL', 'MISSING_CREDENTIAL', 'NO_ADAPTER', 'SERVER', 'RATE_LIMIT']
+const DEFAULT_TERMINAL_CODES = ['QUOTA', 'AUTH', 'INVALID_CREDENTIAL', 'MISSING_CREDENTIAL', 'NO_ADAPTER', 'SERVER', 'RATE_LIMIT', 'TRANSPORT']
 
 /**
  * 「可切换失败」里属于**凭据类**的编码：命中时先尝试条目内 key 轮换（改 apiKeyEnv 引用），
@@ -154,6 +154,10 @@ const DEFAULT_FAILURE_PATTERNS = [
   'invalid api key',
   'token limit',
   'rate limit',
+  // 传输层异常：上游 WebSocket/SSE 中途断开。宿主 classifyPiAiError 只把
+  // "WebSocket closed unexpectedly" 归一化为 TRANSPORT，像 "WebSocket closed 1000"
+  // 这类仅带关闭码的文案会落到通用 PI_AI_ERROR，必须靠消息模式兜底才能触发切换。
+  'websocket closed',
 ]
 
 /**
@@ -180,7 +184,16 @@ const PROBE_PROMPT = 'Reply with the single word: ok'
 
 const DEFAULT_CONFIG = {
   enabled: true,
+  // policy（内容/安全策略）类失败的处理模式：
+  //   'same'   —— 保留当前 provider/model，在同一 (turn, step) 内原地重试（默认；
+  //               受 maxPolicyRetriesPerStep 约束，不轮换 key、不切换 provider、不冷却路由）
+  //   'switch' —— 切换到下一条已配置 provider（旧 `policyFailover: true` 行为）
+  //   'off'    —— 不介入，交回宿主原有失败路径（旧 `policyFailover: false` 行为）
+  policyMode: 'same',
+  // 兼容旧字段：`policyMode` 未给出时按它推导（false→off，true→switch）。
   policyFailover: true,
+  // 单 (turn, step) 内 policy 同 provider 重试次数上限。
+  maxPolicyRetriesPerStep: 2,
   terminalCodes: DEFAULT_TERMINAL_CODES,
   failurePatterns: DEFAULT_FAILURE_PATTERNS,
   minSwitchIntervalMs: 1000,
@@ -336,9 +349,19 @@ function strings(value) {
 function normalizeConfig(raw) {
   const errors = []
   const input = isPlainObject(raw) ? raw : {}
+  // policy 模式解析：`policyMode` 优先；否则按旧字段 `policyFailover` 推导（显式 true→switch，
+  // 显式 false→off），两者都未给出时用默认 same。
+  const requestedPolicyMode = optionalString(input.policyMode)
+  let policyMode
+  if (requestedPolicyMode !== undefined) policyMode = requestedPolicyMode
+  else if (input.policyFailover === false) policyMode = 'off'
+  else if (input.policyFailover === true) policyMode = 'switch'
+  else policyMode = DEFAULT_CONFIG.policyMode
   const config = {
     enabled: input.enabled === undefined ? DEFAULT_CONFIG.enabled : input.enabled === true,
-    policyFailover: input.policyFailover === undefined ? DEFAULT_CONFIG.policyFailover : input.policyFailover === true,
+    policyFailover: policyMode !== 'off',
+    policyMode,
+    maxPolicyRetriesPerStep: input.maxPolicyRetriesPerStep === undefined ? DEFAULT_CONFIG.maxPolicyRetriesPerStep : input.maxPolicyRetriesPerStep,
     terminalCodes: new Set((strings(input.terminalCodes).length > 0 ? strings(input.terminalCodes) : DEFAULT_TERMINAL_CODES).map((code) => code.toUpperCase())),
     failurePatterns: (strings(input.failurePatterns).length > 0 ? strings(input.failurePatterns) : DEFAULT_FAILURE_PATTERNS).map((pattern) => pattern.toLowerCase()),
     minSwitchIntervalMs: input.minSwitchIntervalMs === undefined ? DEFAULT_CONFIG.minSwitchIntervalMs : input.minSwitchIntervalMs,
@@ -358,6 +381,8 @@ function normalizeConfig(raw) {
 
   if (typeof config.minSwitchIntervalMs !== 'number' || Number.isFinite(config.minSwitchIntervalMs) !== true || config.minSwitchIntervalMs < 0) errors.push('minSwitchIntervalMs must be a non-negative number (0 disables the interval guard)')
   if (!Number.isInteger(config.maxSwitchesPerTurn) || config.maxSwitchesPerTurn < 1) errors.push('maxSwitchesPerTurn must be a positive integer')
+  if (['same', 'switch', 'off'].indexOf(config.policyMode) < 0) errors.push('policyMode must be one of same|switch|off')
+  if (!Number.isInteger(config.maxPolicyRetriesPerStep) || config.maxPolicyRetriesPerStep < 1) errors.push('maxPolicyRetriesPerStep must be a positive integer')
   if (parseClock(config.keyResetAt) === undefined) errors.push('keyResetAt must be HH:MM in 24-hour local time (e.g. 06:00)')
 
   const startup = isPlainObject(input.startup) ? input.startup : {}
@@ -522,8 +547,8 @@ function masked(value) {
 /**
  * 该失败是否属于「可切换」，并给设置页一个明确的“不切换原因”。
  * 内容/安全策略拒绝必须先于通用 INVALID_REQUEST 判断：它不是请求参数问题。
- * 默认 `policyFailover: true` 时按受限策略进入下一条已配置 Provider（不轮换 key，
- * 仍受候选预检/冷却/单 turn 切换上限/最小间隔约束）；设为 false 才终止本轮并提示修改提示词。
+ * 命中 policy 时由调用方按 `policyMode` 决定动作（same 原地重试 / switch 切 provider /
+ * off 交回宿主）；本函数只回答“是否对 policy 已完成处理接管”，因此 `off` 返回 hit:false。
  */
 function isSwitchable(config, code, message) {
   const normalized = typeof code === 'string' ? code.toUpperCase() : ''
@@ -531,12 +556,15 @@ function isSwitchable(config, code, message) {
   const policyCodes = new Set(['CONTENT_POLICY_VIOLATION', 'MODERATION_BLOCKED', 'PROMPT_BLOCKED', 'SAFETY'])
   const policyPatterns = ['usage policy', 'content policy', 'safety policy', 'potentially violating', 'prompt was flagged']
   if (policyCodes.has(normalized) || policyPatterns.some((pattern) => haystack.includes(pattern))) {
-    if (config.policyFailover !== false) return { hit: true, how: 'policy:prompt', category: 'switchable', policy: true }
-    return {
-      hit: false,
-      category: 'policy',
-      reason: '提示词被上游内容/安全策略拒绝；不会轮换密钥或切换 Provider，请修改提示词后重试。',
+    const policyMode = config.policyMode ?? (config.policyFailover === false ? 'off' : 'same')
+    if (policyMode === 'off') {
+      return {
+        hit: false,
+        category: 'policy',
+        reason: '提示词被上游内容/安全策略拒绝；policyMode=off 时不介入，交回宿主处理（请修改提示词后重试）。',
+      }
     }
+    return { hit: true, how: 'policy:prompt', category: 'switchable', policy: true }
   }
   if (normalized === 'CONTEXT_WINDOW_EXCEEDED') {
     return { hit: false, category: 'context', reason: '上下文窗口超限；切换密钥无效，请缩短上下文或先压缩。' }
@@ -563,6 +591,7 @@ const PROBE_STATUS_LABELS = {
   NO_ADAPTER: '路由未注册/无适配器',
   RATE_LIMIT: '限流',
   SERVER: '服务端/网络异常',
+  TRANSPORT: '传输中断',
   CONTEXT_WINDOW_EXCEEDED: '上下文超限',
   INVALID_REQUEST: '请求无效',
   UNSUPPORTED_REASONING_EFFORT: '推理档位不支持',
@@ -578,6 +607,11 @@ function classifyProbeFailure(code, message) {
   const detail = String(message ?? '').slice(0, 200)
   if (haystack.includes('timeout') || haystack.includes('timed out') || haystack.includes('aborted')) {
     return { status: 'TIMEOUT', label: '超时/无响应', message: detail.length > 0 ? detail : 'no response in time' }
+  }
+  // 传输层中断与切换判定对齐：宿主未归一化的 "WebSocket closed 1000" 会落到 PI_AI_ERROR，
+  // 这里按文案兜底展示为「传输中断」，避免全量测试把它误报成「未知错误」。
+  if (haystack.includes('websocket closed') || haystack.includes('other side closed')) {
+    return { status: 'TRANSPORT', label: '传输中断', message: detail.length > 0 ? detail : 'connection closed mid-stream' }
   }
   const label = PROBE_STATUS_LABELS[normalized]
   if (label !== undefined) return { status: normalized, label, message: detail }
@@ -1133,7 +1167,7 @@ export function apply(ctx, rawConfig) {
     const key = stepKeyOf(sessionId, turn, step)
     let record = state.steps.get(key)
     if (record === undefined) {
-      record = { attempted: new Set(), target: undefined, switches: 0, needs: { tools: false, images: false }, at: Date.now() }
+      record = { attempted: new Set(), target: undefined, switches: 0, policyRetries: 0, needs: { tools: false, images: false }, at: Date.now() }
       state.steps.set(key, record)
       if (state.steps.size > 128) {
         // 按 lastAccess 淘汰：不得误删活跃 step 的记账（R5 语义）。
@@ -1532,6 +1566,46 @@ export function apply(ctx, rawConfig) {
     const code = typeof failure?.code === 'string' ? failure.code.toUpperCase() : ''
 
     const now = Date.now()
+
+    // ① policy 类失败（policyMode='same'，默认）：保留当前 provider/model，在同一
+    //    (turn, step) 内原地重试。不轮换 key、不切换 provider、不给路由冷却——策略拒绝与
+    //    凭据/额度/过载无关，换 provider 或换 key 都治不了；宿主会重新组装同一请求，
+    //    插件无法在上游改写 prompt（见 README「policy 失败」）。重试次数受
+    //    `maxPolicyRetriesPerStep` 约束，耗尽后保持当前 provider/model 交回宿主。
+    //    该分支独立于 provider 切换的最小间隔与单 turn 上限（那两项只约束 provider 切换）。
+    if (decision.policy === true && (config.policyMode ?? 'same') === 'same') {
+      const used = record.policyRetries ?? 0
+      if (used < config.maxPolicyRetriesPerStep) {
+        record.policyRetries = used + 1
+        pushLog({
+          at: now,
+          kind: 'policy-retry',
+          from: failedRoute,
+          to: failedRoute,
+          tier: 0,
+          code: typeof failure?.code === 'string' ? failure.code : '',
+          trigger: decision.how,
+          attempt: record.policyRetries,
+          turn,
+          step,
+        })
+        console.warn('[dsh-provider-failover] policy retry ' + String(record.policyRetries) + '/' + String(config.maxPolicyRetriesPerStep) + ' on ' + (failedRoute.length > 0 ? failedRoute : '(unknown)') + ' (' + decision.how + ', turn ' + String(turn) + ' step ' + String(step) + ')')
+        return { kind: 'retry' }
+      }
+      pushIgnored({
+        at: now,
+        session: sessionKey === '-' ? '' : sessionKey,
+        provider: failedRoute,
+        category: 'policy',
+        reason: 'policy 同 provider 重试已达上限（maxPolicyRetriesPerStep=' + String(config.maxPolicyRetriesPerStep) + '）；保持当前 provider/model 交回宿主。',
+        code: typeof failure?.code === 'string' ? failure.code : '',
+        message: String(failure?.message ?? '').slice(0, 200),
+        turn,
+        step,
+      })
+      return next()
+    }
+
     if (now - (state.lastSwitchAt.get(sessionKey) ?? 0) < config.minSwitchIntervalMs) return next()
     if (record.switches >= config.maxSwitchesPerTurn) return next()
 
@@ -1795,6 +1869,8 @@ export function apply(ctx, rawConfig) {
       return {
         ok: true,
         enabled: config.enabled,
+        policyMode: config.policyMode,
+        maxPolicyRetriesPerStep: config.maxPolicyRetriesPerStep,
         editable: {
           enabled: config.enabled,
           minSwitchIntervalMs: config.minSwitchIntervalMs,
@@ -1946,7 +2022,7 @@ export function apply(ctx, rawConfig) {
   })
 
   const configured = config.tiers.map((tier) => String(tier.tier) + (tier.enabled ? '' : '(off)') + ':' + tier.entries.map((entry) => entry.id).join(',')).join(' | ')
-  console.log('[dsh-provider-failover] ready: ' + configured + ' | startup.preferTier=' + String(config.startup.preferTier) + ' | ranking=' + config.ranking.mode)
+  console.log('[dsh-provider-failover] ready: ' + configured + ' | startup.preferTier=' + String(config.startup.preferTier) + ' | ranking=' + config.ranking.mode + ' | policyMode=' + config.policyMode)
 }
 
 /** 供诊断/测试使用：暴露默认配置的深拷贝。 */
