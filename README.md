@@ -77,6 +77,8 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
           - { id: fallback, route: my-provider-2, model: my-model-2, cooldownMs: 60000 }
 ```
 
+交互式本机配置：使用 `ptc-route-setup` skill 探测 provider/子代理并询问人工偏好。它将无凭据的候选链写入 `$DSH_HOME/plugins/provider-failover/route-config.json`。插件启动时读取该文件，覆盖 `tiers` 和切换上限/错误类别；现有 `settings.json`、profile patch 和凭据文件保持独立。该本机文件不应提交或同步；首次生成后需重启 DSH。
+
 字段：顶层 `enabled` / `policyMode` / `policyFailover`（兼容旧字段）/ `maxPolicyRetriesPerStep` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
 
 ### 按模型族对齐档位（推荐）

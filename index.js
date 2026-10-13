@@ -232,6 +232,31 @@ function settingsFilePath() {
   return join(home, 'plugins', SETTINGS_NAMESPACE, 'settings.json')
 }
 
+/** Read the credential-free local route layer produced by ptc-route-setup. */
+function localRouteConfigPath() {
+  const home = process.env.DSH_HOME !== undefined && process.env.DSH_HOME.trim() !== ''
+    ? process.env.DSH_HOME
+    : join(homedir(), '.dsh')
+  return join(home, 'plugins', SETTINGS_NAMESPACE, 'route-config.json')
+}
+
+function readLocalRouteConfig() {
+  try {
+    const parsed = JSON.parse(readFileSync(localRouteConfigPath(), 'utf8'))
+    if (!isPlainObject(parsed) || parsed.schemaVersion !== 1) return undefined
+    const provider = isPlainObject(parsed.providerFailover) ? parsed.providerFailover : parsed
+    const policy = isPlainObject(provider.failurePolicy) ? provider.failurePolicy : {}
+    return {
+      ...(Array.isArray(provider.tiers) ? { tiers: provider.tiers } : {}),
+      ...(Array.isArray(policy.switchOn) ? { terminalCodes: policy.switchOn } : {}),
+      ...(Number.isInteger(policy.maxSwitchesPerTurn) ? { maxSwitchesPerTurn: policy.maxSwitchesPerTurn } : {}),
+      ...(policy.switchOn?.includes('POLICY') ? { policyMode: 'switch' } : {}),
+    }
+  } catch {
+    return undefined
+  }
+}
+
 /** 读取设置用户层（容错：缺失/损坏一律回退空对象）。 */
 function readSettingsOverrides(file) {
   try {
@@ -680,7 +705,9 @@ function parseRanking(text, candidates) {
  * @param {Record<string, unknown>} rawConfig 插件条目 config
  */
 export function apply(ctx, rawConfig) {
-  const { value: config, errors } = normalizeConfig(rawConfig)
+  const localConfig = readLocalRouteConfig()
+  const effectiveRawConfig = localConfig === undefined ? rawConfig : { ...rawConfig, ...localConfig }
+  const { value: config, errors } = normalizeConfig(effectiveRawConfig)
   if (errors.length > 0) {
     // 校验失败：零介入，并把原因报到日志，便于诊断。
     ctx.logger?.warn?.('dsh-provider-failover: configuration rejected, staying out of the way:\n  - ' + errors.join('\n  - '))
