@@ -63,12 +63,29 @@ check('startup preferTier 默认 0（关闭启动对齐，保持会话选择）'
 check('terminal codes include SERVER + RATE_LIMIT', defaults.terminalCodes.includes('SERVER') && defaults.terminalCodes.includes('RATE_LIMIT'))
 check('message fallbacks include Codex usage-limit wording', defaults.failurePatterns.includes('usage limit') && defaults.failurePatterns.includes('usage_limit'))
 const switchableShape = (value) => ({ terminalCodes: new Set(value.terminalCodes), failurePatterns: value.failurePatterns })
-check('Codex natural-language usage limit is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'Codex error: The usage limit has been reached').how === 'pattern:usage limit')
-check('Codex snake-case usage limit is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'usage_limit_reached').how === 'pattern:usage_limit')
+// 命中方式说明：消息模式兜底（`pattern:<模式>`）只在生效码折算不出可切换类别时才会走到
+// （例如自定义模式未登记类别）。usage limit / websocket / http2 这些**已登记类别**的模式
+// 会先经 effectiveFailureCode 折算成 QUOTA / TRANSPORT，再按终止码集合命中，故 how 为 `effective:<CODE>`；
+// 保留 `pattern:` 前缀的断言用于验证表外模式这条路径本身没断。
+check('Codex natural-language usage limit is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'Codex error: The usage limit has been reached').how === 'effective:QUOTA')
+check('Codex snake-case usage limit is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'usage_limit_reached').how === 'effective:QUOTA')
 check('default terminal codes include TRANSPORT', defaults.terminalCodes.includes('TRANSPORT'))
 check('message fallbacks include WebSocket-close wording', defaults.failurePatterns.includes('websocket closed'))
-check('WebSocket close with code is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'WebSocket closed 1000').how === 'pattern:websocket closed')
+check('WebSocket close with code is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'WebSocket closed 1000').how === 'effective:TRANSPORT')
 check('normalized TRANSPORT failure is switchable', __test.isSwitchable(switchableShape(defaults), 'TRANSPORT', 'socket hang up').how === 'code:TRANSPORT')
+// 2026-10-15：relay 上游 HTTP/2 流复位（SSE error 事件 → PI_AI_ERROR）。宿主两条规则都不命中，
+// 必须靠插件的 'http2' / 'upstream_' 模式兜底，且归类必须是 TRANSPORT（5 次原地重试 + 观测窗口），
+// 否则既无宿主重试也无插件重试，整轮直接终止。
+const HTTP2_FAILURE = 'Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed'
+check('message fallbacks include upstream http2 wording', defaults.failurePatterns.includes('http2') && defaults.failurePatterns.includes('upstream_'))
+check('upstream http2 stream error is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', HTTP2_FAILURE).how === 'effective:TRANSPORT')
+check('upstream http2 stream error maps to TRANSPORT (not DEFAULT)', __test.patternCodeFor(HTTP2_FAILURE, switchableShape(defaults).failurePatterns) === 'TRANSPORT')
+// 展示与判定必须同源：effectiveFailureCode 是设置页状态与切换/重试共用的那一份折算。
+check('effectiveFailureCode: http2 流错误 → TRANSPORT', __test.effectiveFailureCode('PI_AI_ERROR', HTTP2_FAILURE, switchableShape(defaults).failurePatterns) === 'TRANSPORT')
+check('effectiveFailureCode: 空体 5xx → SERVER', __test.effectiveFailureCode('PI_AI_ERROR', 'codex-relay API error (502): 502 status code (no body)', switchableShape(defaults).failurePatterns) === 'SERVER')
+check('effectiveFailureCode: usage limit → QUOTA', __test.effectiveFailureCode('PI_AI_ERROR', 'The usage limit has been reached', switchableShape(defaults).failurePatterns) === 'QUOTA')
+check('effectiveFailureCode: 认不出来时保留原码', __test.effectiveFailureCode('PI_AI_ERROR', 'connect ETIMEDOUT 10.0.0.5:443', switchableShape(defaults).failurePatterns) === 'PI_AI_ERROR')
+check('effectiveFailureCode: 已归一化码不被消息覆盖', __test.effectiveFailureCode('SERVER', 'The usage limit has been reached', switchableShape(defaults).failurePatterns) === 'SERVER')
 check('prompt policy refusal is handled by default', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'Invalid prompt: your prompt was flagged as potentially violating our usage policy').how === 'policy:prompt')
 check('prompt policy refusal can remain terminal explicitly', __test.isSwitchable({ ...switchableShape(defaults), policyFailover: false }, 'PI_AI_ERROR', 'Invalid prompt: your prompt was flagged as potentially violating our usage policy').category === 'policy')
 check('policyFailover:true keeps the legacy switch semantics', __test.isSwitchable({ ...switchableShape(defaults), policyFailover: true }, 'PI_AI_ERROR', 'flagged as potentially violating our usage policy').hit === true)
@@ -85,6 +102,20 @@ check('rejects entry without route', missingRoute.errors.some((error) => error.i
 
 const badCooldown = normalize({ tiers: [{ tier: 1, entries: [{ id: 'a', route: 'r', model: 'm', cooldownMs: 0 }] }] })
 check('rejects non-positive cooldownMs', badCooldown.errors.some((error) => error.includes('cooldownMs')))
+
+console.log('cooldownByCode:')
+const withCooldown = normalize({ cooldownByCode: { quota: 18000000, TRANSPORT: 5000 }, tiers: [{ tier: 1, enabled: true, entries: [{ id: 'a', route: 'r', model: 'm' }] }] })
+check('cooldownByCode keys normalize to uppercase', withCooldown.errors.length === 0 && withCooldown.value.cooldownByCode.QUOTA === 18000000 && withCooldown.value.cooldownByCode.TRANSPORT === 5000, JSON.stringify(withCooldown.errors))
+check('cooldownByCode defaults to an empty map', Object.keys(normalize({}).value.cooldownByCode).length === 0)
+const badCooldownMap = normalize({ cooldownByCode: { QUOTA: -1 } })
+check('rejects non-positive cooldownByCode value', badCooldownMap.errors.some((error) => error.includes('cooldownByCode')))
+const badCooldownShape = normalize({ cooldownByCode: [1] })
+check('rejects non-object cooldownByCode', badCooldownShape.errors.some((error) => error.includes('cooldownByCode')))
+check('QUOTA code gets the category override', __test.cooldownMsFor({ QUOTA: 18000000 }, 60000, 'QUOTA', 'code:QUOTA') === 18000000)
+check('usage-limit wording classifies as QUOTA for cooldown', __test.cooldownMsFor({ QUOTA: 18000000 }, 60000, 'PI_AI_ERROR', 'pattern:usage limit') === 18000000)
+check('websocket-close wording classifies as TRANSPORT for cooldown', __test.cooldownMsFor({ QUOTA: 18000000, TRANSPORT: 3000 }, 60000, 'PI_AI_ERROR', 'pattern:websocket closed') === 3000)
+check('unmapped code falls back to entry cooldownMs', __test.cooldownMsFor({ QUOTA: 18000000 }, 120000, 'SERVER', 'code:SERVER') === 120000)
+check('no entry cooldownMs falls back to the 60s default', __test.cooldownMsFor({}, undefined, 'SERVER', 'code:SERVER') === 60000)
 
 const dupId = normalize({ tiers: [{ tier: 1, entries: [{ id: 'x', route: 'r1', model: 'm' }, { id: 'x', route: 'r2', model: 'm' }] }] })
 check('rejects duplicate entry id', dupId.errors.some((error) => error.includes('duplicate entry id')))
@@ -268,10 +299,13 @@ const env9 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, re
 Object.assign(env9, isolatedApply(env9.ctx, { tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm' }] }] }, { keysByEntry: { ais: ['K1', 'K9'] } }))
 const res9 = await statusOf(env9)
 check('设置层 keys 覆盖 patch keys', res9.body.tiers[0].entries[0].keys.length === 2 && res9.body.tiers[0].entries[0].keysSource === 'settings', JSON.stringify(res9.body.tiers[0].entries[0]))
-check('patch 无 keys 时默认不排程、有覆盖时按需排程', env9.disposers.length === 6, String(env9.disposers.length))
+// 排程断言按「路由条数 + 排程次数」推导，不再写死数字：插件新增/删除路由时
+// 这些断言仍然表达同一件事（几条路由就有几个 effect，另有每个每日重置排程一个）。
+const routeCountOf = (env) => Object.keys(env.routes).length
+check('patch 无 keys 时默认不排程、有覆盖时按需排程', env9.disposers.length === routeCountOf(env9) + 1, String(env9.disposers.length) + ' vs routes ' + String(routeCountOf(env9)))
 const noKeys = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true } } })
 Object.assign(noKeys, isolatedApply(noKeys.ctx, { tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm' }] }] }))
-check('无任何 key 引用时不排程每日重置', noKeys.disposers.length === 5, String(noKeys.disposers.length))
+check('无任何 key 引用时不排程每日重置', noKeys.disposers.length === routeCountOf(noKeys), String(noKeys.disposers.length) + ' vs routes ' + String(routeCountOf(noKeys)))
 
 // b) 轮换使用设置层 keys
 const rotated9 = await env9.handlers['agent/request-error'](failure, async () => 'NEXT')
@@ -440,7 +474,10 @@ check('记录 ignored 决策并标注 configuration', status22.body.ignored?.som
 const env23 = makeSwitchEnv(undefined, { startup: { preferTier: 1 }, tiers: IGNORE_TIERS })
 await env23.handlers['agent/request-error']({ failure: { code: 'QUOTA', message: 'quota exceeded' }, provider: 'r1', turn: 1, step: 1 }, async () => 'NEXT')
 const status23 = await statusOf(env23)
-check('可切换失败不写 ignored', (status23.body.ignored?.length ?? 0) === 0, JSON.stringify(status23.body.ignored))
+// 口径：可切换失败不写「为什么没切」类的 ignored（other/configuration）。
+// no-candidate 是另一件事——失败可切换但档位表里确实没有可用候选，必须留痕，
+// 否则证据里分不清「没触发」和「触发了但没得切」。
+check('可切换失败不写 other/configuration 类 ignored', (status23.body.ignored?.filter((item) => item.category === 'other' || item.category === 'configuration').length ?? 0) === 0, JSON.stringify(status23.body.ignored))
 
 // Codex OAuth 的额度耗尽文案可能被宿主归成 PI_AI_ERROR；消息兜底必须实际触发
 // provider 切换和同一步 retry，而不只是纯函数命中。
@@ -528,11 +565,75 @@ check('classifyProbeFailure 超时兜底', __test.classifyProbeFailure(undefined
 check('classifyProbeFailure 归一化传输中断', __test.classifyProbeFailure('TRANSPORT', 'socket hang up').label === '传输中断')
 check('classifyProbeFailure WebSocket close 兜底', __test.classifyProbeFailure('PI_AI_ERROR', 'WebSocket closed 1000').status === 'TRANSPORT')
 check('classifyProbeFailure 未知编码', __test.classifyProbeFailure(undefined, 'weird thing').label === '未知错误')
+// 2026-10-15：编码未归一化时不再一律「未知错误」——与切换判定共用同一套 failurePatterns 兜底。
+const clsCodexLimit = __test.classifyProbeFailure('PI_AI_ERROR', 'Codex error: The usage limit has been reached')
+check('classifyProbeFailure 未归一化 usage limit 归额度不足', clsCodexLimit.status === 'QUOTA' && clsCodexLimit.label === '额度不足', JSON.stringify(clsCodexLimit))
+const clsRelay502 = __test.classifyProbeFailure('PI_AI_ERROR', 'codex-relay API error (502): 502 status code (no body)')
+check('classifyProbeFailure 原生 502 展示服务端异常而非未知错误', clsRelay502.status === 'SERVER' && clsRelay502.label === '服务端/网络异常', JSON.stringify(clsRelay502))
+const clsEtimedout = __test.classifyProbeFailure('PI_AI_ERROR', 'connect ETIMEDOUT 10.0.0.5:443')
+check('classifyProbeFailure 不把端口/字节当状态码', clsEtimedout.status === 'PI_AI_ERROR' && clsEtimedout.label === '未知错误', JSON.stringify(clsEtimedout))
+const clsWsError = __test.classifyProbeFailure('PI_AI_ERROR', 'WebSocket error')
+check('classifyProbeFailure 裸 WebSocket error 归传输中断', clsWsError.status === 'TRANSPORT' && clsWsError.label === '传输中断', JSON.stringify(clsWsError))
+// 2026-10-15：relay 上游 HTTP/2 流复位以 SSE error 事件下发，文案两条宿主规则都不命中 → PI_AI_ERROR，
+// 必须靠 'http2' / 'upstream_' 模式兜底成 TRANSPORT，否则宿主默认重试码表不含 PI_AI_ERROR，整轮终止。
+const clsHttp2 = __test.classifyProbeFailure('PI_AI_ERROR', 'Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed')
+check('classifyProbeFailure 上游 http2 流错误归传输中断', clsHttp2.status === 'TRANSPORT' && clsHttp2.label === '传输中断', JSON.stringify(clsHttp2))
+check('classifyProbeFailure 网关 upstream_* 前缀码归传输中断', __test.classifyProbeFailure('PI_AI_ERROR', 'Error Code upstream_connection_reset: connection reset by peer').status === 'TRANSPORT')
+const clsCustom = __test.classifyProbeFailure('PI_AI_ERROR', 'custom vendor blocked code', ['custom vendor blocked'])
+check('classifyProbeFailure 自定义模式保守落回未知错误（不臆造状态标签）', clsCustom.label === '未知错误', JSON.stringify(clsCustom))
+
+// 2026-10-16：AUTH 类失败必须区分具体原因。实测 tokeniss 对 claude-opus-5-5 返回
+//   403 {"error":{"type":"new_api_error","message":"预扣费额度失败, 用户剩余额度: ¥1.040956,
+//        需要预扣费额度: ¥1.192114 (request id: ...)"}}  且 code:"AUTH"
+// 提示里只写「AUTH」，真因却是余额不足；同一时期 anthropic-relay 的 403
+// 「该令牌无权访问模型 claude-opus-5-5」也是 AUTH，但真因是模型未授权——两者处置完全不同。
+console.log('失败原因细分（AUTH 类提示）:')
+const REAL_QUOTA_AUTH = '403 {"error":{"type":"new_api_error","message":"预扣费额度失败, 用户剩余额度: ¥1.040956, 需要预扣费额度: ¥1.192114 (request id: 202610160612230175964348268d9d64PFYJzb0)"},"type":"error"}'
+const REAL_PERM_AUTH = '403 {"error":{"message":"该令牌无权访问模型 claude-opus-5-5"}}'
+const reasonQuota = __test.failureReasonFor('AUTH', REAL_QUOTA_AUTH)
+check('AUTH + 预扣费额度失败 → 额度/余额不足（而非“凭据无效”）', reasonQuota.id === 'QUOTA_EXHAUSTED' && reasonQuota.label === '额度/余额不足', JSON.stringify(reasonQuota))
+const reasonPerm = __test.failureReasonFor('AUTH', REAL_PERM_AUTH)
+check('AUTH + 该令牌无权访问模型 → 权限不足：该令牌无权使用该模型', reasonPerm.id === 'MODEL_NOT_AUTHORIZED', JSON.stringify(reasonPerm))
+// 同一个 AUTH 码下两种真因必须给出不同结论——这是本次修复的核心断言。
+check('同一 AUTH 码下「余额不足」与「模型未授权」不再同形', reasonQuota.id !== reasonPerm.id)
+check('AUTH + invalid api key → 凭据无效', __test.failureReasonFor('AUTH', 'invalid api key provided').id === 'CREDENTIAL_INVALID')
+check('AUTH + 认不出的原文 → 如实说“未细分”，不替用户下结论', __test.failureReasonFor('AUTH', 'weird upstream thing').id === 'AUTH')
+check('QUOTA 码无原文时仍按码给出额度标签', __test.failureReasonFor('QUOTA', '').label === '额度/余额不足')
+check('英文额度文案同样细分（不只认中文）', __test.failureReasonFor('AUTH', 'insufficient_quota: your account has run out').id === 'QUOTA_EXHAUSTED')
+// 兜底顺序：更具体的词必须先于通用词命中（'余额不足' vs 泛化的 'balance'）。
+check('细分表取首个命中，具体词优先于通用词', __test.failureReasonFor('AUTH', '额度不足').id === 'QUOTA_EXHAUSTED')
+// 配置只能往内置表**追加**词条，不能整体替换掉中英文默认判定。
+const mergedReasons = __test.mergeFailureReasons({ QUOTA_EXHAUSTED: ['自定义欠费文案'] }, [])
+check('failureReasons 追加词条后仍保留内置中文判定', __test.failureReasonFor('AUTH', REAL_QUOTA_AUTH, mergedReasons).id === 'QUOTA_EXHAUSTED')
+check('failureReasons 追加的自定义词条生效', __test.failureReasonFor('AUTH', '自定义欠费文案', mergedReasons).id === 'QUOTA_EXHAUSTED')
+const mergeErrors = []
+__test.mergeFailureReasons({ NO_SUCH_REASON: ['x'] }, mergeErrors)
+check('failureReasons 未知 id 记配置错误（拼错的键不会静默失效）', mergeErrors.length === 1, JSON.stringify(mergeErrors))
+const mergeErrors2 = []
+__test.mergeFailureReasons({ QUOTA_EXHAUSTED: [] }, mergeErrors2)
+check('failureReasons 空数组记配置错误', mergeErrors2.length === 1, JSON.stringify(mergeErrors2))
+// 归一化后的配置必须带上生效的 failureReasons（判定与展示同源）。
+const normalizedReasons = normalize({ failureReasons: { QUOTA_EXHAUSTED: ['欠费停机'] } })
+check('normalize 结果携带生效 failureReasons', Array.isArray(normalizedReasons.value.failureReasons) && normalizedReasons.value.failureReasons.length === __test.DEFAULT_FAILURE_REASONS.length)
+check('normalize 把自定义词条并入生效表', __test.failureReasonFor('AUTH', '欠费停机', normalizedReasons.value.failureReasons).id === 'QUOTA_EXHAUSTED')
+check('normalize 对未知 reason id 报错', normalize({ failureReasons: { NOPE: ['x'] } }).errors.some((line) => line.indexOf('failureReasons.NOPE') >= 0))
+
+// 全量测试（/failover-probe）的展示同样不能把 AUTH 一律写成「凭据无效」。
+// 注意：只细化 AUTH 族的 label，status 与 QUOTA 等既有标签保持不变。
+const probeReasonTable = __test.DEFAULT_FAILURE_REASONS
+const clsAuthQuota = __test.classifyProbeFailure('AUTH', REAL_QUOTA_AUTH, undefined, probeReasonTable)
+check('全量测试：AUTH + 余额不足展示为额度/余额不足（status 仍为 AUTH）', clsAuthQuota.status === 'AUTH' && clsAuthQuota.label === '额度/余额不足', JSON.stringify(clsAuthQuota))
+const clsAuthPerm = __test.classifyProbeFailure('AUTH', REAL_PERM_AUTH, undefined, probeReasonTable)
+check('全量测试：AUTH + 无权访问模型展示为权限不足', clsAuthPerm.label === '权限不足：该令牌无权使用该模型', JSON.stringify(clsAuthPerm))
+check('全量测试：AUTH + 认不出的原文仍保守显示凭据无效', __test.classifyProbeFailure('AUTH', 'weird upstream thing', undefined, probeReasonTable).label === '凭据无效')
+check('全量测试：不传原因表时行为完全不变（向后兼容）', __test.classifyProbeFailure('AUTH', REAL_QUOTA_AUTH).label === '凭据无效')
+check('全量测试：QUOTA 既有标签不受影响', __test.classifyProbeFailure('QUOTA', 'quota exceeded', undefined, probeReasonTable).label === '额度不足')
 
 const PROBE_TIERS = [
   { tier: 1, enabled: true, entries: [
     { id: 'good', route: 'r-good', model: 'm-good', enabled: true },
     { id: 'bad', route: 'r-bad', model: 'm-bad', enabled: true },
+    { id: 'relay', route: 'r-relay', model: 'm-relay', enabled: true },
     { id: 'off', route: 'r-off', model: 'm-off', enabled: false },
   ] },
   { tier: 2, enabled: false, entries: [{ id: 'offtier', route: 'r-x', model: 'm-x', enabled: true }] },
@@ -544,6 +645,9 @@ const streamStub = (request) => {
     if (request.provider === 'r-good') {
       yield { type: 'text-delta', text: 'ok' }
       yield { type: 'finish', reason: { kind: 'completed' } }
+    } else if (request.provider === 'r-relay') {
+      // 本机 codex-relay 实测：流式请求稳定回 502 且响应体为空。
+      yield { type: 'finish', reason: { kind: 'error', failure: { code: 'PI_AI_ERROR', message: 'codex-relay API error (502): 502 status code (no body)' } } }
     } else {
       yield { type: 'finish', reason: { kind: 'error', failure: { code: 'QUOTA', message: 'insufficient balance' } } }
     }
@@ -557,12 +661,13 @@ const postProbe = async (env, body) => {
 }
 const env24 = makeSwitchEnv(undefined, { tiers: PROBE_TIERS }, undefined, streamStub)
 const probeRes24 = await postProbe(env24, {})
-check('全量测试只覆盖启用档位的启用条目', probeRes24.body.results.length === 2 && probeRes24.body.results.every((item) => item.id !== 'off' && item.id !== 'offtier'), JSON.stringify(probeRes24.body.results.map((item) => item.id)))
+check('全量测试只覆盖启用档位的启用条目', probeRes24.body.results.length === 3 && probeRes24.body.results.every((item) => item.id !== 'off' && item.id !== 'offtier'), JSON.stringify(probeRes24.body.results.map((item) => item.id)))
 check('正常目标回报 OK + 回复', probeRes24.body.results.find((item) => item.id === 'good')?.status === 'OK' && probeRes24.body.results.find((item) => item.id === 'good')?.reply === 'ok', JSON.stringify(probeRes24.body.results.find((item) => item.id === 'good')))
 check('额度不足目标回报 QUOTA', probeRes24.body.results.find((item) => item.id === 'bad')?.status === 'QUOTA' && probeRes24.body.results.find((item) => item.id === 'bad')?.label === '额度不足', JSON.stringify(probeRes24.body.results.find((item) => item.id === 'bad')))
-check('全量测试汇总', probeRes24.body.summary.total === 2 && probeRes24.body.summary.ok === 1 && probeRes24.body.summary.failed === 1, JSON.stringify(probeRes24.body.summary))
+check('空体 502 目标回报 SERVER/服务端网络异常（不再是未知错误）', probeRes24.body.results.find((item) => item.id === 'relay')?.status === 'SERVER' && probeRes24.body.results.find((item) => item.id === 'relay')?.label === '服务端/网络异常', JSON.stringify(probeRes24.body.results.find((item) => item.id === 'relay')))
+check('全量测试汇总', probeRes24.body.summary.total === 3 && probeRes24.body.summary.ok === 1 && probeRes24.body.summary.failed === 2, JSON.stringify(probeRes24.body.summary))
 const status24 = await statusOf(env24)
-check('status 暴露 lastProbe 与 probeTimeoutMs', status24.body.lastProbe?.results?.length === 2 && typeof status24.body.probeTimeoutMs === 'number', JSON.stringify(status24.body.lastProbe?.summary))
+check('status 暴露 lastProbe 与 probeTimeoutMs', status24.body.lastProbe?.results?.length === 3 && typeof status24.body.probeTimeoutMs === 'number', JSON.stringify(status24.body.lastProbe?.summary))
 const single24 = await postProbe(env24, { entry: 'bad' })
 check('单条目过滤', single24.body.results.length === 1 && single24.body.results[0].id === 'bad', JSON.stringify(single24.body.results.map((item) => item.id)))
 check('未知条目报错', (await postProbe(env24, { entry: 'nope' })).status === 400)
@@ -571,7 +676,7 @@ const explicit24 = await postProbe(env24, { entry: 'good', sessionId: 'sess-expl
 check('显式 sessionId 透传到探测请求与报告', explicit24.body.sessionId === 'sess-explicit' && probeSeen.at(-1).sessionId === 'sess-explicit', String(probeSeen.at(-1).sessionId))
 const probeCmd = env24.registered.find((def) => def.name === 'failover-probe')
 const cmdProbe = await probeCmd.handler({ rawInput: '', agent: { session: { id: 'x' } } })
-check('指令 /failover-probe 返回汇总文本', cmdProbe.kind === 'success' && cmdProbe.text.includes('1/2'), String(cmdProbe.text))
+check('指令 /failover-probe 返回汇总文本', cmdProbe.kind === 'success' && cmdProbe.text.includes('1/3'), String(cmdProbe.text))
 for (const dispose of env24.disposers) dispose()
 
 // 2026-10-02：跨会话状态隔离——steps 与 pendingNeeds 按 sessionId 分键。
@@ -604,6 +709,40 @@ for (const dispose of envNeeds.disposers) dispose()
 
 // 设置页需渲染 Host 的 ignored 诊断（client.js 静态检查）。
 check('client.js 渲染「最近未切换原因」（status.ignored）', readFileSync(new URL('../client.js', import.meta.url), 'utf8').includes('status.ignored'))
+
+// 2026-10-16 端到端：真实 tokeniss 403/AUTH 报文经 agent/request-error 后，
+// 通知（/provider-failover/notices 的取数源）必须带出「额度/余额不足」而非只写 AUTH。
+console.log('端到端：AUTH 类失败在通知里区分具体原因:')
+const readNotices = async (env, sessionId) => {
+  const req = { method: 'GET', url: '/provider-failover/notices?sessionId=' + encodeURIComponent(sessionId) + '&limit=20', socket: { remoteAddress: '127.0.0.1' } }
+  const res = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
+  await env.routes['/provider-failover/notices'](req, res)
+  return res.body?.notices ?? []
+}
+const REASON_TIERS = [{ tier: 1, enabled: true, entries: [
+  { id: 'a', route: 'r-tokeniss', model: 'claude-opus-5-5', enabled: true },
+  { id: 'b', route: 'r-codex', model: 'gpt-5.6-sol', enabled: true },
+] }]
+const reasonSession = { session: { id: 'sess-reason', requestHeader: () => undefined } }
+const envReason = makeSwitchEnv(undefined, { startup: { preferTier: 1 }, tiers: REASON_TIERS, failureReasons: { QUOTA_EXHAUSTED: ['试用额度已耗尽'] } })
+await envReason.handlers['agent/request-error']({ agent: reasonSession, provider: 'r-tokeniss', turn: 1, step: 1, failure: { code: 'AUTH', message: REAL_QUOTA_AUTH } }, async () => 'NEXT')
+const quotaNotice = (await readNotices(envReason, 'sess-reason')).find((n) => n.kind === 'failover' && n.code === 'AUTH') ?? {}
+check('切换通知带 reasonId/reasonLabel（不再只说 AUTH）', quotaNotice.reasonId === 'QUOTA_EXHAUSTED' && quotaNotice.reasonLabel === '额度/余额不足', JSON.stringify(quotaNotice))
+check('切换通知带脱敏后的上游原文摘要', typeof quotaNotice.detail === 'string' && quotaNotice.detail.includes('剩余额度'), JSON.stringify(quotaNotice.detail))
+check('原因细分不影响切换行为（仍然切到下一档）', quotaNotice.toRoute === 'r-codex' && quotaNotice.toModel === 'gpt-5.6-sol', JSON.stringify({ to: quotaNotice.toRoute, model: quotaNotice.toModel }))
+// 同一 AUTH 码 + 模型未授权文案 → 不同的展示结论（这是本次修复的核心）。
+const envPerm = makeSwitchEnv(undefined, { startup: { preferTier: 1 }, tiers: REASON_TIERS })
+await envPerm.handlers['agent/request-error']({ agent: { session: { id: 'sess-perm', requestHeader: () => undefined } }, provider: 'r-tokeniss', turn: 1, step: 1, failure: { code: 'AUTH', message: REAL_PERM_AUTH } }, async () => 'NEXT')
+const permNotice = (await readNotices(envPerm, 'sess-perm')).find((n) => n.kind === 'failover') ?? {}
+check('同一 AUTH 码下模型未授权走不同的原因标签', permNotice.reasonId === 'MODEL_NOT_AUTHORIZED' && permNotice.reasonLabel !== quotaNotice.reasonLabel, JSON.stringify(permNotice))
+// 密钥形状的片段绝不能进通知（detail 走 sanitizeForRanking）。
+const envSecret = makeSwitchEnv(undefined, { startup: { preferTier: 1 }, tiers: REASON_TIERS })
+await envSecret.handlers['agent/request-error']({ agent: { session: { id: 'sess-secret', requestHeader: () => undefined } }, provider: 'r-tokeniss', turn: 1, step: 1, failure: { code: 'AUTH', message: 'Authorization failed for api_key sk-abcdefghijklmnopqrstuvwxyz012345' } }, async () => 'NEXT')
+const secretNotice = (await readNotices(envSecret, 'sess-secret')).find((n) => n.kind === 'failover') ?? {}
+check('通知里的密钥形状片段被脱敏', typeof secretNotice.detail === 'string' && secretNotice.detail.includes('[redacted]') && secretNotice.detail.includes('sk-abcdefghij') !== true, JSON.stringify(secretNotice.detail))
+for (const dispose of envReason.disposers) dispose()
+for (const dispose of envPerm.disposers) dispose()
+for (const dispose of envSecret.disposers) dispose()
 
 check('真实设置文件未被探针触碰', existsSync(realSettingsFile) === realFileExisted, realSettingsFile)
 cleanupHomes()

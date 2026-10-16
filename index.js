@@ -27,7 +27,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -158,7 +158,143 @@ const DEFAULT_FAILURE_PATTERNS = [
   // "WebSocket closed unexpectedly" 归一化为 TRANSPORT，像 "WebSocket closed 1000"
   // 这类仅带关闭码的文案会落到通用 PI_AI_ERROR，必须靠消息模式兜底才能触发切换。
   'websocket closed',
+  // pi-ai 的原生 WebSocket 失败文案就是裸的 "WebSocket error"（实测见
+  // .ptc-probe/failover-switch-incident.json 的 ignored 记录）。没有这一条，
+  // 这类失败既不会重试也不会切换，直接交回宿主。
+  'websocket error',
+  'websocket',
+  // 上游流错误（实测 2026-10-15，见 docs/ptc/reports/codex-relay-http2-stream-error-20261015.md）：
+  // codex-relay 的上游 chatgpt.com Codex 后端 HTTP/2 流被对端复位，relay 以 SSE error 事件下发
+  // `{"type":"error","code":"upstream_http2_stream_error","message":"Upstream HTTP/2 stream failed"}`，
+  // pi-ai 拼成 `Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed` 抛出。
+  // 该文案两条都不命中宿主 classifyPiAiError（既无 5xx 数字也无 network/socket/connection 词），
+  // 于是落成 PI_AI_ERROR；宿主默认重试码表又不含 PI_AI_ERROR → 整轮终止、无自动恢复。
+  // 这两条按 TRANSPORT 归类（连接层中断，与能否换 key 无关）：
+  //   'http2'    —— HTTP/2 流/请求失败的各种文案；
+  //   'upstream_'—— 网关/relay 转发层的前缀式错误码（upstream_*）。
+  // 刻意不加宽泛的 'stream failed'：应用语义的 "stream failed to produce output" 会被误伤。
+  'http2',
+  'upstream_',
 ]
+
+/**
+ * 失败**原因**细分表（有序，自上而下首次命中）。
+ *
+ * 存在的理由：归一化码的粒度不够。宿主把上游 403 一律归一化成 `AUTH`，于是
+ * 「余额不足，该去充值」与「该令牌无权访问这个模型，该换来源/换模型」这两件处置完全不同的事，
+ * 在提示里长得一模一样。实测 2026-10-16：tokeniss 返回
+ * `403 {"message":"预扣费额度失败, 用户剩余额度: ¥1.040956, 需要预扣费额度: ¥1.192114"}`
+ * 且 `code: "AUTH"` —— 提示写「AUTH」，真因却是余额不足；同一时期 anthropic-relay 对
+ * `claude-opus-5-5` 返回的 403「该令牌无权访问模型」也是 `AUTH`，但真因是模型未授权。
+ *
+ * 本表**只影响提示文案**：不参与 isSwitchable / retryPolicies / 冷却时长 / key 轮换的任何判定，
+ * 因此增删词条永远不会改变切换与重试行为。匹配对象是**原始报文 + 归一化码**：与
+ * effectiveFailureCode 不同，这里在码已归一化时**不短路**——短路正是 AUTH 提示丢失原文的原因。
+ */
+const DEFAULT_FAILURE_REASONS = [
+  {
+    id: 'QUOTA_EXHAUSTED',
+    label: '额度/余额不足',
+    // 中文厂商文案（实测 tokeniss「预扣费额度失败 / 用户剩余额度」）与常见英文额度报错。
+    patterns: ['预扣费额度失败', '剩余额度', '余额不足', '额度不足', '额度已用尽', '欠费', 'insufficient balance', 'insufficient_quota', 'insufficient funds', 'quota exceeded', 'usage limit', 'usage_limit', 'balance', 'out of credits', 'no credits'],
+  },
+  {
+    id: 'MODEL_NOT_AUTHORIZED',
+    label: '权限不足：该令牌无权使用该模型',
+    // 实测 anthropic-relay 对 claude-opus-5-5 返回 403「该令牌无权访问模型 claude-opus-5-5」。
+    // 与「凭据无效」的区别很关键：凭据本身有效，只是这一把 token 没有该模型/该来源的授权，
+    // 处置是换来源或换档，而不是换 key 或重新登录。
+    patterns: ['无权访问模型', '无权使用', '无权限', '未授权', 'not authorized', 'unauthorized', 'permission', 'forbidden', 'not allowed to access'],
+  },
+  {
+    id: 'CREDENTIAL_INVALID',
+    label: '凭据无效',
+    patterns: ['invalid api key', 'invalid_api_key', 'incorrect api key', 'invalid token', 'invalid credential', 'authentication failed', 'api key not valid'],
+  },
+  {
+    id: 'CREDENTIAL_MISSING',
+    label: '凭据缺失',
+    patterns: ['missing api key', 'no api key', 'api key is required', 'credential not found'],
+  },
+  {
+    id: 'RATE_LIMITED',
+    label: '被限流',
+    patterns: ['rate limit', 'too many requests'],
+  },
+]
+
+/**
+ * 原文都认不出来时，退回**按归一化码**给一个原因标签。
+ * `AUTH` 刻意不再写「凭据无效」——那一句正是本次要修的误导：403 里既有余额不足也有模型未授权，
+ * 拿不准时如实说「未细分」，而不是替用户下结论。
+ */
+const CODE_REASON_LABELS = {
+  QUOTA: '额度/余额不足',
+  AUTH: '授权被拒（未细分到具体原因）',
+  INVALID_CREDENTIAL: '凭据无效',
+  MISSING_CREDENTIAL: '凭据缺失',
+  NO_ADAPTER: '路由未注册/无适配器',
+  RATE_LIMIT: '被限流',
+  SERVER: '服务端异常',
+  TRANSPORT: '传输中断',
+  CONTEXT_WINDOW_EXCEEDED: '上下文超限',
+  INVALID_REQUEST: '请求无效',
+  UNSUPPORTED_REASONING_EFFORT: '推理档位不支持',
+}
+
+/** 通知里保留的上游原文长度（脱敏后截断）。 */
+const FAILURE_DETAIL_LIMIT = 200
+
+/**
+ * 一次失败的**原因**（纯函数）：先按 DEFAULT_FAILURE_REASONS 的顺序匹配原始报文与归一化码，
+ * 全部未命中才退回 CODE_REASON_LABELS 的按码标签。返回值只用于展示：
+ * `{ id, label, matched }`，`matched` 是命中的那个词（留作证据）。
+ */
+function failureReasonFor(code, message, table) {
+  const entries = Array.isArray(table) && table.length > 0 ? table : DEFAULT_FAILURE_REASONS
+  const haystack = (String(message ?? '') + ' ' + String(code ?? '')).toLowerCase()
+  for (const entry of entries) {
+    for (const pattern of entry.patterns) {
+      const needle = String(pattern).toLowerCase()
+      if (needle.length > 0 && haystack.indexOf(needle) >= 0) return { id: entry.id, label: entry.label, matched: String(pattern) }
+    }
+  }
+  const normalized = typeof code === 'string' ? code.toUpperCase() : ''
+  const label = CODE_REASON_LABELS[normalized]
+  if (label === undefined) return { id: 'UNKNOWN', label: '原因未知', matched: undefined }
+  return { id: normalized, label: label, matched: undefined }
+}
+
+/**
+ * 合并配置里的 `failureReasons`（原因 id → 追加词条）与内置表，返回生效的有序表。
+ * 只做**追加**不做替换，避免一份设备配置把内置的中英文词条整体挤掉；
+ * 未知 id 与空数组都记配置错误（否则拼错的键会静默什么都不做）。
+ */
+function mergeFailureReasons(raw, errors) {
+  const table = DEFAULT_FAILURE_REASONS.map((entry) => ({ id: entry.id, label: entry.label, patterns: [...entry.patterns] }))
+  if (raw === undefined || raw === null) return table
+  if (!isPlainObject(raw)) {
+    errors.push('failureReasons must be an object mapping reason id -> extra patterns (string[])')
+    return table
+  }
+  for (const key of Object.keys(raw)) {
+    const target = table.find((entry) => entry.id === String(key).toUpperCase())
+    if (target === undefined) {
+      errors.push('failureReasons.' + key + ' is not a known reason id (known: ' + table.map((entry) => entry.id).join(', ') + ')')
+      continue
+    }
+    const extra = strings(raw[key])
+    if (extra.length === 0) {
+      errors.push('failureReasons.' + key + ' must be a non-empty array of strings')
+      continue
+    }
+    for (const pattern of extra) {
+      const text = pattern.toLowerCase()
+      if (target.patterns.indexOf(text) < 0) target.patterns.push(text)
+    }
+  }
+  return table
+}
 
 /**
  * 示例默认表：全新安装时**零介入**——示例档默认禁用，且路由不指向任何真实服务。
@@ -194,10 +330,42 @@ const DEFAULT_CONFIG = {
   policyFailover: true,
   // 单 (turn, step) 内 policy 同 provider 重试次数上限。
   maxPolicyRetriesPerStep: 2,
+  /**
+   * 按失败类别的重试策略（切换 provider 之前的原地重试）。
+   *
+   * 语义按类别分开，而不是所有错误一律“立刻切换”：
+   *   TRANSPORT   连接/流中断（WebSocket error、socket hang up…）——等 delayMs 重试，
+   *               attempts 次或预算用尽才切换；observationWindowMs 内（连接活过该窗口
+   *               才失败）按“意外中断”处理，活过窗口外则视为路由已不可用，直接切换。
+   *   RATE_LIMIT  服务端限流——按 retryAfterMs 退避重试，预算用尽再切换。
+   *   SERVER      上游 5xx——短暂重试后仍失败则切换。
+   *   QUOTA / AUTH / INVALID_CREDENTIAL / MISSING_CREDENTIAL / NO_ADAPTER
+   *               额度与凭据类，重试无意义——立即切换（attempts=0）。
+   */
+  retryPolicies: {
+    TRANSPORT: { attempts: 5, delayMs: 5000, budgetMs: 30000, observationWindowMs: 30000 },
+    RATE_LIMIT: { attempts: 3, delayMs: 15000, budgetMs: 60000 },
+    SERVER: { attempts: 2, delayMs: 3000, budgetMs: 15000 },
+    QUOTA: { attempts: 0 },
+    AUTH: { attempts: 0 },
+    INVALID_CREDENTIAL: { attempts: 0 },
+    MISSING_CREDENTIAL: { attempts: 0 },
+    NO_ADAPTER: { attempts: 0 },
+    DEFAULT: { attempts: 1, delayMs: 2000, budgetMs: 10000 },
+  },
   terminalCodes: DEFAULT_TERMINAL_CODES,
   failurePatterns: DEFAULT_FAILURE_PATTERNS,
+  // 失败原因细分（只影响提示文案，不参与任何切换/重试判定）。
+  // 同一个 `AUTH` 下「余额不足」与「该令牌无权访问模型」的处置完全不同，而归一化码区分不了；
+  // 实测见 DEFAULT_FAILURE_REASONS 的注释。配置层只能用 failureReasons 往内置表里**追加**词条。
+  failureReasons: DEFAULT_FAILURE_REASONS,
   minSwitchIntervalMs: 1000,
   maxSwitchesPerTurn: 6,
+  // 按失败类别的冷却覆盖：{ QUOTA: 18000000 } 表示额度耗尽的路由冷却 5 小时。
+  // 键为归一化错误码（大写）；消息模式兜底命中的失败按其模式归类（usage limit /
+  // quota / balance 归 QUOTA，websocket closed 归 TRANSPORT 等）。未命中退回条目
+  // cooldownMs（默认 60s）。额度耗尽恢复以小时计，默认 60s 会让死路由被反复捡回。
+  cooldownByCode: {},
   probeTarget: true,
   // key 状态每日重置时刻（本地时间）：清空失效标记并把默认 key 写回。
   keyResetAt: '06:00',
@@ -214,6 +382,15 @@ const DEFAULT_CONFIG = {
     models: [],
     provider: '',
     model: '',
+    /**
+     * 同族互备优先（默认关闭，保持 v3.4.0 的「从第 1 档向上扫」语义）。
+     *
+     * 打开后：失败路由能在档位表里定位时，先只在它**所落的那一档**内选候选，
+     * 该档内确实选不到（全部已尝试/冷却中/能力不兼容/不可解析）才退回全档扫描。
+     * 例：opencode-go 失败先切同档的 ais-2dsglm（同为 deepseek-v4.1-flash），
+     * 而不是直接升到第 1 档的 gpt-5.6-sol。
+     */
+    sameTierFirst: false,
   },
   tiers: DEFAULT_TIERS,
 }
@@ -222,6 +399,94 @@ const DEFAULT_CONFIG = {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && Array.isArray(value) !== true
+}
+
+/** 归一化 { CODE: ms }：键转大写；形状与逐条校验在 normalizeConfig 的 errors 里完成。 */
+function normalizeCooldownByCode(raw) {
+  const out = {}
+  if (!isPlainObject(raw)) return out
+  for (const key of Object.keys(raw)) {
+    const code = String(key).toUpperCase().trim()
+    if (code.length > 0) out[code] = raw[key]
+  }
+  return out
+}
+
+/**
+ * 失败类别的冷却时长（纯函数）：cooldownByCode 按归一化错误码覆盖条目 cooldownMs。
+ * 消息模式兜底命中的失败（how 形如 'pattern:...'）按模式归类，使「额度耗尽冷却 N 小时」
+ * 对未归一化的上游文案（如 Codex 的 usage limit 自然语言报错）同样生效。
+ */
+const COOLDOWN_PATTERN_CLASS = {
+  'insufficient balance': 'QUOTA',
+  'insufficient_quota': 'QUOTA',
+  'quota exceeded': 'QUOTA',
+  'usage limit': 'QUOTA',
+  'usage_limit': 'QUOTA',
+  'balance': 'QUOTA',
+  'websocket closed': 'TRANSPORT',
+  'websocket error': 'TRANSPORT',
+  'websocket': 'TRANSPORT',
+  // 上游流错误（HTTP/2 流复位、网关 upstream_* 前缀码）：连接层中断，归 TRANSPORT
+  // 才能吃到「原地重试 5 次 × 5s、预算 30s」，而不是落到 DEFAULT 的 1 次或直接切换。
+  'http2': 'TRANSPORT',
+  'upstream_': 'TRANSPORT',
+  'rate limit': 'RATE_LIMIT',
+  'token limit': 'RATE_LIMIT',
+  'invalid api key': 'AUTH',
+  'overloaded': 'SERVER',
+}
+
+/**
+ * 消息模式兜底命中的**归一化错误码**（纯函数）：把 `failurePatterns` 命中的那句文案
+ * 折算成 `COOLDOWN_PATTERN_CLASS` 里的类别码，使「切换重试分类」与「全量测试状态展示」
+ * 与「冷却归类」三者用同一套判定，不再各自为政。
+ *
+ * 匹配取**最先出现**的模式（index 相同时取模式表顺序），因此
+ * `insufficient_quota` 先于其子串 `quota` 命中时仍归 QUOTA。
+ * 自定义模式（不在类别表里）按模式名派生一个稳定的大写码，至少不再退化成「未知错误」。
+ * `patterns` 决定派生阶段用哪份模式表（默认取插件默认表，调用方可传生效配置里的那份）。
+ */
+function patternCodeFor(text, patterns) {
+  const haystack = String(text ?? '').toLowerCase()
+  if (haystack.length === 0) return undefined
+  let best
+  let bestAt = -1
+  for (const pattern of Object.keys(COOLDOWN_PATTERN_CLASS)) {
+    const at = haystack.indexOf(pattern)
+    if (at < 0) continue
+    if (bestAt < 0 || at < bestAt) {
+      best = pattern
+      bestAt = at
+    }
+  }
+  if (best !== undefined) return COOLDOWN_PATTERN_CLASS[best]
+  const extra = Array.isArray(patterns) ? patterns : DEFAULT_FAILURE_PATTERNS
+  let derived
+  let derivedAt = -1
+  for (const pattern of extra) {
+    const at = haystack.indexOf(String(pattern).toLowerCase())
+    if (at < 0) continue
+    if (derivedAt < 0 || at < derivedAt) {
+      derived = pattern
+      derivedAt = at
+    }
+  }
+  if (derived === undefined) return undefined
+  return String(derived).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').toUpperCase()
+}
+
+function cooldownMsFor(cooldownByCode, entryCooldownMs, code, how, patterns) {
+  let klass = code
+  if (typeof how === 'string' && how.indexOf('pattern:') === 0) {
+    const pattern = how.slice(8)
+    const mapped = COOLDOWN_PATTERN_CLASS[pattern]
+    if (mapped !== undefined) klass = mapped
+    else klass = patternCodeFor(pattern, patterns) ?? klass
+  }
+  const specific = klass.length > 0 && isPlainObject(cooldownByCode) ? cooldownByCode[klass] : undefined
+  if (positiveNumber(specific)) return specific
+  return entryCooldownMs !== undefined ? entryCooldownMs : 60000
 }
 
 /** 插件自有设置文件：`$DSH_HOME/plugins/<namespace>/settings.json`。 */
@@ -250,6 +515,7 @@ function readLocalRouteConfig() {
       ...(Array.isArray(provider.tiers) ? { tiers: provider.tiers } : {}),
       ...(Array.isArray(policy.switchOn) ? { terminalCodes: policy.switchOn } : {}),
       ...(Number.isInteger(policy.maxSwitchesPerTurn) ? { maxSwitchesPerTurn: policy.maxSwitchesPerTurn } : {}),
+      ...(isPlainObject(policy.cooldownByCode) ? { cooldownByCode: policy.cooldownByCode } : {}),
       ...(policy.switchOn?.includes('POLICY') ? { policyMode: 'switch' } : {}),
     }
   } catch {
@@ -307,6 +573,14 @@ function createFileSettingsScope({ file, base }) {
 
 function positiveNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+/**
+ * 取值版的正数判定：合法时返回该数值本身，否则 undefined。
+ * 与 `positiveNumber`（布尔谓词）区分开——重试策略里需要拿到数值而不是 true/false。
+ */
+function positiveValue(value) {
+  return positiveNumber(value) ? value : undefined
 }
 
 function optionalString(value) {
@@ -371,6 +645,33 @@ function strings(value) {
  * 归一化并与默认值合并。返回 `{ value, errors }`；有 errors 时调用方必须按
  * 「零配置零介入」处理，不得带着部分配置继续运行。
  */
+/**
+ * 归一化 retryPolicies：每个类别只取已知整数/有限数字段，未知字段忽略。
+ * 未声明的类别退回 DEFAULT_CONFIG 的该类别策略；一个类别都没有时仍是完整表。
+ */
+function normalizeRetryPolicies(raw) {
+  const source = isPlainObject(raw) ? raw : {}
+  const result = {}
+  const keys = new Set([...Object.keys(DEFAULT_CONFIG.retryPolicies), ...Object.keys(source)])
+  for (const key of keys) {
+    if (typeof key !== 'string' || key.length === 0) continue
+    const upper = key.toUpperCase()
+    const fallback = DEFAULT_CONFIG.retryPolicies[upper] ?? DEFAULT_CONFIG.retryPolicies.DEFAULT
+    const input = isPlainObject(source[key]) ? source[key] : isPlainObject(source[upper]) ? source[upper] : {}
+    const declared = Object.keys(input).length > 0
+    const policy = {}
+    policy.attempts = Number.isInteger(input.attempts) ? Math.max(0, input.attempts) : declared ? 0 : fallback.attempts
+    if (policy.attempts > 0) {
+      policy.delayMs = positiveValue(input.delayMs) ?? fallback.delayMs ?? 5000
+      policy.budgetMs = positiveValue(input.budgetMs) ?? fallback.budgetMs ?? policy.delayMs * policy.attempts
+      const window = positiveValue(input.observationWindowMs) ?? fallback.observationWindowMs
+      if (window !== undefined) policy.observationWindowMs = window
+    }
+    result[upper] = policy
+  }
+  return result
+}
+
 function normalizeConfig(raw) {
   const errors = []
   const input = isPlainObject(raw) ? raw : {}
@@ -387,10 +688,15 @@ function normalizeConfig(raw) {
     policyFailover: policyMode !== 'off',
     policyMode,
     maxPolicyRetriesPerStep: input.maxPolicyRetriesPerStep === undefined ? DEFAULT_CONFIG.maxPolicyRetriesPerStep : input.maxPolicyRetriesPerStep,
+    retryPolicies: normalizeRetryPolicies(input.retryPolicies),
     terminalCodes: new Set((strings(input.terminalCodes).length > 0 ? strings(input.terminalCodes) : DEFAULT_TERMINAL_CODES).map((code) => code.toUpperCase())),
     failurePatterns: (strings(input.failurePatterns).length > 0 ? strings(input.failurePatterns) : DEFAULT_FAILURE_PATTERNS).map((pattern) => pattern.toLowerCase()),
+    // 生效的失败原因表（内置表 + 配置追加）。放归一化结果里，使「判定」与「展示」同源：
+    // 设置页/通知用哪张表，与运行期用的是同一份。
+    failureReasons: mergeFailureReasons(input.failureReasons, errors),
     minSwitchIntervalMs: input.minSwitchIntervalMs === undefined ? DEFAULT_CONFIG.minSwitchIntervalMs : input.minSwitchIntervalMs,
     maxSwitchesPerTurn: input.maxSwitchesPerTurn === undefined ? DEFAULT_CONFIG.maxSwitchesPerTurn : input.maxSwitchesPerTurn,
+    cooldownByCode: normalizeCooldownByCode(input.cooldownByCode),
     probeTarget: input.probeTarget === undefined ? DEFAULT_CONFIG.probeTarget : input.probeTarget === true,
     keyResetAt: optionalString(input.keyResetAt) ?? DEFAULT_CONFIG.keyResetAt,
     startup: { preferTier: 0 },
@@ -400,12 +706,30 @@ function normalizeConfig(raw) {
       cacheTtlMs: DEFAULT_CONFIG.ranking.cacheTtlMs,
       provider: '',
       model: '',
+      sameTierFirst: false,
     },
     tiers: [],
   }
 
   if (typeof config.minSwitchIntervalMs !== 'number' || Number.isFinite(config.minSwitchIntervalMs) !== true || config.minSwitchIntervalMs < 0) errors.push('minSwitchIntervalMs must be a non-negative number (0 disables the interval guard)')
   if (!Number.isInteger(config.maxSwitchesPerTurn) || config.maxSwitchesPerTurn < 1) errors.push('maxSwitchesPerTurn must be a positive integer')
+  for (const [key, policy] of Object.entries(config.retryPolicies ?? {})) {
+    if (!Number.isInteger(policy.attempts) || policy.attempts < 0) errors.push('retryPolicies.' + key + '.attempts must be a non-negative integer')
+    if (policy.attempts > 0) {
+      for (const field of ['delayMs', 'budgetMs', 'observationWindowMs']) {
+        const value = policy[field]
+        if (value === undefined) continue
+        if (typeof value !== 'number' || Number.isFinite(value) !== true || value <= 0) errors.push('retryPolicies.' + key + '.' + field + ' must be a positive finite number')
+      }
+      if (typeof policy.budgetMs === 'number' && typeof policy.delayMs === 'number' && policy.budgetMs < policy.delayMs) errors.push('retryPolicies.' + key + '.budgetMs must be >= delayMs (otherwise no retry can ever run)')
+    }
+  }
+  if (input.cooldownByCode !== undefined) {
+    if (!isPlainObject(input.cooldownByCode)) errors.push('cooldownByCode must be an object mapping failure codes to milliseconds')
+    else for (const key of Object.keys(input.cooldownByCode)) {
+      if (!positiveNumber(input.cooldownByCode[key])) errors.push('cooldownByCode.' + String(key) + ' must be a positive number of milliseconds')
+    }
+  }
   if (['same', 'switch', 'off'].indexOf(config.policyMode) < 0) errors.push('policyMode must be one of same|switch|off')
   if (!Number.isInteger(config.maxPolicyRetriesPerStep) || config.maxPolicyRetriesPerStep < 1) errors.push('maxPolicyRetriesPerStep must be a positive integer')
   if (parseClock(config.keyResetAt) === undefined) errors.push('keyResetAt must be HH:MM in 24-hour local time (e.g. 06:00)')
@@ -420,6 +744,10 @@ function normalizeConfig(raw) {
   const mode = optionalString(ranking.mode) ?? DEFAULT_CONFIG.ranking.mode
   if (['declared', 'keywords', 'llm'].indexOf(mode) < 0) errors.push('ranking.mode must be one of declared|keywords|llm')
   else config.ranking.mode = mode
+  if (ranking.sameTierFirst !== undefined && typeof ranking.sameTierFirst !== 'boolean') {
+    errors.push('ranking.sameTierFirst must be a boolean')
+  }
+  config.ranking.sameTierFirst = ranking.sameTierFirst === true
   if (ranking.timeoutMs !== undefined) {
     if (!positiveNumber(ranking.timeoutMs)) errors.push('ranking.timeoutMs must be a positive number')
     else config.ranking.timeoutMs = ranking.timeoutMs
@@ -601,6 +929,13 @@ function isSwitchable(config, code, message) {
     return { hit: false, category: 'configuration', reason: '模型不支持当前推理档位；请关闭推理档位或选择兼容模型。' }
   }
   if (config.terminalCodes.has(normalized)) return { hit: true, how: 'code:' + normalized, category: 'switchable' }
+  // 未归一化（空码 / PI_AI_ERROR）时先折算生效码再判：宿主把链路中断、网关自定义码、
+  // 空体 5xx 都留在 PI_AI_ERROR 里，只查原始码会让这些故障既不重试也不切换。
+  // 与全量测试展示走同一个 effectiveFailureCode，避免「状态页说会切换、实际不动」。
+  const effective = effectiveFailureCode(normalized, message, config.failurePatterns)
+  if (effective !== normalized && config.terminalCodes.has(effective)) {
+    return { hit: true, how: 'effective:' + effective, category: 'switchable' }
+  }
   for (const pattern of config.failurePatterns) {
     if (haystack.indexOf(pattern) >= 0) return { hit: true, how: 'pattern:' + pattern, category: 'switchable' }
   }
@@ -623,13 +958,85 @@ const PROBE_STATUS_LABELS = {
 }
 
 /**
- * 把一次探测失败的编码/消息归类成可展示状态（纯函数）。
- * 归一化编码优先；未归一化时按消息（超时/中断关键词）兜底。
+ * 文案里出现的**已知 HTTP 错误状态码**（纯函数）。仅用于「编码未归一化」时的兜底归类：
+ * 只认下表里的码，不做任意三位数匹配——`connect ETIMEDOUT 10.0.0.5:443`、端口号、字节数
+ * 都不该被当成状态码。取**最先出现**的那个码。
  */
-function classifyProbeFailure(code, message) {
+const HTTP_ERROR_STATUSES = new Set([400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 500, 501, 502, 503, 504, 529])
+
+function firstHttpErrorStatus(text) {
+  const matcher = /\b(\d{3})\b/g
+  let match
+  while ((match = matcher.exec(text)) !== null) {
+    const value = Number(match[1])
+    if (HTTP_ERROR_STATUSES.has(value)) return value
+  }
+  return undefined
+}
+
+/**
+ * HTTP 状态码 → 归一化错误类别码（纯函数）。只映射**该类别在本插件里可切换**的码，
+ * 其余（400/404/413/422…）返回 undefined，交回原有判定，不擅自扩大切换面。
+ * 与 `firstHttpErrorStatus` 配套，用于「宿主把上游 HTTP 故障留在 PI_AI_ERROR 里」的兜底。
+ */
+function statusCodeToClass(status) {
+  if (status >= 500) return 'SERVER'
+  if (status === 401 || status === 403) return 'AUTH'
+  if (status === 429) return 'RATE_LIMIT'
+  return undefined
+}
+
+/**
+ * 一次失败的**生效类别码**（纯函数）：归一化码优先；宿主未归一化时（空码 / `PI_AI_ERROR`）
+ * 依次用 `failurePatterns` 消息兜底、HTTP 状态码兜底，都认不出来才退回原始码。
+ *
+ * 切换/重试判定与全量测试展示**必须共用这一个函数**：否则会出现「设置页说会切换、
+ * 实际没切换」这类展示与行为不一致（PI_AI_ERROR 不在宿主默认重试码表里，
+ * 展示与判定一旦分叉，用户看到的状态就没有意义）。
+ */
+function effectiveFailureCode(code, message, patterns) {
+  const raw = typeof code === 'string' ? code.toUpperCase() : ''
+  if (raw !== '' && raw !== 'PI_AI_ERROR') return raw
+  const text = String(message ?? '')
+  const mapped = patternCodeFor(text, patterns)
+  if (mapped !== undefined) return mapped
+  const status = firstHttpErrorStatus(text.toLowerCase())
+  const fromStatus = status === undefined ? undefined : statusCodeToClass(status)
+  return fromStatus ?? raw
+}
+
+/**
+ * 把一次探测失败的编码/消息归类成可展示状态（纯函数）。
+ * 归一化编码优先；编码未归一化（或根本为空）时，与「切换判定」走同一套 `failurePatterns`
+ * 消息兜底：命中即按映射出的类别码展示（usage limit → 额度不足、WebSocket error → 传输中断），
+ * 不再让 `PI_AI_ERROR` 一律显示成「未知错误」——那种展示会掩盖真实的额度/链路故障。
+ * 最后才退回超时/中断关键词与「未知错误」。
+ *
+ * 第四个参数 `reasons` 是生效的失败原因表（`config.failureReasons`）。给了它，**AUTH 族**的
+ * 展示就不再一律写「凭据无效」——401/403 里既有余额不足也有模型未授权，是全量测试最容易
+ * 误导用户的一处（`status` 保持原码不变，只细化给人看的 label；QUOTA 等原有标签一律不动）。
+ */
+function classifyProbeFailure(code, message, patterns, reasons) {
   const normalized = typeof code === 'string' ? code.toUpperCase() : ''
   const haystack = (String(message ?? '') + ' ' + normalized).toLowerCase()
   const detail = String(message ?? '').slice(0, 200)
+  const unknownCode = normalized === '' || normalized === 'PI_AI_ERROR'
+  const patternsFor = Array.isArray(patterns) && patterns.length > 0 ? patterns : DEFAULT_FAILURE_PATTERNS
+  /** AUTH 族：原文能分辨出具体原因时用它，分辨不出才退回按码的保守标签。 */
+  const refineAuthLabel = (statusCode) => {
+    if (reasons === undefined) return undefined
+    if (statusCode !== 'AUTH' && statusCode !== 'INVALID_CREDENTIAL' && statusCode !== 'MISSING_CREDENTIAL') return undefined
+    const reason = failureReasonFor(statusCode, message, reasons)
+    if (reason.id === statusCode || reason.id === 'UNKNOWN') return undefined
+    return reason.label
+  }
+  if (unknownCode) {
+    // 与切换/重试判定共用 effectiveFailureCode：模式兜底 → HTTP 状态码兜底。
+    // 不为未知码臆造标签——effectiveFailureCode 认不出来时仍返回原码，落回下面的「未知错误」。
+    const mapped = effectiveFailureCode(normalized, message, patternsFor)
+    const mappedLabel = PROBE_STATUS_LABELS[mapped]
+    if (mappedLabel !== undefined) return { status: mapped, label: refineAuthLabel(mapped) ?? mappedLabel, message: detail }
+  }
   if (haystack.includes('timeout') || haystack.includes('timed out') || haystack.includes('aborted')) {
     return { status: 'TIMEOUT', label: '超时/无响应', message: detail.length > 0 ? detail : 'no response in time' }
   }
@@ -639,7 +1046,7 @@ function classifyProbeFailure(code, message) {
     return { status: 'TRANSPORT', label: '传输中断', message: detail.length > 0 ? detail : 'connection closed mid-stream' }
   }
   const label = PROBE_STATUS_LABELS[normalized]
-  if (label !== undefined) return { status: normalized, label, message: detail }
+  if (label !== undefined) return { status: normalized, label: refineAuthLabel(normalized) ?? label, message: detail }
   return { status: normalized.length > 0 ? normalized : 'UNKNOWN', label: '未知错误', message: detail.length > 0 ? detail : 'no failure message' }
 }
 
@@ -720,6 +1127,24 @@ export function apply(ctx, rawConfig) {
     routeHealth: new Map(),
     /** 最近转移记录（上限 50） */
     switchLog: [],
+    /**
+     * 会话可见通知：sessionId -> record[]（内存态，上限 200/会话，最新的在前）。
+     * 与 switchLog 的区别：按会话隔离、带 noticeId 与 turn/step、并可落盘补拉，
+     * 供 `/provider-failover/notices` 与插件对话区面板展示。
+     */
+    notices: new Map(),
+    /** 通知自增序号，用于生成稳定 noticeId 与游标 */
+    noticeSeq: 0,
+    /** 每一轮通知生成时 memory 上限 */
+    noticeLimit: 200,
+    /** 生效的按类别重试策略（配置实时同步） */
+    retryPolicies: DEFAULT_CONFIG.retryPolicies,
+    /**
+     * 每会话最近一次**实际下发**的路由：sessionKey -> { provider, model, at }。
+     * 用来识别「不是插件切的」路由变化（模型选择器 / /failover-test / 宿主其它入口），
+     * 这样手动切换也会在会话内留下带原因的通知。
+     */
+    lastRouted: new Map(),
     /** 最近未切换决策（策略拒绝、参数错误等；上限 50） */
     ignoredLog: [],
     /** stepKey -> { attempted:Set<'entryId@route#ref'>, target, switches, needs, at } */
@@ -924,6 +1349,23 @@ export function apply(ctx, rawConfig) {
     }
     state.pins.set(pinKeyOf(sessionId), pin)
     pushLog({ at: pin.at, kind: 'test-switch', from: '(session selection)', to: pin.route + '/' + pin.model, tier: pin.tier, code: 'TEST', trigger: reason, turn: 0, step: 0 })
+    noteRouted(sessionId, pin.route, pin.model)
+    pushNotice({
+      at: pin.at,
+      session: sessionId,
+      kind: 'manual-switch',
+      stage: 'selected',
+      code: 'TEST',
+      trigger: reason,
+      fromRoute: '(session selection)',
+      fromModel: '',
+      toRoute: pin.route,
+      toModel: pin.model,
+      tier: pin.tier,
+      reasoningEffort: pin.reasoningEffort,
+      turn: 0,
+      step: 0,
+    })
     console.warn('[dsh-provider-failover] test switch session ' + String(pinKeyOf(sessionId)) + ' -> ' + pin.route + '/' + pin.model + ' tier ' + String(pin.tier) + ' (' + reason + ')')
     return pin
   }
@@ -1019,11 +1461,11 @@ export function apply(ctx, rawConfig) {
       return { ...base, ok: false, ms, status: 'TIMEOUT', label: '超时/无响应', message: '超过 ' + String(timeoutMs) + 'ms 未完成' }
     }
     if (streamFailure !== undefined) {
-      const cls = classifyProbeFailure(streamFailure.code, streamFailure.message)
+      const cls = classifyProbeFailure(streamFailure.code, streamFailure.message, config.failurePatterns, config.failureReasons)
       return { ...base, ok: false, ms, status: cls.status, label: cls.label, message: cls.message }
     }
     if (thrown !== undefined) {
-      const cls = classifyProbeFailure(thrown.code, messageOf(thrown))
+      const cls = classifyProbeFailure(thrown.code, messageOf(thrown), config.failurePatterns, config.failureReasons)
       return { ...base, ok: false, ms, status: cls.status, label: cls.label, message: cls.message }
     }
     const reply = String(text).trim().slice(0, 120)
@@ -1226,6 +1668,177 @@ export function apply(ctx, rawConfig) {
   function pushLog(record) {
     state.switchLog.unshift(record)
     if (state.switchLog.length > 50) state.switchLog.length = 50
+  }
+
+  /**
+   * 追加一条「会话内可见」的转移通知。
+   *
+   * 与 pushLog 的差别是它会：
+   *  - 按 sessionId 归档（记忆 + JSONL 落盘），因此环形缓冲轮转后仍可回看；
+   *  - 带稳定 noticeId 与 turn/step，客户端可按游标去重补拉；
+   *  - 只记录事实：`stage` 区分「已选中下一尝试目标(selected)」与「启动对齐(startup-align)」，
+   *    绝不把选中候选写成「已成功」。
+   *
+   * 落盘失败只警告，绝不影响切换本身。
+   */
+  function noticeFile() {
+    const base = process.env.DSH_HOME !== undefined && process.env.DSH_HOME.trim() !== ''
+      ? process.env.DSH_HOME
+      : join(homedir(), '.dsh')
+    return join(base, 'plugins', SETTINGS_NAMESPACE, 'notices.jsonl')
+  }
+
+  function pushNotice(input) {
+    const key = sessionKeyOf(input.session)
+    state.noticeSeq += 1
+    const notice = {
+      noticeId: 'n' + String(state.noticeSeq) + '-' + String(input.at) + '-' + Math.random().toString(36).slice(2, 8),
+      at: input.at,
+      session: key,
+      kind: input.kind,
+      stage: input.stage,
+      code: input.code === undefined ? '' : String(input.code),
+      trigger: input.trigger === undefined ? '' : String(input.trigger),
+      fromRoute: input.fromRoute,
+      fromModel: input.fromModel,
+      toRoute: input.toRoute,
+      toModel: input.toModel,
+      tier: input.tier,
+      reasoningEffort: input.reasoningEffort,
+      turn: input.turn,
+      step: input.step,
+      // 原因细分：`AUTH` 这类归一化码不足以决定处置（充值 vs 换来源 vs 重新登录），
+      // 展示必须带上「具体是哪种」。reasonId 稳定可断言，reasonLabel 是给人看的中文。
+      reasonId: input.reasonId,
+      reasonLabel: input.reasonLabel,
+      // 上游原文（脱敏 + 截断）。没有它，用户只看到「AUTH」无法自查；
+      // 有它，余额不足会直接读出「用户剩余额度: ¥1.04」。凭据不会被带进来：
+      // 走 sanitizeForRanking 的密钥形状抹除，且只保留前 FAILURE_DETAIL_LIMIT 字符。
+      detail: input.detail === undefined ? '' : sanitizeForRanking(String(input.detail), FAILURE_DETAIL_LIMIT),
+    }
+    const list = state.notices.get(key) ?? []
+    list.unshift(notice)
+    if (list.length > state.noticeLimit) list.length = state.noticeLimit
+    state.notices.set(key, list)
+    if (state.notices.size > 64) {
+      const oldest = state.notices.keys().next()
+      if (oldest.done !== true && oldest.value !== key) state.notices.delete(oldest.value)
+    }
+    try {
+      mkdirSync(dirname(noticeFile()), { recursive: true })
+      appendFileSync(noticeFile(), JSON.stringify(notice) + '\n', 'utf8')
+    } catch (error) {
+      warnConfigOnce('notice log write failed: ' + messageOf(error))
+    }
+    return notice
+  }
+
+  /**
+   * 失败类别的重试策略（切换 provider 之前的原地重试）。
+   *
+   * 类别划分（详见 DEFAULT_CONFIG.retryPolicies 注释）：
+   *  - TRANSPORT / RATE_LIMIT / SERVER：等 delayMs 后原地重试，次数或预算用尽才切换；
+   *  - QUOTA / AUTH / INVALID_CREDENTIAL / MISSING_CREDENTIAL / NO_ADAPTER：立即切换；
+   *  - 其余（含 POLacy 之外的未归类错误）：按 DEFAULT 策略短暂重试。
+   * 未配置策略时退回 DEFAULT_CONFIG，绝不因为缺配置而变成“永不重试”。
+   */
+  /**
+   * 取该错误码的重试策略。
+   *
+   * 只有**显式列在 retryPolicies 里**的类别才重试；未列出的错误码一律按
+   * `{ attempts: 0 }` 处理，即保持插件原有语义「立即切换」。这样新出现的错误码
+   * 永远不会因为“默认值”而被静默改成先重试，也不会吞掉额度类（QUOTA）的立即切换。
+   */
+  function retryPolicyFor(rawCode) {
+    const table = state.retryPolicies ?? DEFAULT_CONFIG.retryPolicies
+    const code = typeof rawCode === 'string' ? rawCode.toUpperCase() : ''
+    if (code.length === 0) return { attempts: 0 }
+    return isPlainObject(table[code]) ? table[code] : { attempts: 0 }
+  }
+
+  /** 重试类别标签（仅用于日志/通知）；未配置的码返回 'none'。 */
+  function retryClassOf(rawCode) {
+    const code = typeof rawCode === 'string' ? rawCode.toUpperCase() : ''
+    const table = state.retryPolicies ?? DEFAULT_CONFIG.retryPolicies
+    return code.length > 0 && isPlainObject(table[code]) ? code : 'none'
+  }
+
+  /** 是否在「观测窗口内」失败：连接活过该窗口才断，视为路由已不可用，直接切换。 */
+  function withinObservationWindow(policy, since) {
+    if (policy?.observationWindowMs === undefined) return true
+    if (typeof since !== 'number' || Number.isFinite(since) !== true) return true
+    return Date.now() - since <= policy.observationWindowMs
+  }
+
+  /**
+   * 切换 provider 之前的原地重试闸门。返回 undefined 表示放行给后面的切换逻辑。
+   *
+   * 预算按类别记在 (turn, step) 记账里：`record.retryBudget[CLASS] = { spent, attempts, startedAt }`；
+   * 宿主重试仍走 `{ kind: 'retry' }`（交回宿主重放同一请求），插件只负责按类别判断
+   * 「还能重试几次」与「该等多久」。
+   */
+  async function transientRetryGate(payload, failure, record, sessionId, turn, step, failedRoute, code) {
+    const cls = retryClassOf(code)
+    const policy = retryPolicyFor(code)
+    if (policy === undefined || !Number.isInteger(policy.attempts) || policy.attempts <= 0) return undefined
+    if (record.retryBudget === undefined) record.retryBudget = {}
+    const budget = record.retryBudget[cls] ?? { spent: 0, attempts: 0, startedAt: Date.now() }
+    record.retryBudget[cls] = budget
+    if (budget.attempts >= policy.attempts) return undefined
+    const delayMs = policy.delayMs ?? 0
+    const budgetMs = policy.budgetMs ?? delayMs * policy.attempts
+    if (budget.spent + delayMs > budgetMs) return undefined
+    if (cls === 'TRANSPORT' && withinObservationWindow(policy, budget.startedAt) !== true) {
+      warnConfigOnce('transient retry skipped for ' + String(failedRoute) + ': failure arrived after the observation window (' + String(policy.observationWindowMs) + 'ms)')
+      return undefined
+    }
+    budget.spent += delayMs
+    budget.attempts += 1
+    const at = Date.now()
+    // 原地重试同样带原因细分：TRANSPORT/RATE_LIMIT 类下「限流」与「链路抖动」的等待预期不同。
+    const retryReason = failureReasonFor(code, failure?.message, config.failureReasons)
+    pushNotice({
+      at,
+      session: sessionId,
+      kind: 'retry',
+      stage: 'retrying',
+      code,
+      trigger: 'retry:' + cls + ' ' + String(budget.attempts) + '/' + String(policy.attempts) + ' after ' + String(delayMs) + 'ms',
+      fromRoute: failedRoute,
+      fromModel: '',
+      toRoute: failedRoute,
+      toModel: '',
+      tier: -1,
+      turn,
+      step,
+      reasonId: retryReason.id,
+      reasonLabel: retryReason.label,
+      detail: failure?.message,
+    })
+    pushLog({
+      at,
+      kind: 'transient-retry',
+      from: failedRoute,
+      to: failedRoute,
+      tier: 0,
+      code,
+      trigger: 'retry:' + cls,
+      attempt: budget.attempts,
+      turn,
+      step,
+    })
+    console.warn('[dsh-provider-failover] transient retry ' + cls + ' ' + String(budget.attempts) + '/' + String(policy.attempts) + ' on ' + (failedRoute.length > 0 ? failedRoute : '(unknown)') + ' after ' + String(delayMs) + 'ms (spent ' + String(budget.spent) + '/' + String(budgetMs) + 'ms, turn ' + String(turn) + ' step ' + String(step) + ')')
+    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs))
+    return { kind: 'retry' }
+  }
+
+  /** 该会话的通知列表（最新在前）；`after` 为 noticeId，返回它之后（更新）的通知。 */
+  function noticesOf(session, limit, after) {
+    const list = state.notices.get(sessionKeyOf(session)) ?? []
+    const cap = typeof limit === 'number' && limit > 0 ? Math.min(limit, state.noticeLimit) : 20
+    if (after === undefined || after === null || after === '') return list.slice(0, cap)
+    const index = list.findIndex((item) => item.noticeId === after)
+    return (index < 0 ? list : list.slice(0, index)).slice(0, cap)
   }
 
   /**
@@ -1465,10 +2078,12 @@ export function apply(ctx, rawConfig) {
     return orderEntries(tier.entries, context)
   }
 
-  async function pickCandidate(sessionId, turn, step, context, signal, excludeRoute) {
-    const record = stepState(sessionId, turn, step)
-    const now = Date.now()
-    for (const tier of config.tiers) {
+  /**
+   * 在给定档位序列内按既有顺序选第一条可用候选：逐条跳过未启用条目、已尝试、冷却中、
+   * 能力不兼容、不可解析的候选（与 v3.4.0 的 pickCandidate 过滤顺序完全一致）。
+   */
+  async function pickInTiers(tiers, record, now, context, signal, excludeRoute) {
+    for (const tier of tiers) {
       if (tier.enabled !== true) continue
       for (const entry of await entriesInOrder(tier, context, signal, excludeRoute)) {
         if (entry.enabled !== true) continue
@@ -1480,6 +2095,27 @@ export function apply(ctx, rawConfig) {
       }
     }
     return undefined
+  }
+
+  /** 插件自己决定切换目标时同步观测值，避免下一次请求把它再记一遍“手动切换”。 */
+  function noteRouted(sessionId, provider, model) {
+    state.lastRouted.set(sessionKeyOf(sessionId), { provider: provider, model: model, at: Date.now() })
+  }
+
+  async function pickCandidate(sessionId, turn, step, context, signal, excludeRoute) {
+    const record = stepState(sessionId, turn, step)
+    const now = Date.now()
+    // 同族互备（ranking.sameTierFirst，默认 false）：失败路由能在档位表中定位时，先只扫它
+    // 所落的那一档；该档内选不到才退回全档扫描。开关关闭、失败路由为空或无法定位时
+    // 只有一条路径，与旧行为逐字等价。不触碰 key 轮换、冷却写入、record.switches 与限流判定。
+    if (config.ranking.sameTierFirst === true && typeof excludeRoute === 'string' && excludeRoute.length > 0) {
+      const failedTier = tierOf(config, excludeRoute)
+      if (failedTier !== undefined) {
+        const sameTier = await pickInTiers([failedTier], record, now, context, signal, excludeRoute)
+        if (sameTier !== undefined) return sameTier
+      }
+    }
+    return pickInTiers(config.tiers, record, now, context, signal, excludeRoute)
   }
 
   // ---------------------------------------------------------------- 钩子一
@@ -1515,6 +2151,37 @@ export function apply(ctx, rawConfig) {
 
   ctx.on('agent/request', async (payload, next) => {
     const base = await next()
+    // 观测「实际下发的路由」。放在 next() 之后，所以看到的是**所有 hook 处理完的结果**：
+    // 模型选择器 / 测试切换 / 宿主其它入口造成的 provider-model 变化都会在这里现形。
+    // 插件自己发的切换不会重复通知——它在切换当刻就把 lastRouted 更新成了目标路由。
+    if (base !== null && typeof base === 'object' && typeof base.provider === 'string' && typeof base.model === 'string') {
+      const observedKey = sessionKeyOf(sessionIdOf(payload?.agent))
+      const observed = { provider: base.provider, model: base.model, at: Date.now() }
+      const previous = state.lastRouted.get(observedKey)
+      if (previous !== undefined && (previous.provider !== observed.provider || previous.model !== observed.model)) {
+        pushNotice({
+          at: observed.at,
+          session: sessionIdOf(payload?.agent),
+          kind: 'manual-switch',
+          stage: 'selected',
+          code: 'MANUAL',
+          trigger: 'observed:route-change',
+          fromRoute: previous.provider,
+          fromModel: previous.model,
+          toRoute: observed.provider,
+          toModel: observed.model,
+          tier: -1,
+          reasoningEffort: typeof base.reasoningEffort === 'string' ? base.reasoningEffort : undefined,
+          turn: payload?.turn ?? 0,
+          step: payload?.step ?? 0,
+        })
+      }
+      state.lastRouted.set(observedKey, observed)
+      if (state.lastRouted.size > 128) {
+        const oldest = state.lastRouted.keys().next()
+        if (oldest.done !== true && oldest.value !== observedKey) state.lastRouted.delete(oldest.value)
+      }
+    }
     if (config.enabled !== true || config.tiers.length === 0) return base
     const sessionId = sessionIdOf(payload?.agent)
     const sessionKey = sessionKeyOf(sessionId)
@@ -1547,7 +2214,23 @@ export function apply(ctx, rawConfig) {
         if (picked !== undefined) {
           target = { entry: picked.entry, tier: picked.tier, reason: 'startup-align' }
           record.target = target
+          noteRouted(sessionId, picked.entry.route, picked.entry.model)
           pushLog({ at: Date.now(), kind: 'startup-align', from: base.provider + '/' + base.model, to: picked.entry.route + '/' + picked.entry.model, tier: picked.tier.tier })
+          pushNotice({
+            at: Date.now(),
+            session: sessionId,
+            kind: 'startup-align',
+            stage: 'selected',
+            code: 'STARTUP_ALIGN',
+            trigger: 'startup:preferTier=' + String(config.startup.preferTier),
+            fromRoute: base.provider,
+            fromModel: base.model,
+            toRoute: picked.entry.route,
+            toModel: picked.entry.model,
+            tier: picked.tier.tier,
+            turn,
+            step,
+          })
           console.warn('[dsh-provider-failover] startup-align ' + base.provider + '/' + base.model + ' -> ' + picked.entry.route + '/' + picked.entry.model + ' tier ' + String(picked.tier.tier) + ' (preferTier ' + String(config.startup.preferTier) + ')')
         }
       }
@@ -1571,6 +2254,21 @@ export function apply(ctx, rawConfig) {
     const sessionKey = sessionKeyOf(sessionId)
     const turn = payload?.turn ?? 0
     const step = payload?.step ?? 0
+    // 归一化前先做一次生效码判定：宿主把带关闭码的链路中断、网关自定义码、空体 5xx
+    // 都留在通用 PI_AI_ERROR 里，只有靠 failurePatterns（+ 已知 HTTP 状态码）才能识别成
+    // TRANSPORT/SERVER 等类别；重试分类与切换分类都用它。
+    // 注意：isSwitchable 只回 how（`pattern:<模式>`），不回类别码——类别码必须由
+    // effectiveFailureCode 折算，否则 effectiveCode 永远退回 PI_AI_ERROR，
+    // 重试策略会错用 DEFAULT（1 次）而不是该类别的策略（如 TRANSPORT 的 5 次）。
+    // 该函数同时被全量测试的展示逻辑调用，保证「设置页说会切换」与实际行为一致。
+    const rawCode = typeof failure?.code === 'string' ? failure.code.toUpperCase() : ''
+    const effectiveCode = effectiveFailureCode(rawCode, failure?.message, config.failurePatterns)
+    // 原因细分与「生效码」并行计算：`AUTH` 已归一化时 effectiveFailureCode 会直接短路返回，
+    // 原文就不再参与判定——这正是「提示只写 AUTH、看不出余额不足」的成因。所以这里对
+    // **原始报文**独立跑一次 failureReasonFor，只用它填展示字段，不参与任何切换决策。
+    const reason = failureReasonFor(effectiveCode, failure?.message, config.failureReasons)
+    // ① 未归一化的错误码（如 PI_AI_ERROR，带 "WebSocket error" 消息）也要按类别重试：
+    //    先把消息兜底判定的命中码取回来，再决定「原地重试」还是「切换 provider」。
     const decision = isSwitchable(config, failure?.code, failure?.message)
     if (decision.hit !== true) {
       // 记录「为什么不切换」，避免设置页/日志只看到沉默；不改变宿主原有失败路径。
@@ -1582,6 +2280,10 @@ export function apply(ctx, rawConfig) {
         reason: decision.reason ?? '',
         code: typeof failure?.code === 'string' ? failure.code : '',
         message: String(failure?.message ?? '').slice(0, 200),
+        // 即便不切换，也要能看出细分原因：例如「上下文超限」与「额度不足」都可能落到
+        // 这里，而两者的下一步动作完全不同。
+        reasonId: reason.id,
+        reasonLabel: reason.label,
         turn,
         step,
       })
@@ -1636,6 +2338,13 @@ export function apply(ctx, rawConfig) {
     if (now - (state.lastSwitchAt.get(sessionKey) ?? 0) < config.minSwitchIntervalMs) return next()
     if (record.switches >= config.maxSwitchesPerTurn) return next()
 
+    // ⓪ 按类别决定「先原地重试」还是「直接切换」：
+    //    额度/凭据类 attempts=0 → 立即切换；TRANSPORT/RATE_LIMIT/SERVER → 等 delayMs 重试，
+    //    次数或预算用尽才落到下面的 key 轮换与 provider 切换。
+    //    放在凭据轮换之前：凭据类失败优先换 key（同路由同模型），一类失败只吃一层策略。
+    const retried = await transientRetryGate(payload, failure, record, sessionId, turn, step, failedRoute, effectiveCode)
+    if (retried !== undefined) return retried
+
     const failedLoc = failedRoute.length > 0 ? locateRoute(config, failedRoute) : undefined
     const failedEntry = failedLoc?.entry
     const activeRef = failedRoute.length > 0 ? activeRefOf(failedRoute) : undefined
@@ -1643,7 +2352,7 @@ export function apply(ctx, rawConfig) {
 
     // ① 凭据类失败：先在该条目内换 key（同路由、同模型，只改 apiKeyEnv 引用）。
     //    只有归一化到凭据类编码才走这里；消息模式兜底命中的失败按非凭据类处理。
-    if (failedEntry !== undefined && hasRotation(failedEntry) && KEY_ROTATION_CODES.has(code)) {
+    if (failedEntry !== undefined && hasRotation(failedEntry) && (KEY_ROTATION_CODES.has(code) || KEY_ROTATION_CODES.has(effectiveCode))) {
       const rotatedTo = await rotateKey(failedEntry, failedRoute, activeRef, code, now, failure?.message)
       if (rotatedTo !== undefined) {
         record.target = { entry: failedEntry, tier: failedLoc.tier, reason: 'key:' + code }
@@ -1662,6 +2371,28 @@ export function apply(ctx, rawConfig) {
           turn,
           step,
         })
+        // 换 key 是「凭据/授权」类失败的第一处置，必须在会话里可见并说明原因：
+        // 余额不足换 key 可能有效（另一把 key 挂在有钱的账户上），模型未授权换 key
+        // 也可能有效（另一把 token 有该模型权限）——所以两者都先换 key，但用户要知道
+        // 到底是哪一种，才能判断「换 key 会不会有用」。
+        pushNotice({
+          at: now,
+          session: sessionId,
+          kind: 'failover',
+          stage: 'selected',
+          code,
+          trigger: 'key-rotate:' + String(activeRef ?? '(unset)') + ' -> ' + rotatedTo,
+          fromRoute: failedRoute,
+          fromModel: typeof payload?.model === 'string' ? payload.model : '',
+          toRoute: failedRoute,
+          toModel: failedEntry.model,
+          tier: failedLoc.tier.tier,
+          turn,
+          step,
+          reasonId: reason.id,
+          reasonLabel: reason.label,
+          detail: failure?.message,
+        })
         console.warn('[dsh-provider-failover] key rotate ' + failedEntry.id + '@' + failedRoute + ' ' + String(activeRef ?? '(unset)') + ' -> ' + rotatedTo + ' (' + decision.how + ', turn ' + String(turn) + ' step ' + String(step) + ')')
         return { kind: 'retry' }
       }
@@ -1671,7 +2402,7 @@ export function apply(ctx, rawConfig) {
     // ② provider 切换：失败路由进入冷却，本步不再尝试它。
     if (failedRoute.length > 0) {
       state.routeHealth.set(failedRoute, {
-        coolingUntil: now + (failedEntry?.cooldownMs ?? 60000),
+        coolingUntil: now + cooldownMsFor(config.cooldownByCode, failedEntry?.cooldownMs, code, decision.how, config.failurePatterns),
         code: typeof failure?.code === 'string' ? failure.code : '',
         message: String(failure?.message ?? '').slice(0, 200),
         at: now,
@@ -1680,11 +2411,26 @@ export function apply(ctx, rawConfig) {
 
     const context = String(failure?.code ?? '') + ' ' + String(failure?.message ?? '') + (record.needs.tools ? ' tools' : '') + (record.needs.images ? ' images' : '')
     const picked = await pickCandidate(sessionId, turn, step, context, payload?.signal, failedRoute)
-    if (picked === undefined) return next()
+    if (picked === undefined) {
+      // 没有可用候选也是决策，必须留痕：否则“什么都没发生”在证据里和“没触发”无法区分。
+      pushIgnored({
+        at: Date.now(),
+        session: sessionKey === '-' ? '' : sessionKey,
+        provider: failedRoute,
+        category: 'no-candidate',
+        reason: '可切换失败已确认，但档位表中没有可用候选（已尝试/冷却中/能力不兼容/不可解析）。',
+        code: typeof failure?.code === 'string' ? failure.code : '',
+        message: String(failure?.message ?? '').slice(0, 200),
+        turn,
+        step,
+      })
+      return next()
+    }
 
     record.target = { entry: picked.entry, tier: picked.tier, reason: decision.how }
     record.switches += 1
     state.lastSwitchAt.set(sessionKey, now)
+    noteRouted(sessionId, picked.entry.route, picked.entry.model)
     pushLog({
       at: now,
       kind: 'failover',
@@ -1695,6 +2441,28 @@ export function apply(ctx, rawConfig) {
       trigger: decision.how,
       turn,
       step,
+    })
+    // 通知里写实际会下发的推理层级：agent/request 侧同样经 reconcileEffort 解析，
+    // 这里解析一次避免面板显示与真实请求不一致。
+    const noticeEffort = await reconcileEffort(picked.entry, undefined, payload?.signal)
+    pushNotice({
+      at: now,
+      session: sessionId,
+      kind: 'failover',
+      stage: 'selected',
+      code: typeof failure?.code === 'string' ? failure.code : '',
+      trigger: decision.how,
+      fromRoute: failedRoute,
+      fromModel: typeof payload?.model === 'string' ? payload.model : '',
+      toRoute: picked.entry.route,
+      toModel: picked.entry.model,
+      tier: picked.tier.tier,
+      reasoningEffort: noticeEffort,
+      turn,
+      step,
+      reasonId: reason.id,
+      reasonLabel: reason.label,
+      detail: failure?.message,
     })
     console.warn('[dsh-provider-failover] switch ' + (failedRoute.length > 0 ? failedRoute : '(unknown)') + ' -> ' + picked.entry.route + '/' + picked.entry.model + ' tier ' + String(picked.tier.tier) + ' (' + decision.how + ', turn ' + String(turn) + ' step ' + String(step) + ')')
     return { kind: 'retry' }
@@ -1778,6 +2546,7 @@ export function apply(ctx, rawConfig) {
         maxSwitchesPerTurn: config.maxSwitchesPerTurn,
         startupPreferTier: config.startup.preferTier,
         rankingMode: config.ranking.mode,
+        sameTierFirst: config.ranking.sameTierFirst === true,
         keyResetAt: config.keyResetAt,
         keysByEntry: {},
       },
@@ -1791,6 +2560,7 @@ export function apply(ctx, rawConfig) {
       if (parseClock(value.keyResetAt) !== undefined) config.keyResetAt = value.keyResetAt
       else console.warn('[dsh-provider-failover] ignoring invalid keyResetAt (expected HH:MM): ' + String(value.keyResetAt))
       state.keysByEntry = isPlainObject(value.keysByEntry) ? value.keysByEntry : {}
+      state.retryPolicies = config.retryPolicies ?? DEFAULT_CONFIG.retryPolicies
       const keySummary = config.tiers.map((tier) => tier.entries.map((entry) => entry.id + ':' + String(effectiveKeys(entry).length)).join(',')).join(' | ')
       console.log('[dsh-provider-failover] settings ' + source + ': enabled=' + String(config.enabled) + ' minSwitchIntervalMs=' + String(config.minSwitchIntervalMs) + ' maxSwitchesPerTurn=' + String(config.maxSwitchesPerTurn) + ' startup.preferTier=' + String(config.startup.preferTier) + ' ranking=' + config.ranking.mode + ' keyResetAt=' + config.keyResetAt + ' keys=' + keySummary)
       ensureKeyResetTimer()
@@ -1898,12 +2668,17 @@ export function apply(ctx, rawConfig) {
         enabled: config.enabled,
         policyMode: config.policyMode,
         maxPolicyRetriesPerStep: config.maxPolicyRetriesPerStep,
+        /** 当前生效的按类别重试策略（切换 provider 之前的原地重试） */
+        retryPolicies: config.retryPolicies,
+        /** 同族互备优先开关 */
+        sameTierFirst: config.ranking.sameTierFirst === true,
         editable: {
           enabled: config.enabled,
           minSwitchIntervalMs: config.minSwitchIntervalMs,
           maxSwitchesPerTurn: config.maxSwitchesPerTurn,
           startupPreferTier: config.startup.preferTier,
           rankingMode: config.ranking.mode,
+          sameTierFirst: config.ranking.sameTierFirst === true,
           keyResetAt: config.keyResetAt,
           keysByEntry: state.keysByEntry,
         },
@@ -1921,6 +2696,8 @@ export function apply(ctx, rawConfig) {
           missing: [...assigned].filter((route) => registeredIds.has(route) !== true),
         } : null,
         switches: state.switchLog.slice(0, LOG_LIMIT),
+      /** 会话可见通知：每会话条数（完整内容走 GET /provider-failover/notices） */
+      notices: [...state.notices.entries()].map(([session, list]) => ({ session, count: list.length })),
         ignored: state.ignoredLog.slice(0, LOG_LIMIT),
         lastProbe: state.lastProbe,
         probeTimeoutMs: PROBE_TIMEOUT_MS,
@@ -2000,6 +2777,7 @@ export function apply(ctx, rawConfig) {
           maxSwitchesPerTurn: config.maxSwitchesPerTurn,
           startupPreferTier: config.startup.preferTier,
           rankingMode: config.ranking.mode,
+          sameTierFirst: config.ranking.sameTierFirst === true,
           keyResetAt: config.keyResetAt,
           keysByEntry: state.keysByEntry,
           ...patch,
@@ -2046,6 +2824,31 @@ export function apply(ctx, rawConfig) {
       })
       sendJson(res, report.ok === true ? 200 : 400, report)
     })
+    /**
+     * 会话内可见的转移通知：{sessionId?, limit?, after?}。
+     * 缺 sessionId 时用最近一次活跃会话。返回 {ok, sessionId, notices, latest, count}。
+     * 只读、同源限定；通知本身不进入会话 surface，也不进入模型上下文。
+     */
+    register(ROUTE_BASE + '/notices', async (req, res) => {
+      if (isLocalRequest(req) !== true) return sendJson(res, 403, { ok: false, error: 'local requests only' })
+      const url = new URL(String(req.url ?? '/'), 'http://127.0.0.1')
+      const wanted = url.searchParams.get('sessionId')
+      const sessionId = wanted !== null && wanted.length > 0
+        ? wanted
+        : state.lastSessionId !== undefined ? String(state.lastSessionId.id) : undefined
+      if (sessionId === undefined) return sendJson(res, 200, { ok: true, sessionId: null, notices: [], latest: null, count: 0 })
+      const limitRaw = Number.parseInt(String(url.searchParams.get('limit') ?? ''), 10)
+      const after = url.searchParams.get('after') ?? undefined
+      const all = noticesOf(sessionId, undefined, undefined)
+      const notices = noticesOf(sessionId, Number.isFinite(limitRaw) ? limitRaw : 20, after === undefined ? undefined : String(after))
+      return sendJson(res, 200, {
+        ok: true,
+        sessionId: String(sessionKeyOf(sessionId)),
+        notices,
+        latest: all.length > 0 ? all[0] : null,
+        count: all.length,
+      })
+    })
   })
 
   const configured = config.tiers.map((tier) => String(tier.tier) + (tier.enabled ? '' : '(off)') + ':' + tier.entries.map((entry) => entry.id).join(',')).join(' | ')
@@ -2066,4 +2869,4 @@ export function normalize(raw) {
 export { masked }
 
 /** 内部纯函数，供冒烟测试断言（不属于对外契约）。 */
-export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef, resolveTestTarget, unsupportedReasoningEffort, classifyProbeFailure }
+export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef, resolveTestTarget, unsupportedReasoningEffort, classifyProbeFailure, cooldownMsFor, patternCodeFor, effectiveFailureCode, failureReasonFor, mergeFailureReasons, DEFAULT_FAILURE_REASONS }

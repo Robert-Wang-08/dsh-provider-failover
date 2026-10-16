@@ -17,13 +17,25 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 
 默认集合：`QUOTA`、`AUTH`、`INVALID_CREDENTIAL`、`MISSING_CREDENTIAL`、`NO_ADAPTER`、`SERVER`、`RATE_LIMIT`、`TRANSPORT`。
 
-另有**消息模式兜底**（编码未归一化时按文本匹配）：`insufficient balance`、`insufficient_quota`、`quota exceeded`、`usage limit`、`usage_limit`、`balance`、`overloaded`、`invalid api key`、`token limit`、`rate limit`、`websocket closed`。
+另有**消息模式兜底**（编码未归一化时按文本匹配）：`insufficient balance`、`insufficient_quota`、`quota exceeded`、`usage limit`、`usage_limit`、`balance`、`overloaded`、`invalid api key`、`token limit`、`rate limit`、`websocket closed`、`websocket error`、`websocket`、`http2`、`upstream_`。
+
+> 兜底的意义：宿主 `classifyPiAiError` **只看错误文案、不看错误对象与 HTTP 状态码**，认不出来就统一返回 `PI_AI_ERROR`；而宿主默认重试码表（`dsh-llm` 的 `retryableCodes`）只含 `EMPTY_RESPONSE`/`RATE_LIMIT`/`SERVER`/`TIMEOUT`/`TRANSPORT`，**不含 `PI_AI_ERROR`**。所以凡落成 `PI_AI_ERROR` 的失败，宿主既不重试也不切换，唯一恢复路径就是本节这张模式表——漏一条就等于该故障"整轮直接失败"。
+
+同一套兜底也用于**三处展示/判定**，避免同一个错误在不同界面结论不一致：
+切换与冷却分类（`patternCodeFor` → `QUOTA`/`TRANSPORT`/…）、全量测试状态标签（`/failover-probe` 与设置页的「全量测试」按钮，不再把未归一化失败一律显示成「未知错误」）、以及按类别重试策略的取类（例如裸 `WebSocket error` 现在正确落到 `TRANSPORT` 的 5 次原地重试，而不是 `DEFAULT` 的 1 次）。
+
+**生效码折算只有一个入口：`effectiveFailureCode(code, message, patterns)`。** 归一化码优先；宿主未归一化时（空码 / `PI_AI_ERROR`）依次做消息模式兜底、HTTP 状态码兜底，都认不出来才返回原码。切换/重试判定（`agent/request-error`）、`isSwitchable`、全量测试展示**全部调用它**——这是刻意的：`PI_AI_ERROR` 不在宿主默认重试码表里，展示与判定一旦分叉，设置页显示的状态就没有意义（会出现「说会切换、实际不动」）。命中方式在通知里可区分：`effective:<CODE>`（折算后落在终止码集合）、`pattern:<模式>`（表外模式，无登记类别时才走到）、`code:<CODE>`（宿主已归一化）。
+
+全量测试还会对**带 HTTP 状态码字样**的未归一化失败兜底：`codex-relay API error (502): 502 status code (no body)` 这类空体 5xx 显示为「服务端/网络异常」而不是「未知错误」。只认已知的 HTTP 错误码表（400/401/402/403/404/408/409/413/422/429/5xx/529），因此 `connect ETIMEDOUT 10.0.0.5:443` 里的 `443` 不会被当成状态码；状态码 → 类别只映射**本插件可切换**的三种（5xx→`SERVER`、401/403→`AUTH`、429→`RATE_LIMIT`），400/404/413/422 等仍保持「请求无效、不切换」。
 
 其中 `usage limit` / `usage_limit` 覆盖 Codex OAuth 常见额度耗尽文案 `The usage limit has been reached` 与 `usage_limit_reached`。部分宿主版本会把前者归成通用 `PI_AI_ERROR`，插件必须依靠消息模式兜底，不能只看 `QUOTA` 编码。
 
 `websocket closed` 覆盖上游 WebSocket/SSE 中途断开（如 `WebSocket closed 1000`）：宿主 `classifyPiAiError` 只把 `WebSocket closed unexpectedly` 归一化为 `TRANSPORT`，仅带关闭码的文案会落到通用 `PI_AI_ERROR`，须靠消息模式兜底才能触发切换。传输层失败按**非凭据类**处理，直接走 provider 切换（换 key 治不了连接断开）。
 
-> ⚠️ **这两个键是「整体替换」，不是「追加」。** `terminalCodes` / `failurePatterns` 只要非空，就会**完全替换**上表的默认集合（`index.js` 的 `normalizeConfig`：`strings(input.terminalCodes).length > 0 ? strings(input.terminalCodes) : DEFAULT_TERMINAL_CODES`）。因此在 profile 里一旦列出它们却漏掉 `TRANSPORT` 或 `websocket closed`，传输层故障转移会被**静默关闭**：上游 WebSocket/SSE 中途断开时不切换，宿主日志里也不会出现 `switch` 行——看起来像「插件失效」，实际是配置把触发条件删掉了。
+`http2` / `upstream_` 覆盖网关把上游连接层故障改写成自定义码的情形（实测 2026-10-15：codex-relay 的上游 chatgpt.com Codex 后端 HTTP/2 流被对端复位，relay 以 SSE `error` 事件下发 `{"code":"upstream_http2_stream_error","message":"Upstream HTTP/2 stream failed"}`，pi-ai 拼成 `Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed` 抛出）。该文案既无 5xx 数字也无 `network/socket/connection` 词，宿主两条规则都不命中 → `PI_AI_ERROR` → 修复前**既不重试也不切换**（实测 `isSwitchable` 返回 `hit:false`）。现在折算成 `TRANSPORT`（通知里记 `effective:TRANSPORT`），可吃到「原地重试 5 次 × 5s、预算 30s、观测窗口 30s」，预算耗尽再切换 provider；全量测试里同样显示为「传输中断」。同一条修复也覆盖**任何**留在 `PI_AI_ERROR` 里的 HTTP 失败：空体 502 现在折算 `SERVER`（`effective:SERVER`）并真的触发重试/切换，而不只是状态页好看。
+刻意**没有**采用宽泛的 `stream failed`：应用语义的 `stream failed to produce output` 会被误伤（实测仍为「未知错误、不切换」）；`upstream_*` 前缀码已覆盖网关层改写，其余上游文案（`*_timeout`、`*_connection_*`）由 `timeout`/`network`/`connection` 类关键词或 `http2` 承接。
+
+> ⚠️ **这两个键是「整体替换」，不是「追加」。** `terminalCodes` / `failurePatterns` 只要非空，就会**完全替换**上表的默认集合（`index.js` 的 `normalizeConfig`：`strings(input.terminalCodes).length > 0 ? strings(input.terminalCodes) : DEFAULT_TERMINAL_CODES`）。因此在 profile 里一旦列出它们却漏掉 `TRANSPORT`、`SERVER` 或 `websocket closed` / `http2` / `upstream_`，对应故障转移会被**静默关闭**：上游 WebSocket/SSE 中途断开、网关 `upstream_*` 流错误、留在 `PI_AI_ERROR` 里的空体 5xx 都不切换，宿主日志里也不会出现 `switch` 行——看起来像「插件失效」，实际是配置把触发条件删掉了。
 >
 > **推荐根本不要写这两个键**，直接用默认表（上表即为默认表）。确需自定义时，请以上表为基线**逐项追加**，不要凭记忆重写。
 
@@ -77,9 +89,9 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
           - { id: fallback, route: my-provider-2, model: my-model-2, cooldownMs: 60000 }
 ```
 
-交互式本机配置：使用 `ptc-route-setup` skill 探测 provider/子代理并询问人工偏好。它将无凭据的候选链写入 `$DSH_HOME/plugins/provider-failover/route-config.json`。插件启动时读取该文件，覆盖 `tiers` 和切换上限/错误类别；现有 `settings.json`、profile patch 和凭据文件保持独立。该本机文件不应提交或同步；首次生成后需重启 DSH。
+交互式本机配置：使用 `ptc-route-setup` skill 探测 provider/子代理并询问人工偏好。它将无凭据的候选链写入 `$DSH_HOME/plugins/provider-failover/route-config.json`。插件启动时读取该文件，覆盖 `tiers`、切换上限/错误类别和按类冷却策略；现有 `settings.json`、profile patch 和凭据文件保持独立。该本机文件不应提交或同步；首次生成后需重启 DSH。
 
-字段：顶层 `enabled` / `policyMode` / `policyFailover`（兼容旧字段）/ `maxPolicyRetriesPerStep` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
+字段：顶层 `enabled` / `policyMode` / `policyFailover`（兼容旧字段）/ `maxPolicyRetriesPerStep` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `cooldownByCode`（按错误码覆盖冷却毫秒，如 `{"QUOTA": 18000000}` 把额度耗尽的冷却拉到 5 小时；usage limit / quota 等消息模式兜底也归 QUOTA，未命中退回条目 `cooldownMs`）/ `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
 
 ### 按模型族对齐档位（推荐）
 

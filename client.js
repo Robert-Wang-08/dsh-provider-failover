@@ -55,6 +55,11 @@ window.__ModuleLoader__.load({
       ".pf-err{color:var(--dsw-alias-state-error-primary)}",
       ".pf-mono{font-family:var(--dsw-font-mono,monospace);font-size:12px}",
       ".pf-list{margin:0;padding-left:18px}",
+      ".pf-dock{display:flex;flex-direction:column;gap:4px;margin:0 0 6px;padding:6px 10px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);border-radius:8px;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-primary)}",
+      ".pf-dock-head{display:flex;align-items:center;gap:8px;cursor:pointer}",
+      ".pf-dock-title{font-weight:600}",
+      ".pf-dock-body{margin:0;padding-left:18px;max-height:180px;overflow:auto}",
+      ".pf-dock-more{color:var(--dsw-alias-label-secondary);cursor:pointer;text-decoration:underline}",
     ].join("");
 
     async function apiFetch(url, options, timeoutMs) {
@@ -73,6 +78,10 @@ window.__ModuleLoader__.load({
     }
 
     const getStatus = () => apiFetch(ROUTE + "/status");
+
+    /** 会话内可见的转移通知：原因 + 结果 + 时间；不进入模型上下文。 */
+    const getNotices = (sessionId, limit) =>
+      apiFetch(ROUTE + "/notices?sessionId=" + encodeURIComponent(String(sessionId)) + "&limit=" + String(limit === undefined ? 20 : limit));
     const saveConfig = (patch) =>
       apiFetch(ROUTE + "/config", {
         method: "POST",
@@ -121,7 +130,12 @@ window.__ModuleLoader__.load({
     function describeIgnored(item) {
       const when = item.at === undefined ? "" : new Date(item.at).toLocaleTimeString();
       const where = String(item.provider) + " · turn " + String(item.turn) + "/step " + String(item.step);
-      const code = item.code === undefined || String(item.code).length === 0 ? "" : " · " + String(item.code);
+      // 未切换的记录同样要能读出细分原因（「额度不足」与「上下文超限」的下一步完全不同）。
+      const reasonLabel = item.reasonLabel === undefined || item.reasonLabel === null ? "" : String(item.reasonLabel);
+      const codeRaw = item.code === undefined || String(item.code).length === 0 ? "" : String(item.code);
+      const code = reasonLabel !== ""
+        ? " · " + reasonLabel + (codeRaw === "" || codeRaw === reasonLabel ? "" : "（" + codeRaw + "）")
+        : codeRaw === "" ? "" : " · " + codeRaw;
       const why = item.reason !== undefined && String(item.reason).length > 0 ? String(item.reason) : String(item.message === undefined ? "" : item.message);
       return "[" + ignoredLabel(item.category) + "] " + where + code + " · " + why + "（" + when + "）";
     }
@@ -496,6 +510,96 @@ window.__ModuleLoader__.load({
             : h("div", { className: "pf-hint" }, "冷却中：" + status.cooling.map((item) => item.route + "(" + item.code + ")").join(", "))));
     }
 
+    /** 把一条通知写成人话：谁失败、为什么（细分原因）、切到哪、什么时候。 */
+    function describeNotice(item) {
+      if (item === null || item === undefined) return "";
+      const when = new Date(item.at).toLocaleTimeString();
+      const head = item.kind === "retry"
+        ? "原地重试"
+        : item.kind === "manual-switch"
+          ? (String(item.code) === "TEST" ? "测试切换" : "手动切换")
+          : item.stage === "startup-align" ? "启动对齐" : "故障转移";
+      // 归一化码（AUTH/QUOTA）粒度不够：同一个 AUTH 下「余额不足」与「该令牌无权使用该模型」
+      // 的处置完全不同。优先展示细分原因，没有细分时退回错误码，最后才写「未知原因」。
+      const reasonLabel = item.reasonLabel === undefined || item.reasonLabel === null || String(item.reasonLabel) === ""
+        ? ""
+        : String(item.reasonLabel);
+      const codeText = item.code === undefined || String(item.code) === "" ? "" : String(item.code);
+      const reason = String(item.code) === "MANUAL"
+        ? "模型选择器/外部入口变更"
+        : String(item.code) === "TEST"
+          ? "来自 " + String(item.trigger)
+          : reasonLabel !== ""
+            ? (codeText === "" ? reasonLabel : reasonLabel + "（" + codeText + "）")
+            : codeText !== "" ? codeText : "未知原因";
+      const from = String(item.fromRoute) + (item.fromModel === undefined || item.fromModel === "" ? "" : "/" + String(item.fromModel));
+      const to = String(item.toRoute) + (item.toModel === undefined || item.toModel === "" ? "" : "/" + String(item.toModel));
+      const tier = typeof item.tier === "number" && item.tier > 0 ? "（档 " + String(item.tier) + "）" : "";
+      const effort = item.reasoningEffort === undefined || item.reasoningEffort === null ? "" : " · effort " + String(item.reasoningEffort);
+      const where = " · turn " + String(item.turn) + " step " + String(item.step);
+      // 上游原文：让用户能自查（余额不足会直接读出「用户剩余额度: ¥1.04」）。
+      // 服务端已做密钥形状抹除与截断，这里只负责显示形状。
+      const detail = item.detail === undefined || item.detail === null || String(item.detail) === ""
+        ? ""
+        : " · " + String(item.detail);
+      return when + " " + head + " · " + reason + " · " + from + " → " + to + tier + effort + where + detail;
+    }
+
+    /**
+     * 会话输入区上方的故障转移通知条（conversation.input.dock，session 作用域）。
+     *
+     * 数据来自插件自助的按会话通知接口（GET /provider-failover/notices），
+     * 因此切换原因与结果在会话里可见，又不写入 Session surface、不进模型上下文。
+     */
+    function FailoverNoticeDock(props) {
+      const sessionId = props === undefined || props === null ? undefined : props.sessionId;
+      const [notices, setNotices] = react.useState([]);
+      const [open, setOpen] = react.useState(false);
+      const [failed, setFailed] = react.useState(false);
+
+      react.useEffect(() => {
+        if (sessionId === undefined || sessionId === null) return undefined;
+        let alive = true;
+        const tick = async () => {
+          try {
+            const data = await getNotices(sessionId, 20);
+            if (alive !== true) return;
+            setNotices(Array.isArray(data.notices) ? data.notices : []);
+            setFailed(false);
+          } catch (error) {
+            if (alive === true) setFailed(true);
+          }
+        };
+        tick();
+        const timer = setInterval(tick, 4000);
+        return () => {
+          alive = false;
+          clearInterval(timer);
+        };
+      }, [sessionId]);
+
+      if (sessionId === undefined || sessionId === null) return null;
+      if (failed === true) return null;
+      if (notices.length === 0) return null;
+      const latest = notices[0];
+      return h(
+        "div",
+        { className: "pf-dock" },
+        h(
+          "div",
+          { className: "pf-dock-head", onClick: () => setOpen(!open) },
+          h("span", { className: "pf-dock-title" }, "故障转移通知"),
+          h("span", { className: "pf-mono" }, describeNotice(latest)),
+          notices.length > 1
+            ? h("span", { className: "pf-dock-more" }, open ? "收起" : "展开 " + String(notices.length) + " 条")
+            : null,
+        ),
+        open === true
+          ? h("ul", { className: "pf-dock-body pf-mono" }, notices.map((item, index) => h("li", { key: index }, describeNotice(item))))
+          : null,
+      );
+    }
+
     const inject = ["slots"];
 
     function apply(ctx) {
@@ -512,6 +616,17 @@ window.__ModuleLoader__.load({
       ctx.slots.inject("settings.section", () => ctx.slots.register(
         { name: "settings.section", id: "provider-failover", order: 12, label: "Provider 故障转移" },
         () => react.createElement(ProviderFailoverPanel, null),
+      ));
+
+      // 会话内可见：把该会话的切换原因与结果显示在输入区上方（session 作用域插槽）。
+      ctx.slots.inject("conversation.input.dock", () => ctx.slots.register(
+        {
+          name: "conversation.input.dock",
+          id: "provider-failover-notices",
+          order: 30,
+          inject: (sessionId) => ({ sessionId: sessionId }),
+        },
+        FailoverNoticeDock,
       ));
     }
 
