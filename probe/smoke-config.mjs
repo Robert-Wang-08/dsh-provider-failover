@@ -744,6 +744,27 @@ for (const dispose of envReason.disposers) dispose()
 for (const dispose of envPerm.disposers) dispose()
 for (const dispose of envSecret.disposers) dispose()
 
+console.log('按类别重试策略（SERVER = 上游 5xx / 空体 502）:')
+// 空体 502 由 effectiveFailureCode 折算成 SERVER，所以 SERVER 这一档就是 502 的实际重试档。
+// 2026-10-16 实测把该档从 3s×2（15s 预算）提到 5s×5（30s 预算）：codex-relay 连续三次返回
+// 空体 502，旧档 36s 内就交出了路由，接棒的 openai-codex / kimi 又分别额度耗尽，tier1 全灭。
+check('默认 SERVER 档 = 5 次 × 5s、预算 30s', JSON.stringify(defaults.retryPolicies.SERVER) === JSON.stringify({ attempts: 5, delayMs: 5000, budgetMs: 30000 }), JSON.stringify(defaults.retryPolicies.SERVER))
+check('SERVER 档的全部重试都落在预算内（attempts × delayMs <= budgetMs）', defaults.retryPolicies.SERVER.attempts * defaults.retryPolicies.SERVER.delayMs <= defaults.retryPolicies.SERVER.budgetMs, JSON.stringify(defaults.retryPolicies.SERVER))
+check('SERVER 档按类别可被配置覆盖（不整体挤掉其它类）', normalize({ retryPolicies: { SERVER: { attempts: 4, delayMs: 2000, budgetMs: 9000 } } }).value.retryPolicies.SERVER.attempts === 4 && normalize({ retryPolicies: { SERVER: { attempts: 4, delayMs: 2000, budgetMs: 9000 } } }).value.retryPolicies.TRANSPORT.attempts === defaults.retryPolicies.TRANSPORT.attempts)
+// 用极小的 delayMs 驱动同一条闸门，避免回归里真的等 25s。
+const RETRY_TIERS = [
+  { tier: 1, enabled: true, entries: [{ id: 'relay', route: 'r1', model: 'm1', enabled: true }, { id: 'kimi', route: 'r2', model: 'm2', enabled: true }] },
+]
+const envRetry = makeSwitchEnv(undefined, { startup: { preferTier: 1 }, tiers: RETRY_TIERS, retryPolicies: { SERVER: { attempts: 3, delayMs: 1, budgetMs: 100 } } })
+const retryAgent = { session: { id: 'sess-retry', requestHeader: () => undefined } }
+const retryFailure = { code: 'PI_AI_ERROR', message: 'codex-relay API error (502): 502 status code (no body)' }
+for (let attempt = 0; attempt < 4; attempt += 1) await envRetry.handlers['agent/request-error']({ agent: retryAgent, provider: 'r1', turn: 1, step: 1, failure: retryFailure }, async () => 'NEXT')
+const retryNotices = (await readNotices(envRetry, 'sess-retry')).filter((n) => n.kind === 'retry')
+const retrySwitches = (await readNotices(envRetry, 'sess-retry')).filter((n) => n.kind === 'failover')
+check('空体 502 落到 SERVER 档原地重试，次数由 attempts 收口', retryNotices.length === 3 && retryNotices.every((n) => String(n.trigger).startsWith('retry:SERVER')), JSON.stringify(retryNotices.map((n) => n.trigger)))
+check('次数用尽后切换下一档，而不是无限原地重试', retrySwitches.length >= 1 && retrySwitches[0].toRoute === 'r2', JSON.stringify(retrySwitches.map((n) => n.toRoute)))
+for (const dispose of envRetry.disposers) dispose()
+
 check('真实设置文件未被探针触碰', existsSync(realSettingsFile) === realFileExisted, realSettingsFile)
 cleanupHomes()
 

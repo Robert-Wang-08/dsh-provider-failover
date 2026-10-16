@@ -338,14 +338,18 @@ const DEFAULT_CONFIG = {
    *               attempts 次或预算用尽才切换；observationWindowMs 内（连接活过该窗口
    *               才失败）按“意外中断”处理，活过窗口外则视为路由已不可用，直接切换。
    *   RATE_LIMIT  服务端限流——按 retryAfterMs 退避重试，预算用尽再切换。
-   *   SERVER      上游 5xx——短暂重试后仍失败则切换。
+   *   SERVER      上游 5xx（含空体 502）——按 delayMs 间隔原地重试，attempts 次或预算用尽
+   *               再切换。实测 2026-10-16：codex-relay 连续三次返回空体 502（单次请求约 15s），
+   *               旧策略 2 次重试 × 3s 退避在 36s 内就交出了路由；紧接着 openai-codex 报额度
+   *               用尽、kimi 报周额度 403，tier1 全线失败，子代理整轮失败。改为 5 次 × 5s
+   *               （30s 预算）给短时过载留出自愈窗口，预算耗尽才把故障交给下一档。
    *   QUOTA / AUTH / INVALID_CREDENTIAL / MISSING_CREDENTIAL / NO_ADAPTER
    *               额度与凭据类，重试无意义——立即切换（attempts=0）。
    */
   retryPolicies: {
     TRANSPORT: { attempts: 5, delayMs: 5000, budgetMs: 30000, observationWindowMs: 30000 },
     RATE_LIMIT: { attempts: 3, delayMs: 15000, budgetMs: 60000 },
-    SERVER: { attempts: 2, delayMs: 3000, budgetMs: 15000 },
+    SERVER: { attempts: 5, delayMs: 5000, budgetMs: 30000 },
     QUOTA: { attempts: 0 },
     AUTH: { attempts: 0 },
     INVALID_CREDENTIAL: { attempts: 0 },
@@ -1114,6 +1118,19 @@ function parseRanking(text, candidates) {
 export function apply(ctx, rawConfig) {
   const localConfig = readLocalRouteConfig()
   const effectiveRawConfig = localConfig === undefined ? rawConfig : { ...rawConfig, ...localConfig }
+  try {
+    // TEMP DIAGNOSTIC (remove after diagnosing sameTierFirst)
+    const fs = require$1 !== undefined ? undefined : undefined
+    writeFileSync(join(homedir(), '.dsh', 'failover-config-dump.json'), JSON.stringify({
+      at: new Date().toISOString(),
+      rawKeys: isPlainObject(rawConfig) ? Object.keys(rawConfig) : typeof rawConfig,
+      rawRanking: isPlainObject(rawConfig) ? rawConfig.ranking : undefined,
+      localRanking: isPlainObject(localConfig) ? localConfig.ranking : undefined,
+      effectiveRanking: isPlainObject(effectiveRawConfig) ? effectiveRawConfig.ranking : undefined,
+      effectiveHasRetryPolicies: isPlainObject(effectiveRawConfig) && effectiveRawConfig.retryPolicies !== undefined,
+      effectiveTierCount: isPlainObject(effectiveRawConfig) && Array.isArray(effectiveRawConfig.tiers) ? effectiveRawConfig.tiers.length : undefined,
+    }, null, 2) + '\n', 'utf8')
+  } catch (error) { /* diagnostic only */ }
   const { value: config, errors } = normalizeConfig(effectiveRawConfig)
   if (errors.length > 0) {
     // 校验失败：零介入，并把原因报到日志，便于诊断。

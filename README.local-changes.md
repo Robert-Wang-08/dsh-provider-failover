@@ -7,8 +7,18 @@
    经 `GET /provider-failover/notices` 取数，客户端在 `conversation.input.dock` 显示
    「原因 + 结果 + turn/step」。不写 Session surface、不进模型上下文。
 2. **按失败类别的重试策略**（`retryPolicies`）：TRANSPORT 5s×5（30s 预算）、RATE_LIMIT 15s×3、
-   SERVER 3s×2；QUOTA/AUTH/凭据类/NO_ADAPTER 立即切换；未列出的错误码一律立即切换。
+   **SERVER 5s×5（30s 预算）**；QUOTA/AUTH/凭据类/NO_ADAPTER 立即切换；未列出的错误码一律立即切换。
    并补齐 `websocket error` / `websocket` 消息兜底与其 TRANSPORT 归类。
+
+   SERVER 档于 2026-10-16 由 **3s×2（`budgetMs` 15s）改为 5s×5（`budgetMs` 30s）**。起因（实测）：
+   codex-relay 对同一个子代理请求连续三次返回空体 `502 status code (no body)`（单次请求约 15s），
+   旧档的 2 次重试 × 3s 退避在 36s 内就交出了路由；接棒的 openai-codex 报 `usage limit`、
+   kimi 报 403 周额度，tier1 三条全灭，子代理整轮失败且调用方看不到原因。新档给短时过载留
+   30s 自愈窗口，预算耗尽才升档/交回宿主。**空体 502 已由 `effectiveFailureCode()` 折算为
+   `SERVER`**（见上游 README「生效码」一节），因此这一档就是 502 的实际重试档。
+   覆盖方式：profile patch 里 `- id: dsh-deepseek-keypool` 的 `config.retryPolicies` 可按类别整体覆盖
+   （加载期校验 `budgetMs >= delayMs`，否则拒绝加载）；本机没有覆盖，用的是这里的默认值。
+   回归：`node probe/smoke-config.mjs`（期望 `FAILURES: 0`）。
 3. **`ranking.sameTierFirst`**（默认 false）：打开后失败先在**同档内**互备，整档耗尽才升档。
 4. **失败原因细分（`AUTH` 不再是一句空话）**：通知与设置页除错误码外，再显示**具体原因**
    （额度/余额不足、权限不足：该令牌无权使用该模型、凭据无效、凭据缺失、被限流）与
