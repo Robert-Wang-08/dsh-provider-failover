@@ -224,9 +224,21 @@ dsh plugin --profile <profile> remove dsh-deepseek-keypool
 
 安装后需重启 `dsh web` 生效；**客户端半（`client.js`）的改动同样必须重启后才生效**（`/plugins/??dsh-deepseek-keypool/client.js` 按内容哈希 `rev` 供包，旧 `rev` 直接 404）。`dsh web` 每次启动都会打印**带新 token 的地址**（`http://127.0.0.1:3080/?token=…`），重启后旧标签页的 token 已失效——在 UI 上往往表现为「页面或某个插件小节空白」，所以**重启后必须用新打印的地址重开**。
 
-## 诊断
+## 上下文溢出与自动恢复（2026-10-16）
 
-宿主日志中可见：
+`pi-ai detected context overflow for model "..."` 是 pi-ai 对上游上下文超限的标准化文案，最终错误码为 `CONTEXT_WINDOW_EXCEEDED`。它不是 pi-ai 自己“接管了 DSH”，也不是 provider 凭据故障：换 key/provider 无法缩短当前会话历史，所以本插件默认把它记录为 `ignored/context`，不做错误切换。
+
+DSH `compaction-basic` 已支持 `CONTEXT_WINDOW_EXCEEDED -> 压缩 -> 同一步 retry`，但 `dsh 0.2.0-rc.2` 有一个宿主边界缺陷：pi-ai 可能在首个 stream chunk 之前抛出该错误，`dsh-agent-loop` 原先只在流已启动后派发 `agent/request-error`，导致 compaction 根本收不到事件，最终整轮失败。
+
+本机兼容补丁 `dsh-permission-compat/tools/apply-dsh-context-recovery-compat.mjs` 已安装到实际 DSH `0.2.0-rc.2`，标记为 `DSH_SUBMIT_CONTEXT_RECOVERY_COMPAT_V1`，并保留版本化备份。它只把“首个 chunk 前的失败”送入既有 `agent/request-error` waterfall，不修改消息、不伪造错误码、不切换上下文，也不终止当前 DSH；新实例加载后，现有 compaction 会自动压缩并重试。验证入口：
+
+```powershell
+node dsh-permission-compat/tools/apply-dsh-context-recovery-compat.mjs --verify
+```
+
+“已达到输出 token 上限，回答被截断”是正常的 `max-tokens` 结束态，不等于上下文溢出或 provider 故障。当前版本不对它无限自动续写，以免重复执行工具或在无边界任务上循环；需要续作时应由用户发送“继续”，或后续单独实现有上限、可观测的 continuation policy。
+
+
 
 - `[dsh-provider-failover] ready: …` 启动时的档位/条目摘要与 `startup.preferTier`、`ranking` 模式；
 - `switch <from> -> <to> tier N (<trigger>)` 每次实际转移（trigger 为 `code:XXX` 或 `pattern:xxx`）；
