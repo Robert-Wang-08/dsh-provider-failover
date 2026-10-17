@@ -230,10 +230,10 @@ dsh plugin --profile <profile> remove dsh-deepseek-keypool
 
 DSH `compaction-basic` 已支持 `CONTEXT_WINDOW_EXCEEDED -> 压缩 -> 同一步 retry`，但 `dsh 0.2.0-rc.2` 有一个宿主边界缺陷：pi-ai 可能在首个 stream chunk 之前抛出该错误，`dsh-agent-loop` 原先只在流已启动后派发 `agent/request-error`，导致 compaction 根本收不到事件，最终整轮失败。
 
-本机兼容补丁 `dsh-permission-compat/tools/apply-dsh-context-recovery-compat.mjs` 已安装到实际 DSH `0.2.0-rc.2`，标记为 `DSH_SUBMIT_CONTEXT_RECOVERY_COMPAT_V1`，并保留版本化备份。它只把“首个 chunk 前的失败”送入既有 `agent/request-error` waterfall，不修改消息、不伪造错误码、不切换上下文，也不终止当前 DSH；新实例加载后，现有 compaction 会自动压缩并重试。验证入口：
+本机兼容补丁 `D:\src\dsh\dsh-permission-compat\tools\apply-dsh-context-recovery-compat.mjs` 已安装到实际 DSH `0.2.0-rc.2`，标记为 `DSH_SUBMIT_CONTEXT_RECOVERY_COMPAT_V1`，并保留版本化备份。它只把“首个 chunk 前的失败”送入既有 `agent/request-error` waterfall，不修改消息、不伪造错误码、不切换上下文，也不终止当前 DSH；新实例加载后，现有 compaction 会自动压缩并重试。验证入口：
 
 ```powershell
-node dsh-permission-compat/tools/apply-dsh-context-recovery-compat.mjs --verify
+node D:\src\dsh\dsh-permission-compat\tools\apply-dsh-context-recovery-compat.mjs --verify
 ```
 
 “已达到输出 token 上限，回答被截断”是正常的 `max-tokens` 结束态，不等于上下文溢出或 provider 故障。当前版本不对它无限自动续写，以免重复执行工具或在无边界任务上循环；需要续作时应由用户发送“继续”，或后续单独实现有上限、可观测的 continuation policy。
