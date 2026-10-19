@@ -46,3 +46,14 @@
    「失败原因细分（AUTH 类提示）」与「端到端：AUTH 类失败在通知里区分具体原因」两组断言。
 
 回归：`node probe/smoke-config.mjs`（期望 FAILURES: 0）。
+客户端半另有渲染回归：`node probe/client-dock.mjs`（期望 ALL PASSED）——用最小 React
+运行时真实渲染 `conversation.input.dock` 的通知条，覆盖「无通知隐形 / 有通知出标题与人话
+描述 / 多条可展开 / 取数失败不渲染半截 / 各 kind 不抛错」。它存在的理由：DSH 的 slot
+边界会吞掉渲染期异常，只做字符串检查区分不出「没数据」和「渲染崩了」。
+
+**已知缺口（2026-10-19 复核）**：`notices.jsonl` 只有 `appendFileSync`，插件内**没有**
+任何回放/读取路径，`noticesOf()` 只查内存表。因此 DSH 重启（或插件重新 apply）后，
+历史上的切换通知在页面上不再出现——而 `docs/provider-failover-notice.md` 写的是
+「落盘 … 因此环形缓冲轮转后仍可回看」。同理 `status.switches`（设置页「最近转移」）
+也是纯内存。要真正「可回看」，需要在 `/notices` 里补一段按 session 过滤、按 `noticeId`
+去重、只读文件尾部的回放。
