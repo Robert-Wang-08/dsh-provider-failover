@@ -45,7 +45,7 @@ const LOG_LIMIT = 10
  * 用户层的值落在插件自有文件 `$DSH_HOME/plugins/provider-failover/settings.json`
  * （0.2 起 dsh-settings 不再提供按插件命名空间 store，见 createFileSettingsScope），
  * 键集为 `enabled / minSwitchIntervalMs / maxSwitchesPerTurn / startupPreferTier /
- * rankingMode / keyResetAt / keysByEntry`；生效时机为写入后即时同步，无需重启。
+ * rankingMode / keyResetAt / keysByEntry / rankingModel`；生效时机为写入后即时同步，无需重启。
  * 字段合法性由 /config 端点与 normalize 校验，不再维护独立的 schema 定义。
  */
 
@@ -392,7 +392,7 @@ const DEFAULT_CONFIG = {
      * 打开后：失败路由能在档位表里定位时，先只在它**所落的那一档**内选候选，
      * 该档内确实选不到（全部已尝试/冷却中/能力不兼容/不可解析）才退回全档扫描。
      * 例：opencode-go 失败先切同档的 ais-2dsglm（同为 deepseek-v4.1-flash），
-     * 而不是直接升到第 1 档的 gpt-5.6-sol。
+     * 而不是直接升到第 1 档的 gpt-6.1-sol。
      */
     sameTierFirst: false,
   },
@@ -589,6 +589,26 @@ function positiveValue(value) {
 
 function optionalString(value) {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+}
+
+/** 当前排序配置对设置页暴露的单模型选择；空链返回 null。 */
+function rankingModelOf(ranking) {
+  if (!isPlainObject(ranking)) return null
+  const provider = optionalString(ranking.provider)
+  const model = optionalString(ranking.model)
+  if (provider !== undefined && model !== undefined) return { provider, model }
+  const first = Array.isArray(ranking.models) ? ranking.models[0] : undefined
+  if (isPlainObject(first)) {
+    const firstProvider = optionalString(first.provider)
+    const firstModel = optionalString(first.model)
+    if (firstProvider !== undefined && firstModel !== undefined) return { provider: firstProvider, model: firstModel }
+  }
+  return null
+}
+
+/** 仅复制排序配置，避免用户层覆盖污染 profile 基线。 */
+function cloneRanking(ranking) {
+  return JSON.parse(JSON.stringify(ranking))
 }
 
 /** 凭据引用名（POSIX 标识符）：`keys` 的每个元素都是它，而不是路由名，更不是密钥值。 */
@@ -1132,6 +1152,8 @@ export function apply(ctx, rawConfig) {
     }, null, 2) + '\n', 'utf8')
   } catch (error) { /* diagnostic only */ }
   const { value: config, errors } = normalizeConfig(effectiveRawConfig)
+  // rankingModel 是用户层单模型覆盖；null/未设置时恢复这份 profile 基线，保留原有 ranking.models 链。
+  const profileRanking = cloneRanking(config.ranking)
   if (errors.length > 0) {
     // 校验失败：零介入，并把原因报到日志，便于诊断。
     ctx.logger?.warn?.('dsh-provider-failover: configuration rejected, staying out of the way:\n  - ' + errors.join('\n  - '))
@@ -1678,6 +1700,45 @@ export function apply(ctx, rawConfig) {
   }
 
   const llm = () => ctx.get('llm') ?? undefined
+
+  const agentDefaultModel = () => {
+    if (typeof ctx.get !== 'function') return undefined
+    try {
+      return ctx.get('agentDefaultModel') ?? undefined
+    } catch (error) {
+      return undefined
+    }
+  }
+
+  function currentDefaultModel() {
+    const service = agentDefaultModel()
+    if (service === undefined || typeof service.currentSelection !== 'function' || typeof service.saveSelection !== 'function') return { available: false, value: null, error: '宿主 agentDefaultModel 服务未装载' }
+    try {
+      const current = service.currentSelection()
+      const provider = optionalString(current?.provider)
+      const model = optionalString(current?.model)
+      if (provider === undefined || model === undefined) return { available: false, value: null, error: '宿主默认模型选择不完整' }
+      return { available: true, value: { provider, model }, error: undefined }
+    } catch (error) {
+      return { available: false, value: null, error: '读取宿主默认模型失败：' + messageOf(error) }
+    }
+  }
+
+  function applyRankingModelOverride(value) {
+    if (isPlainObject(value)) {
+      const provider = optionalString(value.provider)
+      const model = optionalString(value.model)
+      if (provider !== undefined && model !== undefined) {
+        // 用户层模型选择落为单元素 ranking.models，保持 provider/model 兼容字段同步。
+        config.ranking.provider = provider
+        config.ranking.model = model
+        config.ranking.models = [{ provider, model }]
+        return
+      }
+      warnConfigOnce('ignoring invalid rankingModel user setting; restoring profile ranking')
+    }
+    config.ranking = cloneRanking(profileRanking)
+  }
 
   function cooling(route, now) {
     const health = state.routeHealth.get(route)
@@ -2571,6 +2632,7 @@ export function apply(ctx, rawConfig) {
       config.minSwitchIntervalMs = value.minSwitchIntervalMs
       config.maxSwitchesPerTurn = value.maxSwitchesPerTurn
       config.startup.preferTier = value.startupPreferTier
+      applyRankingModelOverride(value.rankingModel)
       config.ranking.mode = value.rankingMode
       if (parseClock(value.keyResetAt) !== undefined) config.keyResetAt = value.keyResetAt
       else console.warn('[dsh-provider-failover] ignoring invalid keyResetAt (expected HH:MM): ' + String(value.keyResetAt))
@@ -2639,9 +2701,61 @@ export function apply(ctx, rawConfig) {
       }
       return { registered, configurable }
     }
+
+    /** 实时读取 provider 与模型目录；单个 provider 的模型失败只标注该项。 */
+    const modelCatalog = async () => {
+      const service = llm()
+      if (service === undefined || typeof service.listProviders !== 'function') return []
+      let providers
+      try {
+        providers = service.listProviders()
+      } catch (error) {
+        console.warn('[dsh-provider-failover] listProviders for catalog failed: ' + messageOf(error))
+        return []
+      }
+      const result = []
+      for (const info of Array.isArray(providers) ? providers : []) {
+        const id = optionalString(info?.id)
+        if (id === undefined) continue
+        const item = { id, name: String(info?.name ?? id), models: [] }
+        if (typeof service.listModels !== 'function') {
+          item.error = '宿主 llm 未提供 listModels()'
+          result.push(item)
+          continue
+        }
+        try {
+          const models = await service.listModels(id)
+          item.models = (Array.isArray(models) ? models : []).map((model) => ({
+            id: String(model?.id ?? ''),
+            name: String(model?.name ?? model?.id ?? ''),
+          })).filter((model) => model.id.length > 0 && model.name.length > 0)
+        } catch (error) {
+          item.error = messageOf(error)
+        }
+        result.push(item)
+      }
+      return result
+    }
+
+    function validateModelSelection(field, value, catalog) {
+      if (value === null) return { value: null, errors: [] }
+      if (!isPlainObject(value)) return { value: null, errors: [field + ' 必须是 { provider, model } 或 null'] }
+      const provider = optionalString(value.provider)
+      const model = optionalString(value.model)
+      if (provider === undefined || model === undefined) return { value: null, errors: [field + ' 的 provider 和 model 必须同时填写'] }
+      const providerInfo = catalog.find((item) => item.id === provider)
+      if (providerInfo === undefined) return { value: null, errors: [field + ' provider 不存在：' + provider] }
+      if (providerInfo.error !== undefined) return { value: null, errors: [field + ' provider 的模型目录不可用：' + providerInfo.error] }
+      if (providerInfo.models.some((item) => item.id === model) !== true) return { value: null, errors: [field + ' model 不存在：' + provider + '/' + model] }
+      return { value: { provider, model }, errors: [] }
+    }
+
+    const rankingModelSnapshot = () => rankingModelOf(config.ranking)
+
     const snapshot = async () => {
       await refreshRefInfo()
       const directory = providerDirectory()
+      const defaultModel = currentDefaultModel()
       // 目录不可用（llm 未就绪或宿主未报告任何 provider）时不做关联判断，避免全量误标。
       const directoryKnown = directory.registered.length > 0 || directory.configurable.length > 0
       const registeredIds = new Set(directory.registered.map((item) => item.id))
@@ -2680,6 +2794,10 @@ export function apply(ctx, rawConfig) {
       }))
       return {
         ok: true,
+        rankingModel: rankingModelSnapshot(),
+        defaultModel: defaultModel.value,
+        defaultModelAvailable: defaultModel.available,
+        defaultModelError: defaultModel.error,
         enabled: config.enabled,
         policyMode: config.policyMode,
         maxPolicyRetriesPerStep: config.maxPolicyRetriesPerStep,
@@ -2693,6 +2811,10 @@ export function apply(ctx, rawConfig) {
           maxSwitchesPerTurn: config.maxSwitchesPerTurn,
           startupPreferTier: config.startup.preferTier,
           rankingMode: config.ranking.mode,
+          rankingModel: rankingModelSnapshot(),
+          defaultModel: defaultModel.value,
+          defaultModelAvailable: defaultModel.available,
+          defaultModelError: defaultModel.error,
           sameTierFirst: config.ranking.sameTierFirst === true,
           keyResetAt: config.keyResetAt,
           keysByEntry: state.keysByEntry,
@@ -2719,6 +2841,15 @@ export function apply(ctx, rawConfig) {
         cooling: [...state.routeHealth.entries()].map(([route, health]) => ({ route: route, code: health.code, until: health.coolingUntil })),
       }
     }
+    register(ROUTE_BASE + '/catalog', async (req, res) => {
+      if (isLocalRequest(req) !== true) return sendJson(res, 403, { ok: false, error: 'local requests only' })
+      if (req.method !== 'GET') return sendJson(res, 405, { ok: false, error: 'GET only' })
+      try {
+        sendJson(res, 200, { providers: await modelCatalog() })
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: '读取模型目录失败：' + messageOf(error) })
+      }
+    })
     register(ROUTE_BASE + '/status', async (req, res) => {
       if (isLocalRequest(req) !== true) return sendJson(res, 403, { ok: false, error: 'local requests only' })
       sendJson(res, 200, await snapshot())
@@ -2772,31 +2903,50 @@ export function apply(ctx, rawConfig) {
       if (state.settings === undefined) return sendJson(res, 503, { ok: false, error: 'settings service is not composed; edit the profile patch instead' })
       const body = await readJsonBody(req)
       const patch = {}
-      for (const key of ['enabled', 'minSwitchIntervalMs', 'maxSwitchesPerTurn', 'startupPreferTier', 'rankingMode', 'keyResetAt', 'keysByEntry']) {
+      for (const key of ['enabled', 'minSwitchIntervalMs', 'maxSwitchesPerTurn', 'startupPreferTier', 'rankingMode', 'keyResetAt', 'keysByEntry', 'rankingModel']) {
         if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
       }
-      if (Object.keys(patch).length === 0) return sendJson(res, 400, { ok: false, error: 'no editable field in request' })
+      const hasRankingModel = Object.prototype.hasOwnProperty.call(body, 'rankingModel')
+      const hasDefaultModel = Object.prototype.hasOwnProperty.call(body, 'defaultModel')
+      let catalog
+      let defaultSelection
+      if (hasRankingModel || hasDefaultModel) {
+        catalog = await modelCatalog()
+        if (hasRankingModel) {
+          const checked = validateModelSelection('排序模型', body.rankingModel, catalog)
+          if (checked.errors.length > 0) return sendJson(res, 400, { ok: false, error: checked.errors.join('; '), errors: checked.errors })
+          patch.rankingModel = checked.value
+        }
+        if (hasDefaultModel) {
+          // 宿主默认模型配置是必填完整选择且没有 clear API；null 因此表示“不改动当前默认模型”。
+          const checked = validateModelSelection('默认模型', body.defaultModel, catalog)
+          if (checked.errors.length > 0) return sendJson(res, 400, { ok: false, error: checked.errors.join('; '), errors: checked.errors })
+          defaultSelection = checked.value
+          if (defaultSelection !== null) {
+            const service = agentDefaultModel()
+            if (service === undefined || typeof service.saveSelection !== 'function') return sendJson(res, 503, { ok: false, error: '宿主 agentDefaultModel 服务未装载，无法保存默认模型' })
+          }
+        }
+      }
+      if (Object.keys(patch).length === 0 && hasDefaultModel !== true) return sendJson(res, 400, { ok: false, error: 'no editable field in request' })
       if (patch.keyResetAt !== undefined && parseClock(patch.keyResetAt) === undefined) return sendJson(res, 400, { ok: false, error: 'keyResetAt must be HH:MM in 24-hour local time' })
       const keyErrors = validateKeysByEntry(patch.keysByEntry)
       if (keyErrors.length > 0) return sendJson(res, 400, { ok: false, error: keyErrors.join('; '), errors: keyErrors })
-      try {
-        await state.settings.update(patch)
-      } catch (error) {
-        return sendJson(res, 400, { ok: false, error: messageOf(error) })
+      if (hasDefaultModel && defaultSelection !== null) {
+        try {
+          await agentDefaultModel().saveSelection(defaultSelection)
+        } catch (error) {
+          return sendJson(res, 400, { ok: false, error: '保存默认模型失败：' + messageOf(error) })
+        }
       }
-      // watch 回调是异步投递的；这里立即按 patch 预演一次，保证响应里的 editable 已是新值（M1）。
-      if (typeof state.syncSettings === 'function') {
-        state.syncSettings({
-          enabled: config.enabled,
-          minSwitchIntervalMs: config.minSwitchIntervalMs,
-          maxSwitchesPerTurn: config.maxSwitchesPerTurn,
-          startupPreferTier: config.startup.preferTier,
-          rankingMode: config.ranking.mode,
-          sameTierFirst: config.ranking.sameTierFirst === true,
-          keyResetAt: config.keyResetAt,
-          keysByEntry: state.keysByEntry,
-          ...patch,
-        }, 'updated')
+      if (Object.keys(patch).length > 0) {
+        try {
+          await state.settings.update(patch)
+        } catch (error) {
+          return sendJson(res, 400, { ok: false, error: messageOf(error) })
+        }
+        // watch 回调是异步投递的；这里立即重放已落盘设置，保证响应里的 editable 已是新值。
+        if (typeof state.syncSettings === 'function') state.syncSettings(state.settings.get(), 'updated')
       }
       sendJson(res, 200, await snapshot())
     })

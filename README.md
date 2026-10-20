@@ -105,8 +105,8 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
       - tier: 1                        # gpt 族互备
         enabled: true
         entries:
-          - { id: relay,    route: codex-relay,  model: gpt-5.6-sol, cooldownMs: 60000 }
-          - { id: official, route: openai-codex, model: gpt-5.6-sol, cooldownMs: 120000 }
+          - { id: relay,    route: codex-relay,  model: gpt-6.1-sol, cooldownMs: 60000 }
+          - { id: official, route: openai-codex, model: gpt-6.1-sol, cooldownMs: 120000 }
       - tier: 2                        # deepseek 族互备
         enabled: true
         entries:
@@ -204,6 +204,8 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
   - 排序是**旁路调用**，不带 agent 循环的会话上下文：依赖会话头或额外凭据的路由可能拒绝旁路调用，因此链里应把**不依赖会话头/额外凭据**的路由放在前面，失败项会被自动跳过并尝试下一项（已实测该回退路径）。
   - 结论：`llm` 排序会让故障转移多等数秒；对延迟敏感时保持默认 `keywords`。
 
+  设置页也能直接选排序模型（provider + model 下拉，目录来自宿主 llm 注册表）：它写用户层覆盖 `rankingModel`，等价于单条 `ranking.provider/model`；清除覆盖后回退 profile 的 `ranking.models` 链。`ranking.mode` 不是 `llm` 时该项不参与排序。
+
 ## 凭据策略（重要）
 
 - **插件不持有、不存储、不读取、不写入任何密钥值**；不调用凭据服务的写入接口。
@@ -256,12 +258,13 @@ node D:\src\dsh\dsh-permission-compat\tools\apply-dsh-context-recovery-compat.mj
 
 ## 设置页与状态接口
 
-dsh 设置页新增「Provider 故障转移」小节：**总开关** + 常用参数（最小切换间隔、单 turn 上限、启动对齐档位、档内排序模式、key 每日重置时刻），保存后**即时生效，无需重启**；另有「重置 key 状态」按钮。
+dsh 设置页新增「Provider 故障转移」小节：**总开关** + 常用参数（最小切换间隔、单 turn 上限、启动对齐档位、档内排序模式、key 每日重置时刻），保存后**即时生效，无需重启**；另有「重置 key 状态」按钮，以及两组从宿主目录取值的下拉——**排序模型**（provider + model，写用户层 `rankingModel`）与**默认模型**（provider + model，经宿主 `agentDefaultModel` 服务保存，即新会话起手模型）。
 
 - 持久化：写插件自有文件 `$DSH_HOME/plugins/provider-failover/settings.json`（0.2 起 dsh-settings 移除了按插件命名空间 store 与 `settings.yaml` 用户层）；**用户层优先于 profile patch 的对应字段**（这正是开关语义；没被用户改过的项仍以 patch 为准）。
 - 接口（仅本地回环）：
   - `GET /provider-failover/status`：生效值 + 档位表（含每条目 key 引用的 `ref/active/configured/source/failed` 标注）+ `nextKeyResetAt` + 最近 10 条转移/换 key 记录 + 冷却路由。
-  - `POST /provider-failover/config`：字段白名单 `{enabled, minSwitchIntervalMs, maxSwitchesPerTurn, startupPreferTier, rankingMode, keyResetAt}`，经 settings 服务落盘。
+  - `POST /provider-failover/config`：字段白名单 `{enabled, minSwitchIntervalMs, maxSwitchesPerTurn, startupPreferTier, rankingMode, keyResetAt, rankingModel, defaultModel}`，经 settings 服务落盘。`rankingModel: {provider, model}` 写用户层覆盖，`null` 表示清除覆盖并回退 profile 的 ranking 链；`defaultModel: {provider, model}` 经宿主 `agentDefaultModel` 保存，`null` 表示不改动（宿主默认模型是必填项，没有 clear 接口），宿主服务未装载时该字段返回 503。两者都会先对照实时目录校验，未知 provider/model 返回 400。
+  - `GET /provider-failover/catalog`：宿主 provider/model 目录 `{providers:[{id,name,models:[{id,name}],error?}]}`，供设置页下拉使用；单个 provider 取模型失败只标注 `error`，不影响其余目录。
   - `POST /provider-failover/keys`：`{entry, ref}` 手工置位、`{entry}` 重置该条目、`{}` 重置全部（未声明或未配置的引用被拒绝）。
   - `POST /provider-failover/test`：`{entry?, sessionId?, clear?}` 会话级测试切换；状态接口同时返回 `testTargets`、`pins`、`lastSessionId`。
 - 档位表与宿主 provider 目录**实时关联**：条目显示 `id → route/model` 并标注「宿主未注册／冷却中」；同时列出未纳入任何档位的 provider 与「档位引用但未注册」的警告。目录不可用（llm 未就绪）时不做关联判断，不误标。

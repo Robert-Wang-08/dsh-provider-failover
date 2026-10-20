@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-keypool",
-  "version": "3.4.0",
+  "version": "3.5.0",
   "description": "DSH Provider 分档故障转移 —— 模型请求以额度/凭据/过载/限流等可切换失败结束时，按配置表档位顺序切换 harness 路由（provider）；凭据类失败先在条目内轮换 key（改写该路由的 apiKeyEnv 引用名，路由与模型不变），并按每日重置时刻恢复默认 key。设置页可查看并编辑每个条目的 key 引用（凭据引用名）与状态（在用/可用/失效[时间·错误]/未配置），并可做会话级测试切换（/failover-test 指令或按钮）。不持有也不读写任何凭据值。",
   "type": "module",
   "main": "index.js",
@@ -39,11 +39,11 @@
     "origin": "self",
     "author": "wang",
     "created": "2026-09-22",
-    "updated": "2026-10-13",
-    "version": "3.4.0",
+    "updated": "2026-10-20",
+    "version": "3.5.0",
     "managed-by": "skillhub",
     "source": "skillhub",
     "asset-type": "registry-entry",
-    "changelog": "3.4.0: load credential-free local route-config.json from DSH_HOME/plugins/provider-failover at startup; preserve existing settings.json and profile configuration. 3.3.0: transport failures now fail over to the next provider — 'websocket closed' joins the message-pattern fallback and TRANSPORT becomes a terminal code, so an un-normalized 'WebSocket closed 1000' (host maps it to generic PI_AI_ERROR) still switches (probe display aligned to 传输中断). policy (content/safety) failures now default to policyMode 'same' — keep the current provider/model and retry in-place within the same (turn, step) (bounded by maxPolicyRetriesPerStep), instead of switching provider; 'switch'/'off' restore the old policyFailover semantics. Prompt rewrite on retry is impossible (frozen loop requests + request-reconstruction invariant), documented in README. 3.2.4: adapt to dsh 0.2 (settings moved to the plugin-owned settings.json; active key ref now read via SettingsForms.describe), probe drives the file scope in an isolated DSH_HOME, and the isSwitchable policy comment matches the default policyFailover: true behavior."
+    "changelog": "3.5.0: settings panel gains two host-catalog dropdowns — ranking model (provider+model, user-layer rankingModel override, null clears it) and default model (provider+model, saved through the host agentDefaultModel service); new read-only endpoint GET /provider-failover/catalog enumerates host providers/models with per-provider error tolerance; POST /provider-failover/config accepts rankingModel/defaultModel with live catalog validation (unknown route -> 400, missing service -> 503); status/editable snapshot now expose rankingModel/defaultModel/defaultModelAvailable/defaultModelError; README documents the new fields; .gitignore now excludes manual *.bak-* copies. 3.4.0: load credential-free local route-config.json from DSH_HOME/plugins/provider-failover at startup; preserve existing settings.json and profile configuration. 3.3.0: transport failures now fail over to the next provider — 'websocket closed' joins the message-pattern fallback and TRANSPORT becomes a terminal code, so an un-normalized 'WebSocket closed 1000' (host maps it to generic PI_AI_ERROR) still switches (probe display aligned to 传输中断). policy (content/safety) failures now default to policyMode 'same' — keep the current provider/model and retry in-place within the same (turn, step) (bounded by maxPolicyRetriesPerStep), instead of switching provider; 'switch'/'off' restore the old policyFailover semantics. Prompt rewrite on retry is impossible (frozen loop requests + request-reconstruction invariant), documented in README. 3.2.4: adapt to dsh 0.2 (settings moved to the plugin-owned settings.json; active key ref now read via SettingsForms.describe), probe drives the file scope in an isolated DSH_HOME, and the isSwitchable policy comment matches the default policyFailover: true behavior."
   }
 }

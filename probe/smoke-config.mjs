@@ -210,7 +210,7 @@ const makeCtx = (providers, options) => {
     logger: { warn: () => {} },
     effect: (fn) => { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); return () => {} },
     on: (event, fn) => { handlers[event] = fn },
-    get: (n) => n === 'llm' ? providers : n === 'settings' ? settingsProvider : n === 'credentials' ? credentials : undefined,
+    get: (n) => n === 'llm' ? providers : n === 'settings' ? settingsProvider : n === 'credentials' ? credentials : n === 'agentDefaultModel' ? opts.agentDefaultModel : undefined,
     inject: (deps, cb) => {
       if (deps.includes('webServer')) cb({ webServer: { register: (r) => { routes[r.path] = r.handler; return () => {} } } })
     },
@@ -218,12 +218,17 @@ const makeCtx = (providers, options) => {
   return { ctx, routes, mutations, handlers, disposers }
 }
 const res1 = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
-const env1 = makeCtx({ listProviders: () => [{ id: 'example-provider', name: 'Example' }, { id: 'other-provider', name: 'Other' }], listConfigurableProviders: () => [] })
+const env1 = makeCtx({ listProviders: () => [{ id: 'example-provider', name: 'Example' }, { id: 'other-provider', name: 'Other' }], listModels: async (provider) => { if (provider === 'other-provider') throw new Error('catalog unavailable'); return [{ provider, id: provider + '-model', name: provider + ' Model' }] }, listConfigurableProviders: () => [] })
 Object.assign(env1, isolatedApply(env1.ctx, {}))
 check('apply 只读不写盘（设置文件尚未创建）', !existsSync(env1.settingsFile))
-check('注册 status/config/keys 三条路由', env1.routes['/provider-failover/status'] !== undefined && env1.routes['/provider-failover/config'] !== undefined && env1.routes['/provider-failover/keys'] !== undefined)
+check('注册 status/config/keys/catalog 四条路由', env1.routes['/provider-failover/status'] !== undefined && env1.routes['/provider-failover/config'] !== undefined && env1.routes['/provider-failover/keys'] !== undefined && env1.routes['/provider-failover/catalog'] !== undefined)
+const catalogRes = { status: 0, body: null, writeHead(s) { this.status = s }, end(b) { this.body = JSON.parse(b) } }
+await env1.routes['/provider-failover/catalog']({ method: 'GET', socket: { remoteAddress: '127.0.0.1' } }, catalogRes)
+check('catalog 返回 provider/model 精简目录', catalogRes.status === 200 && catalogRes.body.providers[0].models[0].id === 'example-provider-model', JSON.stringify(catalogRes.body))
+check('单 provider 模型目录失败不拖垮整个 catalog', catalogRes.status === 200 && catalogRes.body.providers[1].models.length === 0 && catalogRes.body.providers[1].error === 'catalog unavailable', JSON.stringify(catalogRes.body))
 await env1.routes['/provider-failover/status']({ socket: { remoteAddress: '127.0.0.1' } }, res1)
 check('status 暴露 writable（文件 scope 可写）', res1.body.writable === true, String(res1.body.writable))
+check('agentDefaultModel 缺失时默认模型不可编辑且有提示', res1.body.editable.defaultModelAvailable === false && String(res1.body.editable.defaultModelError).includes('未装载'), JSON.stringify(res1.body.editable))
 await env1.routes['/provider-failover/status']({ socket: { remoteAddress: '127.0.0.1' } }, res1)
 check('snapshot 用 route 名关联目录', res1.body.tiers[0].entries[0].route === 'example-provider' && res1.body.tiers[0].entries[0].registered === true, JSON.stringify(res1.body.tiers?.[0]))
 check('snapshot 计算 unassigned/missing', Array.isArray(res1.body.providers.unassigned) && res1.body.providers.unassigned.some((p) => p.id === 'other-provider') && res1.body.providers.missing.length === 0, JSON.stringify(res1.body.providers))
@@ -240,7 +245,7 @@ check('目录不可用时 providers=null 且不误标', res3.body.providers === 
 
 console.log('apply 假 ctx（凭据引用轮换路径）:')
 const KEY_CONFIG = { keyResetAt: '06:00', tiers: [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm', keys: ['K1', 'K2'] }] }] }
-const llmStub = { listProviders: () => [{ id: 'r1', name: 'R1' }], listConfigurableProviders: () => [] }
+const llmStub = { listProviders: () => [{ id: 'r1', name: 'R1' }], listModels: async (provider) => provider === 'r1' ? [{ provider: 'r1', id: 'm', name: 'M' }] : [], listConfigurableProviders: () => [] }
 const failure = { failure: { code: 'AUTH', message: 'invalid api key' }, provider: 'r1', turn: 1, step: 1 }
 const env4 = makeCtx(llmStub, { providerSection: { r1: { apiKeyEnv: 'K1' } }, refInfo: { K1: { configured: true, source: 'file' }, K2: { configured: true, source: 'file' } } })
 Object.assign(env4, isolatedApply(env4.ctx, KEY_CONFIG))
@@ -329,7 +334,30 @@ const written11 = readScope(env11.settingsFile)
 check('合法写入被接受并落盘', okConfig.status === 200 && JSON.stringify(written11) === JSON.stringify({ keysByEntry: { ais: ['K1', 'K3'] } }), JSON.stringify(written11))
 check('写入后状态快照反映新引用', okConfig.body.tiers[0].entries[0].keys.length === 2 && okConfig.body.tiers[0].entries[0].keys[1].ref === 'K3', JSON.stringify(okConfig.body.tiers[0].entries[0].keys))
 check('快照暴露可编辑的 keysByEntry', JSON.stringify(okConfig.body.editable.keysByEntry) === JSON.stringify({ ais: ['K1', 'K3'] }), JSON.stringify(okConfig.body.editable.keysByEntry))
-for (const env of [env9, noKeys, env11]) for (const dispose of env.disposers) dispose()
+const badRankingProvider = await postConfig(env11, { rankingModel: { provider: 'nope', model: 'm' } })
+check('rankingModel 拒绝未知 provider', badRankingProvider.status === 400 && String(badRankingProvider.body.error).includes('provider 不存在'), JSON.stringify(badRankingProvider.body))
+const badRankingModel = await postConfig(env11, { rankingModel: { provider: 'r1', model: 'nope' } })
+check('rankingModel 拒绝未知 model', badRankingModel.status === 400 && String(badRankingModel.body.error).includes('model 不存在'), JSON.stringify(badRankingModel.body))
+const okRankingModel = await postConfig(env11, { rankingModel: { provider: 'r1', model: 'm' } })
+const writtenRanking = readScope(env11.settingsFile)
+check('rankingModel 进入 config.ranking 单模型链', okRankingModel.status === 200 && JSON.stringify(okRankingModel.body.rankingModel) === JSON.stringify({ provider: 'r1', model: 'm' }), JSON.stringify(okRankingModel.body.rankingModel))
+check('rankingModel 持久化到 settings 用户层', JSON.stringify(writtenRanking.rankingModel) === JSON.stringify({ provider: 'r1', model: 'm' }), JSON.stringify(writtenRanking))
+const clearedRankingModel = await postConfig(env11, { rankingModel: null })
+check('rankingModel=null 清除用户覆盖并回退 profile', clearedRankingModel.status === 200 && clearedRankingModel.body.rankingModel === null && readScope(env11.settingsFile).rankingModel === null, JSON.stringify(clearedRankingModel.body.rankingModel))
+const badDefaultModel = await postConfig(env11, { defaultModel: { provider: 'r1', model: 'nope' } })
+check('defaultModel 拒绝未知 model', badDefaultModel.status === 400 && String(badDefaultModel.body.error).includes('model 不存在'), JSON.stringify(badDefaultModel.body))
+const defaultSaves = []
+let defaultCurrent = { provider: 'r1', model: 'm' }
+const defaultService = {
+  currentSelection: () => ({ ...defaultCurrent }),
+  saveSelection: async (selection) => { defaultCurrent = { ...selection }; defaultSaves.push({ ...selection }) },
+}
+const envDefault = makeCtx(llmStub, { agentDefaultModel: defaultService })
+Object.assign(envDefault, isolatedApply(envDefault.ctx, KEY_CONFIG))
+const savedDefault = await postConfig(envDefault, { defaultModel: { provider: 'r1', model: 'm' } })
+check('defaultModel 通过 agentDefaultModel 服务保存', savedDefault.status === 200 && JSON.stringify(defaultSaves) === JSON.stringify([{ provider: 'r1', model: 'm' }]), JSON.stringify({ body: savedDefault.body, defaultSaves }))
+check('snapshot/editable 暴露默认模型可用状态', savedDefault.body.defaultModelAvailable === true && savedDefault.body.editable.defaultModelAvailable === true && savedDefault.body.defaultModel.model === 'm', JSON.stringify(savedDefault.body.editable))
+for (const env of [env9, noKeys, env11, envDefault]) for (const dispose of env.disposers) dispose()
 
 console.log('测试切换（指令 + /test 路由）:')
 const TEST_TIERS = [

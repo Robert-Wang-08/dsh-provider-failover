@@ -2,12 +2,13 @@
  * dsh-deepseek-keypool — 客户端半（client.js）
  *
  * 在 dsh 设置页注册「Provider 故障转移」小节：总开关 + 常用参数，保存后写
- * settings 命名空间 `provider-failover`（用户层 = `$DSH_HOME/settings.yaml`），
- * Host 半 watch 到变更即时生效（无需重启）。
+ * 插件自有用户层 `$DSH_HOME/plugins/provider-failover/settings.json`，Host 半 watch
+ * 到变更即时生效（无需重启）。
  *
  * 读写经同源接口：
  *   GET  /provider-failover/status  → 当前生效值 + 档位表 + 最近转移 + 冷却
- *   POST /provider-failover/config  → { enabled?, minSwitchIntervalMs?, ... }
+ *   GET  /provider-failover/catalog → 宿主 provider/model 目录
+ *   POST /provider-failover/config  → { enabled?, rankingModel?, defaultModel?, ... }
  *
  * 本文件不包含任何凭据，也不接触密钥。
  */
@@ -37,6 +38,8 @@ window.__ModuleLoader__.load({
       ".pf-row{display:flex;align-items:center;justify-content:space-between;gap:12px}",
       ".pf-row>label{flex:0 0 auto;color:var(--dsw-alias-label-secondary)}",
       ".pf-row>input[type=number],.pf-row>input[type=text],.pf-row>select{width:168px;padding:4px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}",
+      ".pf-model-selects{display:flex;align-items:center;gap:8px}",
+      ".pf-model-selects>select{width:168px;padding:4px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}",
       ".pf-hint{color:var(--dsw-alias-label-secondary);font-size:12px}",
       ".pf-warn{color:var(--dsw-alias-state-error-primary);font-size:12px}",
       ".pf-keyrow{display:flex;align-items:center;gap:8px}",
@@ -78,6 +81,7 @@ window.__ModuleLoader__.load({
     }
 
     const getStatus = () => apiFetch(ROUTE + "/status");
+    const getCatalog = () => apiFetch(ROUTE + "/catalog");
 
     /** 会话内可见的转移通知：原因 + 结果 + 时间；不进入模型上下文。 */
     const getNotices = (sessionId, limit) =>
@@ -142,6 +146,7 @@ window.__ModuleLoader__.load({
 
     function ProviderFailoverPanel() {
       const [status, setStatus] = react.useState(null);
+      const [catalog, setCatalog] = react.useState(null);
       const [form, setForm] = react.useState(null);
       const [keyDraft, setKeyDraft] = react.useState(null);
       const [testTarget, setTestTarget] = react.useState("");
@@ -149,12 +154,18 @@ window.__ModuleLoader__.load({
       const [testMsgKind, setTestMsgKind] = react.useState("ok");
       const [error, setError] = react.useState("");
       const [keyError, setKeyError] = react.useState("");
+      const [modelError, setModelError] = react.useState("");
       const [saved, setSaved] = react.useState("");
       const [busy, setBusy] = react.useState(false);
       const [probeReport, setProbeReport] = react.useState(null);
       const [probeMsg, setProbeMsg] = react.useState("");
       const [probeMsgKind, setProbeMsgKind] = react.useState("ok");
       const [probeBusy, setProbeBusy] = react.useState(false);
+
+      const formOf = (data) => Object.assign({}, data.editable, {
+        rankingModel: data.editable.rankingModel === undefined ? null : data.editable.rankingModel,
+        defaultModel: data.editable.defaultModel === undefined ? null : data.editable.defaultModel,
+      });
 
       /** 由状态快照构造 key 草稿：条目 id → 引用名数组（生效值，含 patch 回退）。 */
       const draftOf = (data) => {
@@ -171,11 +182,14 @@ window.__ModuleLoader__.load({
       const load = react.useCallback(async () => {
         try {
           const data = await getStatus();
+          const catalogData = await getCatalog();
           setStatus(data);
-          setForm(data.editable);
+          setCatalog(Array.isArray(catalogData.providers) ? catalogData.providers : []);
+          setForm(formOf(data));
           setKeyDraft(draftOf(data));
           if (data.lastProbe !== undefined && data.lastProbe !== null) setProbeReport(data.lastProbe);
           setError("");
+          setModelError("");
         } catch (err) {
           setError(err.message);
         }
@@ -198,6 +212,35 @@ window.__ModuleLoader__.load({
         setSaved("");
       };
 
+      const draftSelectionOf = (value) => value !== null && value !== undefined && typeof value.provider === "string" && typeof value.model === "string"
+        ? { provider: value.provider, model: value.model }
+        : { provider: "", model: "" };
+      const selectionOf = (value) => {
+        const draft = draftSelectionOf(value);
+        return draft.provider.length > 0 && draft.model.length > 0 ? draft : null;
+      };
+      const modelSelection = (key) => selectionOf(form[key]);
+      const setModelPart = (key, part) => (event) => {
+        const value = event.target.value;
+        setForm((prev) => {
+          const current = draftSelectionOf(prev[key]);
+          return Object.assign({}, prev, { [key]: Object.assign({}, current, { [part]: value, ...(part === "provider" ? { model: "" } : {}) }) });
+        });
+        setSaved("");
+        setModelError("");
+      };
+      const providerInfoOf = (selection) => catalog === null || selection === null || selection === undefined ? undefined : catalog.find((item) => item.id === selection.provider);
+      const modelOptionsOf = (selection) => {
+        const info = providerInfoOf(selection);
+        return info === undefined ? [] : info.models;
+      };
+      const modelDirty = JSON.stringify(modelSelection("rankingModel")) !== JSON.stringify(selectionOf(status.editable.rankingModel))
+        || JSON.stringify(modelSelection("defaultModel")) !== JSON.stringify(selectionOf(status.editable.defaultModel));
+      const modelIncomplete = ["rankingModel", "defaultModel"].some((key) => {
+        const draft = draftSelectionOf(form[key]);
+        return draft.provider.length > 0 && draft.model.length === 0;
+      });
+
       const patch = {};
       if (form.enabled !== status.editable.enabled) patch.enabled = form.enabled === true;
       if (String(form.minSwitchIntervalMs) !== String(status.editable.minSwitchIntervalMs)) patch.minSwitchIntervalMs = Number(form.minSwitchIntervalMs);
@@ -213,12 +256,29 @@ window.__ModuleLoader__.load({
         try {
           const data = await saveConfig(patch);
           setStatus(data);
-          setForm(data.editable);
+          setForm(formOf(data));
           setKeyDraft(draftOf(data));
           setError("");
           setSaved("已保存并即时生效");
         } catch (err) {
           setError(err.message);
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      const saveModels = async () => {
+        if (modelDirty !== true) return;
+        setBusy(true);
+        try {
+          const data = await saveConfig({ rankingModel: modelSelection("rankingModel"), defaultModel: modelSelection("defaultModel") });
+          setStatus(data);
+          setForm(formOf(data));
+          setKeyDraft(draftOf(data));
+          setModelError("");
+          setSaved("模型选择已保存并即时生效");
+        } catch (err) {
+          setModelError(err.message);
         } finally {
           setBusy(false);
         }
@@ -243,7 +303,7 @@ window.__ModuleLoader__.load({
         try {
           const data = await saveConfig({ keysByEntry: map });
           setStatus(data);
-          setForm(data.editable);
+          setForm(formOf(data));
           setKeyDraft(draftOf(data));
           setKeyError("");
           setSaved("key 列表已保存并即时生效");
@@ -304,7 +364,7 @@ window.__ModuleLoader__.load({
         try {
           const data = await testSwitch(testTarget.length > 0 ? { entry: testTarget } : {});
           setStatus(data.status);
-          setForm(data.status.editable);
+          setForm(formOf(data.status));
           setTestMsgKind("ok");
           setTestMsg("已切换：" + String(data.pin.route) + "/" + String(data.pin.model) + "（会话 " + String(data.sessionId) + "）");
         } catch (err) {
@@ -411,7 +471,7 @@ window.__ModuleLoader__.load({
         try {
           const data = await resetKeys({});
           setStatus(data.status);
-          setForm(data.status.editable);
+          setForm(formOf(data.status));
           setKeyDraft(draftOf(data.status));
           setError("");
           setSaved("已重置全部 key 状态");
@@ -430,10 +490,43 @@ window.__ModuleLoader__.load({
             ? "本地时间 HH:MM；到点清空失效标记并把默认 key 写回"
             : "本地时间 HH:MM；下次：" + new Date(status.nextKeyResetAt).toLocaleString()));
 
+      const modelRow = (key, label, disabled) => {
+        const selected = draftSelectionOf(form[key]);
+        const info = providerInfoOf(selected);
+        const options = modelOptionsOf(selected);
+        const modelDisabled = disabled === true || selected.provider.length === 0 || options.length === 0 || info?.error !== undefined;
+        const hint = disabled === true
+          ? String(status.editable.defaultModelError ?? "宿主 agentDefaultModel 服务未装载，无法编辑")
+          : info?.error !== undefined
+            ? "该 provider 的模型目录读取失败：" + String(info.error)
+            : selected.provider.length === 0
+              ? "请先选择 provider"
+              : options.length === 0
+                ? "该 provider 暂无可用模型"
+                : undefined;
+        return h("div", { className: "pf-row", key: key },
+          h("label", null, label),
+          h("div", { className: "pf-model-selects" },
+            h("select", { value: selected.provider, disabled: disabled === true || catalog === null, onChange: setModelPart(key, "provider") },
+              h("option", { value: "", disabled: key === "defaultModel" }, "选择 provider"),
+              (catalog === null ? [] : catalog).map((provider) => h("option", { key: provider.id, value: provider.id }, String(provider.name) + "（" + String(provider.id) + "）"))),
+            h("select", { value: selected.model, disabled: modelDisabled, onChange: setModelPart(key, "model") },
+              h("option", { value: "" }, "选择 model"),
+              options.map((model) => h("option", { key: model.id, value: model.id }, String(model.name) + "（" + String(model.id) + "）")))),
+          hint === undefined ? null : h("span", { className: "pf-hint" }, hint));
+      };
+      const modelCard = h("div", { className: "pf-card" },
+        h("div", { className: "pf-hint" }, "模型目录来自宿主 llm 注册表；清除排序模型会回退 profile 配置。"),
+        modelRow("rankingModel", "排序模型", false),
+        modelRow("defaultModel", "默认模型", status.editable.defaultModelAvailable !== true),
+        h("div", { className: "pf-actions" },
+          h("button", { className: "pf-btn", disabled: busy === true || modelDirty !== true || modelIncomplete === true || catalog === null, onClick: saveModels }, busy === true ? "保存中…" : "保存模型选择"),
+          modelError.length > 0 ? h("span", { className: "pf-err" }, modelError) : null));
+
       return h("div", { className: "pf-root" },
         h("div", null,
           h("div", { className: "pf-title" }, "Provider 故障转移"),
-          h("div", { className: "pf-sub" }, "终端失败（额度/凭据/过载/限流等）后按档位顺序切换路由；凭据类失败先在条目内轮换 key（改写该路由的 apiKeyEnv 引用，路由与模型不变）。设置改动即时生效，写入 settings.yaml 的 provider-failover 段。")),
+          h("div", { className: "pf-sub" }, "终端失败（额度/凭据/过载/限流等）后按档位顺序切换路由；凭据类失败先在条目内轮换 key（改写该路由的 apiKeyEnv 引用，路由与模型不变）。设置改动即时生效，写入插件自有 settings.json。")),
 
         h("div", { className: "pf-card" },
           h("div", { className: "pf-row" },
@@ -456,6 +549,8 @@ window.__ModuleLoader__.load({
           saved.length > 0 ? h("span", { className: "pf-ok" }, saved) : null,
           error.length > 0 ? h("span", { className: "pf-err" }, error) : null,
           status.writable !== true ? h("span", { className: "pf-err" }, "settings 服务未装载，无法在此保存") : null),
+
+        modelCard,
 
         keyCard,
 

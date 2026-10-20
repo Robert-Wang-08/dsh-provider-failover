@@ -7,3 +7,7 @@ mock-stderr*.log
 .credentials.yaml
 *.credentials.yaml
 .env
+# 手工备份副本（例如 index.js.bak-before-*）不进版本库
+*.bak
+*.bak-*
+*.backup-*
