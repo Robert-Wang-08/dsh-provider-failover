@@ -1157,11 +1157,13 @@ export function apply(ctx, rawConfig) {
     /** 生效的按类别重试策略（配置实时同步） */
     retryPolicies: DEFAULT_CONFIG.retryPolicies,
     /**
-     * 每会话最近一次**实际下发**的路由：sessionKey -> { provider, model, at }。
-     * 用来识别「不是插件切的」路由变化（模型选择器 / /failover-test / 宿主其它入口），
-     * 这样手动切换也会在会话内留下带原因的通知。
+     * 每会话最近一次插件覆盖前的 base 路由：sessionKey -> { provider, model, at }。
+     * 仅与后续 base 比较以识别外部路由变化；不能写入 failover/startup/pin 目标，
+     * 否则重试仍携带旧 base 时会被误报为“手动切换”。这不是最终下发配置。
      */
-    lastRouted: new Map(),
+    lastObservedBase: new Map(),
+    /** 已单独通知、等待 base 首次跟上的测试 pin；弱引用不延长 pin 生命周期。 */
+    unobservedTestSelections: new WeakSet(),
     /** 最近未切换决策（策略拒绝、参数错误等；上限 50） */
     ignoredLog: [],
     /** stepKey -> { attempted:Set<'entryId@route#ref'>, target, switches, needs, at } */
@@ -1365,8 +1367,8 @@ export function apply(ctx, rawConfig) {
       at: Date.now(),
     }
     state.pins.set(pinKeyOf(sessionId), pin)
+    state.unobservedTestSelections.add(pin)
     pushLog({ at: pin.at, kind: 'test-switch', from: '(session selection)', to: pin.route + '/' + pin.model, tier: pin.tier, code: 'TEST', trigger: reason, turn: 0, step: 0 })
-    noteRouted(sessionId, pin.route, pin.model)
     pushNotice({
       at: pin.at,
       session: sessionId,
@@ -2114,11 +2116,6 @@ export function apply(ctx, rawConfig) {
     return undefined
   }
 
-  /** 插件自己决定切换目标时同步观测值，避免下一次请求把它再记一遍“手动切换”。 */
-  function noteRouted(sessionId, provider, model) {
-    state.lastRouted.set(sessionKeyOf(sessionId), { provider: provider, model: model, at: Date.now() })
-  }
-
   async function pickCandidate(sessionId, turn, step, context, signal, excludeRoute) {
     const record = stepState(sessionId, turn, step)
     const now = Date.now()
@@ -2168,14 +2165,17 @@ export function apply(ctx, rawConfig) {
 
   ctx.on('agent/request', async (payload, next) => {
     const base = await next()
-    // 观测「实际下发的路由」。放在 next() 之后，所以看到的是**所有 hook 处理完的结果**：
-    // 模型选择器 / 测试切换 / 宿主其它入口造成的 provider-model 变化都会在这里现形。
-    // 插件自己发的切换不会重复通知——它在切换当刻就把 lastRouted 更新成了目标路由。
+    // 只观测本插件覆盖前的 base（下游 hook 返回值），不是最终请求配置。
+    // 故障转移/启动对齐/pin 只覆盖返回值，不改此观测基线。
+    // 测试切换已有独立通知，base 跟上当前 pin 时不再重复报告手动切换。
     if (base !== null && typeof base === 'object' && typeof base.provider === 'string' && typeof base.model === 'string') {
       const observedKey = sessionKeyOf(sessionIdOf(payload?.agent))
       const observed = { provider: base.provider, model: base.model, at: Date.now() }
-      const previous = state.lastRouted.get(observedKey)
-      if (previous !== undefined && (previous.provider !== observed.provider || previous.model !== observed.model)) {
+      const previous = state.lastObservedBase.get(observedKey)
+      const testPin = activePin(sessionIdOf(payload?.agent))
+      const followsTestSelection = testPin !== undefined && state.unobservedTestSelections.has(testPin) && testPin.route === observed.provider && testPin.model === observed.model
+      if (followsTestSelection) state.unobservedTestSelections.delete(testPin)
+      if (previous !== undefined && !followsTestSelection && (previous.provider !== observed.provider || previous.model !== observed.model)) {
         pushNotice({
           at: observed.at,
           session: sessionIdOf(payload?.agent),
@@ -2193,10 +2193,10 @@ export function apply(ctx, rawConfig) {
           step: payload?.step ?? 0,
         })
       }
-      state.lastRouted.set(observedKey, observed)
-      if (state.lastRouted.size > 128) {
-        const oldest = state.lastRouted.keys().next()
-        if (oldest.done !== true && oldest.value !== observedKey) state.lastRouted.delete(oldest.value)
+      state.lastObservedBase.set(observedKey, observed)
+      if (state.lastObservedBase.size > 128) {
+        const oldest = state.lastObservedBase.keys().next()
+        if (oldest.done !== true && oldest.value !== observedKey) state.lastObservedBase.delete(oldest.value)
       }
     }
     if (config.enabled !== true || config.tiers.length === 0) return base
@@ -2231,7 +2231,6 @@ export function apply(ctx, rawConfig) {
         if (picked !== undefined) {
           target = { entry: picked.entry, tier: picked.tier, reason: 'startup-align' }
           record.target = target
-          noteRouted(sessionId, picked.entry.route, picked.entry.model)
           pushLog({ at: Date.now(), kind: 'startup-align', from: base.provider + '/' + base.model, to: picked.entry.route + '/' + picked.entry.model, tier: picked.tier.tier })
           pushNotice({
             at: Date.now(),
@@ -2447,7 +2446,6 @@ export function apply(ctx, rawConfig) {
     record.target = { entry: picked.entry, tier: picked.tier, reason: decision.how }
     record.switches += 1
     state.lastSwitchAt.set(sessionKey, now)
-    noteRouted(sessionId, picked.entry.route, picked.entry.model)
     pushLog({
       at: now,
       kind: 'failover',

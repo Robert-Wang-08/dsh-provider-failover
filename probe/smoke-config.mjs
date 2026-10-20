@@ -765,6 +765,50 @@ check('空体 502 落到 SERVER 档原地重试，次数由 attempts 收口', re
 check('次数用尽后切换下一档，而不是无限原地重试', retrySwitches.length >= 1 && retrySwitches[0].toRoute === 'r2', JSON.stringify(retrySwitches.map((n) => n.toRoute)))
 for (const dispose of envRetry.disposers) dispose()
 
+console.log('路由观测隔离（故障转移目标不污染 base 基线）:')
+const observationPatch = { probeTarget: false, minSwitchIntervalMs: 0, startup: { preferTier: 0 }, ranking: { mode: 'declared' }, tiers: RETRY_TIERS }
+const envObserve = makeSwitchEnv(undefined, observationPatch)
+const observeAgent = freshAgent('sess-observe')
+const observePayload = { agent: observeAgent, turn: 1, step: 1 }
+const originalBase = { provider: 'r-old', model: 'm-old' }
+await envObserve.handlers['agent/request'](observePayload, async () => ({ ...originalBase }))
+await envObserve.handlers['agent/request-error']({ ...observePayload, provider: 'r-old', model: 'm-old', failure: { code: 'QUOTA', message: 'quota exceeded' } }, async () => 'NEXT')
+for (let attempt = 0; attempt < 3; attempt += 1) {
+  const actual = await envObserve.handlers['agent/request'](observePayload, async () => ({ ...originalBase }))
+  check('故障转移后的连续请求仍使用目标 ' + attempt, actual.provider === 'r1' && actual.model === 'm1', JSON.stringify(actual))
+}
+check('故障转移后旧 base 不再误报手动切回', (await readNotices(envObserve, 'sess-observe')).filter((n) => n.kind === 'manual-switch').length === 0)
+const changedBase = { provider: 'r-external', model: 'm-external' }
+await envObserve.handlers['agent/request']({ ...observePayload, step: 2 }, async () => ({ ...changedBase }))
+await envObserve.handlers['agent/request']({ ...observePayload, step: 2 }, async () => ({ ...changedBase }))
+const externalNotices = (await readNotices(envObserve, 'sess-observe')).filter((n) => n.kind === 'manual-switch')
+check('真实外部 base 变更仍通知一次且起点是前一个 base', externalNotices.length === 1 && externalNotices[0].fromRoute === 'r-old' && externalNotices[0].toRoute === 'r-external', JSON.stringify(externalNotices))
+await envObserve.handlers['agent/request']({ agent: freshAgent('sess-observe-other'), turn: 1, step: 1 }, async () => ({ ...changedBase }))
+check('路由观测按会话隔离', (await readNotices(envObserve, 'sess-observe-other')).length === 0)
+
+const envAlignObserve = makeSwitchEnv(undefined, { ...observationPatch, startup: { preferTier: 1 } })
+const alignAgent = freshAgent('sess-align-observe')
+for (let attempt = 0; attempt < 2; attempt += 1) {
+  const actual = await envAlignObserve.handlers['agent/request']({ agent: alignAgent, turn: 1, step: 1 }, async () => ({ ...originalBase }))
+  check('启动对齐后的请求仍使用目标 ' + attempt, actual.provider === 'r1', JSON.stringify(actual))
+}
+check('启动对齐后旧 base 不误报手动切换', (await readNotices(envAlignObserve, 'sess-align-observe')).filter((n) => n.kind === 'manual-switch').length === 0)
+
+const envPinObserve = makeSwitchEnv(controllerStub, SWITCH_PATCH)
+const pinAgent = freshAgent('sess-pin-observe')
+await envPinObserve.handlers['agent/request']({ agent: pinAgent, turn: 1, step: 1 }, async () => ({ provider: 'r1', model: 'm1' }))
+await postTest(envPinObserve, { sessionId: 'sess-pin-observe', entry: 'relay' })
+// 官方选模尚未反映在 base 时，pin 生效也不能制造反向切换通知。
+await envPinObserve.handlers['agent/request']({ agent: pinAgent, turn: 1, step: 1 }, async () => ({ provider: 'r1', model: 'm1' }))
+await envPinObserve.handlers['agent/request']({ agent: pinAgent, turn: 1, step: 1 }, async () => ({ provider: 'r2', model: 'm2' }))
+const pinNotices = (await readNotices(envPinObserve, 'sess-pin-observe')).filter((n) => n.kind === 'manual-switch')
+check('测试切换在旧 base 与选模同步后都不重复通知', pinNotices.length === 1 && pinNotices[0].code === 'TEST', JSON.stringify(pinNotices))
+await envPinObserve.handlers['agent/request']({ agent: pinAgent, turn: 1, step: 2 }, async () => ({ provider: 'r3', model: 'm3' }))
+await envPinObserve.handlers['agent/request']({ agent: pinAgent, turn: 1, step: 3 }, async () => ({ provider: 'r2', model: 'm2' }))
+const returnToPinNotices = (await readNotices(envPinObserve, 'sess-pin-observe')).filter((n) => n.kind === 'manual-switch' && n.code === 'MANUAL')
+check('测试同步只去重一次，之后外部切走再切回 pin 仍通知', returnToPinNotices.length === 2 && returnToPinNotices[0].fromRoute === 'r3' && returnToPinNotices[0].toRoute === 'r2', JSON.stringify(returnToPinNotices))
+for (const env of [envObserve, envAlignObserve, envPinObserve]) for (const dispose of env.disposers) dispose()
+
 check('真实设置文件未被探针触碰', existsSync(realSettingsFile) === realFileExisted, realSettingsFile)
 cleanupHomes()
 
