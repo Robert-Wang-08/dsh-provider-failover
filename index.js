@@ -1180,19 +1180,6 @@ function parseRanking(text, candidates) {
 export function apply(ctx, rawConfig) {
   const localConfig = readLocalRouteConfig()
   const effectiveRawConfig = localConfig === undefined ? rawConfig : { ...rawConfig, ...localConfig }
-  try {
-    // TEMP DIAGNOSTIC (remove after diagnosing sameTierFirst)
-    const fs = require$1 !== undefined ? undefined : undefined
-    writeFileSync(join(homedir(), '.dsh', 'failover-config-dump.json'), JSON.stringify({
-      at: new Date().toISOString(),
-      rawKeys: isPlainObject(rawConfig) ? Object.keys(rawConfig) : typeof rawConfig,
-      rawRanking: isPlainObject(rawConfig) ? rawConfig.ranking : undefined,
-      localRanking: isPlainObject(localConfig) ? localConfig.ranking : undefined,
-      effectiveRanking: isPlainObject(effectiveRawConfig) ? effectiveRawConfig.ranking : undefined,
-      effectiveHasRetryPolicies: isPlainObject(effectiveRawConfig) && effectiveRawConfig.retryPolicies !== undefined,
-      effectiveTierCount: isPlainObject(effectiveRawConfig) && Array.isArray(effectiveRawConfig.tiers) ? effectiveRawConfig.tiers.length : undefined,
-    }, null, 2) + '\n', 'utf8')
-  } catch (error) { /* diagnostic only */ }
   const { value: config, errors } = normalizeConfig(effectiveRawConfig)
   // rankingModel 是用户层单模型覆盖；null/未设置时恢复这份 profile 基线，保留原有 ranking.models 链。
   const profileRanking = cloneRanking(config.ranking)
