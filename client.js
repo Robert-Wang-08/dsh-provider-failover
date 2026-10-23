@@ -613,7 +613,9 @@ window.__ModuleLoader__.load({
         ? "原地重试"
         : item.kind === "manual-switch"
           ? (String(item.code) === "TEST" ? "测试切换" : "手动切换")
-          : item.stage === "startup-align" ? "启动对齐" : "故障转移";
+          : item.kind === "exhausted"
+            ? "无可用候选"
+            : item.stage === "startup-align" ? "启动对齐" : "故障转移";
       // 归一化码（AUTH/QUOTA）粒度不够：同一个 AUTH 下「余额不足」与「该令牌无权使用该模型」
       // 的处置完全不同。优先展示细分原因，没有细分时退回错误码，最后才写「未知原因」。
       const reasonLabel = item.reasonLabel === undefined || item.reasonLabel === null || String(item.reasonLabel) === ""
@@ -628,7 +630,9 @@ window.__ModuleLoader__.load({
             ? (codeText === "" ? reasonLabel : reasonLabel + "（" + codeText + "）")
             : codeText !== "" ? codeText : "未知原因";
       const from = String(item.fromRoute) + (item.fromModel === undefined || item.fromModel === "" ? "" : "/" + String(item.fromModel));
-      const to = String(item.toRoute) + (item.toModel === undefined || item.toModel === "" ? "" : "/" + String(item.toModel));
+      const to = String(item.toRoute) === ""
+        ? "—"
+        : String(item.toRoute) + (item.toModel === undefined || item.toModel === "" ? "" : "/" + String(item.toModel));
       const tier = typeof item.tier === "number" && item.tier > 0 ? "（档 " + String(item.tier) + "）" : "";
       const effort = item.reasoningEffort === undefined || item.reasoningEffort === null ? "" : " · effort " + String(item.reasoningEffort);
       const where = " · turn " + String(item.turn) + " step " + String(item.step);

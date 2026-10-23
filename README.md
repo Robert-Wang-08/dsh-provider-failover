@@ -93,6 +93,20 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 
 字段：顶层 `enabled` / `policyMode` / `policyFailover`（兼容旧字段）/ `maxPolicyRetriesPerStep` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `cooldownByCode`（按错误码覆盖冷却毫秒，如 `{"QUOTA": 18000000}` 把额度耗尽的冷却拉到 5 小时；usage limit / quota 等消息模式兜底也归 QUOTA，未命中退回条目 `cooldownMs`）/ `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
 
+### 冷却语义与「无候选」
+
+- **只在真的切走之后**才给失败路由写冷却：失败但档位表里没有可用候选时，不再顺手冻结这条路。
+  否则一串链路抖动会逐个冻住每条路由，等其中某条报额度耗尽时整条梯子都在冷却里，切换无从发生。
+- **冷却只延长、不缩短**：同一路由先被判 `QUOTA`（`cooldownByCode.QUOTA`，默认 5 小时）之后，
+  再来一条 `SERVER` 不会把它改写成 60 秒，额度已死的路由不会被 60 秒后重新捡回。
+- **无候选会留痕**：档位表耗尽时推一条 `kind=exhausted` 的会话通知（进 `notices.jsonl` 与会话
+  通知条，附带「谁在冷却」摘要），不再只有内存 `ignored` 环里那条看不见的记录。
+- **类别按折算后的生效码**：宿主管线把失败留在 `PI_AI_ERROR` 里、靠消息或状态码折算成 `QUOTA`
+  时，冷却同样按 `QUOTA` 计；只有未登记的类别才回退条目 `cooldownMs`。
+
+2026-10-23 的起因与完整时间线（kimi 额度耗尽时五条路由同时冷却 → 无候选）见 DSH 工作区的
+`docs/ptc/reports/failover-kimi-quota-20261023.md`；回归断言见 `probe/smoke-cooldown.mjs`。
+
 ### 按模型族对齐档位（推荐）
 
 把**同一个 model** 的多个路由放进同一档，额度耗尽时就会先在同族内互备；跨族降级交给下一档：

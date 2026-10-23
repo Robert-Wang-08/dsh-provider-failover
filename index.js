@@ -487,6 +487,11 @@ function cooldownMsFor(cooldownByCode, entryCooldownMs, code, how, patterns) {
     const mapped = COOLDOWN_PATTERN_CLASS[pattern]
     if (mapped !== undefined) klass = mapped
     else klass = patternCodeFor(pattern, patterns) ?? klass
+  } else if (typeof how === 'string' && how.indexOf('effective:') === 0) {
+    // 宿主没归一化（code 仍是 PI_AI_ERROR）、靠消息/状态码折算出类别的失败，
+    // 必须按**折算后的类别**取冷却：否则 "You have hit your ChatGPT usage limit" 这类
+    // 真实额度耗尽只吃到条目兜底的 60 秒，一分钟后又把死路由捡回来打一次。
+    klass = how.slice('effective:'.length)
   }
   const specific = klass.length > 0 && isPlainObject(cooldownByCode) ? cooldownByCode[klass] : undefined
   if (positiveNumber(specific)) return specific
@@ -853,11 +858,21 @@ function normalizeConfig(raw) {
         }
       }
       if (id === undefined || route === undefined || model === undefined || !positiveNumber(cooldownMs)) continue
+      // WINDOWFIX: 可选显式上下文窗口声明（token 数），覆盖内置路由兜底表。
+      let contextWindow
+      if (rawEntry.contextWindow !== undefined) {
+        if (!positiveNumber(rawEntry.contextWindow) || !Number.isInteger(rawEntry.contextWindow)) {
+          errors.push('entry.contextWindow must be a positive integer (entry ' + String(id ?? '?') + ')')
+        } else {
+          contextWindow = rawEntry.contextWindow
+        }
+      }
       const compatible = isPlainObject(rawEntry.compatible) ? rawEntry.compatible : {}
       entries.push({
         id,
         route,
         model,
+        contextWindow,
         description: optionalString(rawEntry.description) ?? '',
         keywords: strings(rawEntry.keywords).map((keyword) => keyword.toLowerCase()),
         compatible: { tools: compatible.tools !== false, images: compatible.images === true },
@@ -921,6 +936,28 @@ function masked(value) {
   return text.slice(0, 6) + '····' + text.slice(-4)
 }
 
+// WINDOWFIX: 已知路由的声明上下文窗口兜底表（条目未显式声明 contextWindow 时使用）。
+// 数值来自 2026-10-21 运行时观测（request/context.contextWindow）；条目显式声明优先。
+const BUILTIN_CONTEXT_WINDOWS = {
+  'ais-2dsglm': 1000000,
+  'opencode-go': 1000000,
+  'kimi-coding': 262144,
+  'codex-relay': 500000,
+  'openai-codex': 500000,
+}
+
+// WINDOWFIX: 条目生效窗口 = 显式 contextWindow > 内置路由兜底 > undefined（未知不参与溢出切换）。
+function declaredContextWindow(entry) {
+  const explicit = entry?.contextWindow
+  if (typeof explicit === 'number' && Number.isFinite(explicit) && explicit > 0) return explicit
+  const builtin = BUILTIN_CONTEXT_WINDOWS[entry?.route]
+  return typeof builtin === 'number' && builtin > 0 ? builtin : undefined
+}
+
+// WINDOWFIX: 识别上游包装成 invalid_request_error 的上下文溢出文案
+// （实证：kimi 400 "Your request exceeded k3-256k model token limit: 262144"）。
+const CONTEXT_OVERFLOW_MESSAGE_PATTERN = /token limit|maximum context length|context length|too many tokens|context window exceeded/i
+
 /**
  * 该失败是否属于「可切换」，并给设置页一个明确的“不切换原因”。
  * 内容/安全策略拒绝必须先于通用 INVALID_REQUEST 判断：它不是请求参数问题。
@@ -943,10 +980,15 @@ function isSwitchable(config, code, message) {
     }
     return { hit: true, how: 'policy:prompt', category: 'switchable', policy: true }
   }
+  // WINDOWFIX: 上下文超限不再一律「不切换」——换 key 确实无效，但切换到**声明窗口更大**
+  // 的候选有效（含压缩自救：compaction 请求走同一 failover 面）。无更大窗口候选时由调用方忽略。
   if (normalized === 'CONTEXT_WINDOW_EXCEEDED') {
-    return { hit: false, category: 'context', reason: '上下文窗口超限；切换密钥无效，请缩短上下文或先压缩。' }
+    return { hit: true, how: 'window:overflow', category: 'context-window' }
   }
   if (normalized === 'INVALID_REQUEST') {
+    if (CONTEXT_OVERFLOW_MESSAGE_PATTERN.test(String(message ?? ''))) {
+      return { hit: true, how: 'window:overflow-400', category: 'context-window' }
+    }
     return { hit: false, category: 'invalid-request', reason: '请求参数无效；切换密钥无效，请修正请求配置。' }
   }
   if (normalized === 'UNSUPPORTED_REASONING_EFFORT') {
@@ -1219,6 +1261,14 @@ export function apply(ctx, rawConfig) {
      * agent/request 取用，作为该会话步骤的需求粘滞。sessionId -> { needs, at }。
      */
     pendingNeeds: new Map(),
+    /**
+     * WINDOWFIX-FLOOR: 每会话的上下文窗口下限（token 数）。会话在某窗口 W 的模型上发生
+     * 上下文溢出时提升到 W（取历史最大值），此后该会话的**所有**候选切换（不限失败类别）
+     * 都过滤掉声明窗口 ≤ 下限的条目，防止非溢出失败（QUOTA/SERVER/TRANSPORT）把大上下文
+     * 会话降级进装不下的窗口。sessionKey -> { window, at }；TTL 到期或容量淘汰后失效
+     * （会话压缩变小后允许回到小窗口模型）。
+     */
+    contextFloors: new Map(),
     /** 排序结果缓存：hash -> { ids, at } */
     rankingCache: new Map(),
     /** 进行中的排序请求 signal 集合（钩子据此豁免自身调用；支持并发） */
@@ -1745,6 +1795,35 @@ export function apply(ctx, rawConfig) {
     return health !== undefined && health.coolingUntil > now
   }
 
+  /**
+   * 写入路由冷却：**只延长，不缩短**。
+   * 同一路由可能先被判 QUOTA（5 小时），随后一条 SERVER 只值 30 分钟——旧实现直接 set()，
+   * 会把额度已死的路由 30 分钟后又放回候选，于是「打一次再冻一次」。取两者较晚者即消除该抖动。
+   */
+  function coolDownRoute(route, now, ms, code, message) {
+    if (typeof route !== 'string' || route.length === 0) return
+    const until = now + (positiveNumber(ms) === true ? ms : 60000)
+    const previous = state.routeHealth.get(route)
+    const coolingUntil = previous !== undefined && Number.isFinite(previous.coolingUntil) && previous.coolingUntil > until ? previous.coolingUntil : until
+    state.routeHealth.set(route, {
+      coolingUntil,
+      code: typeof code === 'string' ? code : '',
+      message: String(message ?? '').slice(0, 200),
+      at: now,
+    })
+  }
+
+  /** 当前冷却中的路由摘要（给人看，不进模型上下文）：route(CODE, 至 HH:MM:SS)。 */
+  function coolingSummary(now) {
+    const items = []
+    for (const [route, health] of state.routeHealth) {
+      if (health === undefined || !(health.coolingUntil > now)) continue
+      const until = new Date(health.coolingUntil).toLocaleTimeString('zh-CN', { hour12: false })
+      items.push(route + '(' + String(health.code ?? '') + ', 至 ' + until + ')')
+    }
+    return items.length === 0 ? '(无)' : items.join(', ')
+  }
+
   function pushLog(record) {
     state.switchLog.unshift(record)
     if (state.switchLog.length > 50) state.switchLog.length = 50
@@ -2158,17 +2237,56 @@ export function apply(ctx, rawConfig) {
     return orderEntries(tier.entries, context)
   }
 
+  // WINDOWFIX-FLOOR: 会话上下文下限——溢出后该会话的一切候选切换都避开 ≤ 下限的窗口。
+  const CONTEXT_FLOOR_TTL_MS = 2 * 60 * 60 * 1000
+  const CONTEXT_FLOOR_MAX_ENTRIES = 256
+
+  function sessionContextFloor(sessionId, now) {
+    const key = sessionKeyOf(sessionId)
+    const entry = state.contextFloors.get(key)
+    if (entry === undefined) return undefined
+    if (now - entry.at > CONTEXT_FLOOR_TTL_MS) {
+      state.contextFloors.delete(key)
+      return undefined
+    }
+    return entry.window
+  }
+
+  function raiseContextFloor(sessionId, window, now) {
+    if (typeof window !== 'number' || !Number.isFinite(window) || window <= 0) return
+    const key = sessionKeyOf(sessionId)
+    const prev = state.contextFloors.get(key)
+    state.contextFloors.set(key, { window: Math.max(window, prev?.window ?? 0), at: now })
+    if (state.contextFloors.size > CONTEXT_FLOOR_MAX_ENTRIES) {
+      let oldestKey
+      let oldestAt = Number.POSITIVE_INFINITY
+      for (const [k, v] of state.contextFloors) {
+        if (v.at < oldestAt) { oldestAt = v.at; oldestKey = k }
+      }
+      if (oldestKey !== undefined) state.contextFloors.delete(oldestKey)
+    }
+  }
+
   /**
    * 在给定档位序列内按既有顺序选第一条可用候选：逐条跳过未启用条目、已尝试、冷却中、
    * 能力不兼容、不可解析的候选（与 v3.4.0 的 pickCandidate 过滤顺序完全一致）。
    */
-  async function pickInTiers(tiers, record, now, context, signal, excludeRoute) {
+  async function pickInTiers(tiers, record, now, context, signal, excludeRoute, minContextWindow) {
     for (const tier of tiers) {
       if (tier.enabled !== true) continue
       for (const entry of await entriesInOrder(tier, context, signal, excludeRoute)) {
         if (entry.enabled !== true) continue
+        // 失败路由本身不是自己的候选。旧实现靠「选候选之前先把失败路由写进冷却」间接排除它；
+        // 冷却写入已移到选中候选之后（agent/request-error），因此这里必须显式排除，
+        // 否则 no-candidate 之后的下一步会把自己的失败路由又选回来。
+        if (typeof excludeRoute === 'string' && excludeRoute.length > 0 && entry.route === excludeRoute) continue
         if (record.attempted.has(attemptKey(entry.id, entry.route, activeRefOf(entry.route)))) continue
         if (cooling(entry.route, now)) continue
+        // WINDOWFIX: 溢出切换只在「声明窗口严格更大」的候选间选择；窗口未知者不参与。
+        if (minContextWindow !== undefined) {
+          const entryWindow = declaredContextWindow(entry)
+          if (entryWindow === undefined || entryWindow <= minContextWindow) continue
+        }
         if (compatible(entry, record.needs) !== true) continue
         if ((await serviceable(entry, signal)) !== true) continue
         return { tier, entry }
@@ -2177,20 +2295,24 @@ export function apply(ctx, rawConfig) {
     return undefined
   }
 
-  async function pickCandidate(sessionId, turn, step, context, signal, excludeRoute) {
+  async function pickCandidate(sessionId, turn, step, context, signal, excludeRoute, minContextWindow) {
     const record = stepState(sessionId, turn, step)
     const now = Date.now()
+    // WINDOWFIX-FLOOR: 会话下限（历史溢出窗口）与本次显式最小窗口取较大者，对所有失败类别的切换生效。
+    const floorWindow = sessionContextFloor(sessionId, now)
+    const effectiveMinWindow = Math.max(minContextWindow ?? 0, floorWindow ?? 0)
+    const minWindow = effectiveMinWindow > 0 ? effectiveMinWindow : undefined
     // 同族互备（ranking.sameTierFirst，默认 false）：失败路由能在档位表中定位时，先只扫它
     // 所落的那一档；该档内选不到才退回全档扫描。开关关闭、失败路由为空或无法定位时
     // 只有一条路径，与旧行为逐字等价。不触碰 key 轮换、冷却写入、record.switches 与限流判定。
     if (config.ranking.sameTierFirst === true && typeof excludeRoute === 'string' && excludeRoute.length > 0) {
       const failedTier = tierOf(config, excludeRoute)
       if (failedTier !== undefined) {
-        const sameTier = await pickInTiers([failedTier], record, now, context, signal, excludeRoute)
+        const sameTier = await pickInTiers([failedTier], record, now, context, signal, excludeRoute, minWindow)
         if (sameTier !== undefined) return sameTier
       }
     }
-    return pickInTiers(config.tiers, record, now, context, signal, excludeRoute)
+    return pickInTiers(config.tiers, record, now, context, signal, excludeRoute, minWindow)
   }
 
   // ---------------------------------------------------------------- 钩子一
@@ -2476,18 +2598,38 @@ export function apply(ctx, rawConfig) {
       // 无可用下一把（全部失效 / 未配置 / 写入失败）→ 落到 provider 切换路径。
     }
 
-    // ② provider 切换：失败路由进入冷却，本步不再尝试它。
-    if (failedRoute.length > 0) {
-      state.routeHealth.set(failedRoute, {
-        coolingUntil: now + cooldownMsFor(config.cooldownByCode, failedEntry?.cooldownMs, code, decision.how, config.failurePatterns),
-        code: typeof failure?.code === 'string' ? failure.code : '',
-        message: String(failure?.message ?? '').slice(0, 200),
-        at: now,
-      })
-    }
+    // ② provider 切换：先选候选，**选中之后**才把失败路由写进冷却（见下方 coolDownRoute 调用）。
+    //    旧实现先写冷却再选候选，于是「根本没切走」的失败也把该路由冻住 N 分钟：
+    //    2026-10-23 实测一串网络抖动逐个冻住 tier1/tier2 五条路由，等 kimi 报额度耗尽时
+    //    整条梯子都在冷却里，QUOTA 无从切换、只能原地失败（举证与后续修正见
+    //    docs/ptc/reports/failover-kimi-quota-20261023.md）。
+    //    选候选时失败路由由 pickInTiers 的 excludeRoute 显式排除，不再依赖冷却副作用。
+    const coolingMs = cooldownMsFor(config.cooldownByCode, failedEntry?.cooldownMs, code, decision.how, config.failurePatterns)
 
+    // WINDOWFIX: 上下文超限切换——只在「声明窗口严格更大」的候选间选择；失败条目窗口未知
+    // 或不存在更大候选时，保持原「不切换」行为并明确记录原因。
+    const overflowSwitch = decision.category === 'context-window'
+    const failedWindow = overflowSwitch && failedEntry !== undefined ? declaredContextWindow(failedEntry) : undefined
+    // WINDOWFIX-FLOOR: 溢出即精确信号（context > 失败模型窗口），提升该会话的下限。
+    if (overflowSwitch && failedWindow !== undefined) {
+      raiseContextFloor(sessionId, failedWindow, now)
+    }
+    if (overflowSwitch && failedWindow === undefined) {
+      pushIgnored({
+        at: now,
+        session: sessionKey === '-' ? '' : sessionKey,
+        provider: failedRoute,
+        category: 'context',
+        reason: '上下文超限，但失败条目未声明上下文窗口，无法判定更大窗口候选；保持当前模型，请先压缩上下文。',
+        code,
+        message: String(failure?.message ?? '').slice(0, 200),
+        turn,
+        step,
+      })
+      return next()
+    }
     const context = String(failure?.code ?? '') + ' ' + String(failure?.message ?? '') + (record.needs.tools ? ' tools' : '') + (record.needs.images ? ' images' : '')
-    const picked = await pickCandidate(sessionId, turn, step, context, payload?.signal, failedRoute)
+    const picked = await pickCandidate(sessionId, turn, step, context, payload?.signal, failedRoute, overflowSwitch ? failedWindow : undefined)
     if (picked === undefined) {
       // 没有可用候选也是决策，必须留痕：否则“什么都没发生”在证据里和“没触发”无法区分。
       pushIgnored({
@@ -2501,9 +2643,31 @@ export function apply(ctx, rawConfig) {
         turn,
         step,
       })
+      // 只进内存 ignored 环等于没留痕：调用方只看得到一条 bare 上游错误，会误判成「failover 失效」。
+      // 因此同样落一条会话可见通知（notices.jsonl + 会话通知条），把「无候选」和「谁在冷却」说清楚。
+      pushNotice({
+        at: now,
+        session: sessionId,
+        kind: 'exhausted',
+        stage: 'exhausted',
+        code: typeof failure?.code === 'string' ? failure.code : '',
+        trigger: 'no-candidate',
+        fromRoute: failedRoute,
+        fromModel: typeof payload?.model === 'string' ? payload.model : '',
+        toRoute: '',
+        toModel: '',
+        tier: 0,
+        turn,
+        step,
+        reasonId: reason.id,
+        reasonLabel: reason.label,
+        detail: '无可用候选；冷却中：' + coolingSummary(now),
+      })
       return next()
     }
 
+    // 真的选到了下一跳，才把失败路由写进冷却（只延长、不缩短）。
+    coolDownRoute(failedRoute, now, coolingMs, code, failure?.message)
     record.target = { entry: picked.entry, tier: picked.tier, reason: decision.how }
     record.switches += 1
     state.lastSwitchAt.set(sessionKey, now)
@@ -3034,4 +3198,4 @@ export function normalize(raw) {
 export { masked }
 
 /** 内部纯函数，供冒烟测试断言（不属于对外契约）。 */
-export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef, resolveTestTarget, unsupportedReasoningEffort, classifyProbeFailure, cooldownMsFor, patternCodeFor, effectiveFailureCode, failureReasonFor, mergeFailureReasons, DEFAULT_FAILURE_REASONS }
+export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef, resolveTestTarget, unsupportedReasoningEffort, classifyProbeFailure, cooldownMsFor, patternCodeFor, effectiveFailureCode, failureReasonFor, mergeFailureReasons, DEFAULT_FAILURE_REASONS, declaredContextWindow }
