@@ -144,6 +144,110 @@ window.__ModuleLoader__.load({
       return "[" + ignoredLabel(item.category) + "] " + where + code + " · " + why + "（" + when + "）";
     }
 
+    /**
+     * 凭据引用名的形状：与 Host 半 KEY_REF_PATTERN 同口径的 POSIX 标识符。
+     * 界面侧必须先做同一条校验，否则用户先看到「行加上了」，直到点保存才被
+     * Host 用英文 400 打回（"invalid credential reference name"），观感就是
+     * 「添加生效了、保存说无效」。
+     */
+    const REF_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+    /**
+     * 值更像密钥本身而不是引用名（只用于把失败原因讲清楚，不改变合法名判定）。
+     * 只认三类证据：已知密钥前缀、超长串、高熵字母数字串——不含「含非法字符」，
+     * 否则 DEEPSEEK-KEY 这类带横线的普通名字会被误说成密钥值。
+     */
+    function looksLikeSecretValue(value) {
+      const text = String(value);
+      if (/^(sk|pk|rk|gsk|xai|key|token|bearer)[-_.]/i.test(text) === true) return true;
+      if (text.length >= 40) return true;
+      return /^[A-Za-z0-9+/_-]{20,}={0,2}$/.test(text) === true && /\d/.test(text) === true && /[A-Za-z]/.test(text) === true;
+    }
+
+    /** 单行引用名的问题描述；空串表示合法（空行也返回空串，保存时被过滤）。 */
+    function describeRefIssue(value) {
+      const text = String(value);
+      if (text.length === 0) return "";
+      if (REF_NAME_PATTERN.test(text) === true) return "";
+      if (/^\s|\s$/.test(text) === true) return "首尾有空格";
+      if (/\s/.test(text) === true) return "不能包含空格";
+      if (/^\d/.test(text) === true) return "不能以数字开头";
+      if (looksLikeSecretValue(text) === true) return "看起来是密钥值；这里填环境变量名/凭据引用名，密钥值请写进 .credentials.yaml 或环境变量";
+      return "只能使用字母、数字、下划线，且不能以数字开头";
+    }
+
+    /** 草稿整理成提交体：去首尾空白、丢空行；某条目全空则不入 map（= 删除该覆盖，回退 patch）。 */
+    function keyDraftMap(draft) {
+      const map = {};
+      for (const entryId of Object.keys(draft)) {
+        const refs = draft[entryId].map((ref) => String(ref).trim()).filter((ref) => ref.length > 0);
+        if (refs.length > 0) map[entryId] = refs;
+      }
+      return map;
+    }
+
+    /** 稳定比较用的序列化（条目键排序，引用顺序保留——顺序即轮换顺序）。 */
+    function normalizedKeyMap(map) {
+      return JSON.stringify(Object.keys(map).sort().map((entryId) => [entryId, map[entryId]]));
+    }
+
+    /**
+     * 保存前的整表预检：与 Host 半 validateKeysByEntry 的四类拒绝一一对应
+     * （形状不合法 / 条目内重复 / 跨条目重复 / 未知条目 id），返回每一行的问题。
+     */
+    function reviewKeyDraft(draft) {
+      const rows = [];
+      const owner = new Map();
+      for (const entryId of Object.keys(draft)) {
+        const seen = new Set();
+        draft[entryId].forEach((value, index) => {
+          const ref = String(value).trim();
+          if (ref.length === 0) return;
+          const shape = describeRefIssue(ref);
+          if (shape.length > 0) {
+            rows.push({ entryId, index, ref, message: shape });
+            return;
+          }
+          if (seen.has(ref) === true) {
+            rows.push({ entryId, index, ref, message: "同一录入内重复（上一行已填 " + ref + "）" });
+            return;
+          }
+          seen.add(ref);
+          const previous = owner.get(ref);
+          if (previous !== undefined && previous !== entryId) {
+            rows.push({ entryId, index, ref, message: "该引用名已被条目 " + previous + " 使用；一个引用只服务一个条目" });
+            return;
+          }
+          if (previous === undefined) owner.set(ref, entryId);
+        });
+      }
+      return rows;
+    }
+
+    /** 把 Host 半的英文 key 校验错误翻成可操作的中文（识别不了的原样返回）。 */
+    function friendlyKeyError(message) {
+      const text = String(message);
+      const invalidName = /^keysByEntry\.(\S+) has an invalid credential reference name: (.*)$/.exec(text);
+      if (invalidName !== null) {
+        const ref = invalidName[2].replace(/^"|"$/g, "");
+        const why = describeRefIssue(ref);
+        return "引用名「" + ref + "」不合法" + (why.length > 0 ? "（" + why + "）" : "")
+          + "：只能用字母、数字、下划线且不以数字开头；这里填环境变量名，不填密钥值。";
+      }
+      const repeats = /^keysByEntry\.(\S+) repeats credential reference: (.*)$/.exec(text);
+      if (repeats !== null) return "条目 " + repeats[1] + " 内重复了同一个引用名：" + repeats[2] + "（列表顺序即轮换顺序，去掉重复项）。";
+      const unknown = /^keysByEntry has unknown entry id: (.*)$/.exec(text);
+      if (unknown !== null) return "档位表里没有条目 id「" + unknown[1] + "」（配置刚被改动时会这样，请点『重新读取』后重试）。";
+      const shared = /^credential reference "(.*)" is used by both entry (\S+) and entry (.*)$/.exec(text);
+      if (shared !== null) return "引用名「" + shared[1] + "」同时被条目 " + shared[2] + " 和 " + shared[3] + " 使用；一个引用只服务一个条目，请改名或只保留其一。";
+      const notArray = /^keysByEntry\.(\S+) must be an array of credential reference names$/.exec(text);
+      if (notArray !== null) return "条目 " + notArray[1] + " 的 key 列表必须是引用名数组。";
+      if (text === "keysByEntry must be an object mapping entry id to credential reference names") {
+        return "key 列表格式不对：应为「条目 id → 引用名数组」的映射。";
+      }
+      return text;
+    }
+
     function ProviderFailoverPanel() {
       const [status, setStatus] = react.useState(null);
       const [catalog, setCatalog] = react.useState(null);
@@ -250,11 +354,30 @@ window.__ModuleLoader__.load({
       if (String(form.keyResetAt) !== String(status.editable.keyResetAt)) patch.keyResetAt = String(form.keyResetAt);
       const dirty = Object.keys(patch).length > 0;
 
+      // key 草稿的派生状态：与快照比较得出脏标记，并在保存前做与 Host 同口径的整表预检。
+      const savedKeyMap = keyDraftMap(draftOf(status));
+      const keyDraftShape = keyDraftMap(keyDraft);
+      const keyDirty = normalizedKeyMap(keyDraftShape) !== normalizedKeyMap(savedKeyMap);
+      const keyRows = reviewKeyDraft(keyDraft);
+      const keyBlocked = keyDirty === true && keyRows.length > 0;
+      const keyProblemOf = (entryId, index) => {
+        const row = keyRows.find((item) => item.entryId === entryId && item.index === index);
+        return row === undefined ? "" : row.message;
+      };
+
       const save = async () => {
-        if (dirty !== true) return;
+        if (dirty !== true && keyDirty !== true) return;
+        if (keyBlocked === true) {
+          setKeyError("key 列表有未修正项（见下方标红行），先修正再保存。");
+          return;
+        }
         setBusy(true);
         try {
-          const data = await saveConfig(patch);
+          // 主保存一并提交待保存的 key 改动：否则「行加上了、点保存却什么也没发生」，
+          // 用户会把这种静默当成「保存无效」。
+          const payload = Object.assign({}, patch);
+          if (keyDirty === true) payload.keysByEntry = keyDraftShape;
+          const data = await saveConfig(payload);
           setStatus(data);
           setForm(formOf(data));
           setKeyDraft(draftOf(data));
@@ -294,21 +417,21 @@ window.__ModuleLoader__.load({
 
       /** 提交：只保留有内容的引用；某条目全部清空 = 删除该覆盖，回退 profile patch。 */
       const saveKeys = async () => {
-        const map = {};
-        for (const entryId of Object.keys(keyDraft)) {
-          const refs = keyDraft[entryId].map((ref) => String(ref).trim()).filter((ref) => ref.length > 0);
-          if (refs.length > 0) map[entryId] = refs;
+        if (keyRows.length > 0) {
+          const first = keyRows[0];
+          setKeyError("有未修正项（" + first.entryId + " 第 " + String(first.index + 1) + " 行「" + first.ref + "」）—— " + first.message);
+          return;
         }
         setBusy(true);
         try {
-          const data = await saveConfig({ keysByEntry: map });
+          const data = await saveConfig({ keysByEntry: keyDraftShape });
           setStatus(data);
           setForm(formOf(data));
           setKeyDraft(draftOf(data));
           setKeyError("");
           setSaved("key 列表已保存并即时生效");
         } catch (err) {
-          setKeyError(err.message);
+          setKeyError(friendlyKeyError(err.message));
         } finally {
           setBusy(false);
         }
@@ -326,7 +449,10 @@ window.__ModuleLoader__.load({
           return h("span", { className: "pf-badge pf-badge-failed", title: why }, "失效 " + when + (why.length > 0 ? " · " + why : ""));
         }
         if (item.configured !== true) {
-          return h("span", { className: "pf-badge pf-badge-muted", title: "宿主凭据库中没有这个引用" }, "未配置");
+          return h("span", {
+            className: "pf-badge pf-badge-muted",
+            title: "宿主凭据库里没有这个引用名——引用名本身没问题，缺的是值：把它写进 .credentials.yaml 的 refs 或同名环境变量",
+          }, "未配置");
         }
         return h("span", { className: "pf-badge " + (item.active === true ? "pf-badge-active" : "pf-badge-muted") },
           item.active === true ? "在用" : "可用",
@@ -334,7 +460,7 @@ window.__ModuleLoader__.load({
       };
 
       const keyCard = h("div", { className: "pf-card" },
-        h("div", { className: "pf-hint" }, "单 provider 多 key（凭据引用名）——填环境变量名，不要填密钥值；值请在 .credentials.yaml 或环境变量里提供。列表顺序即轮换顺序，首项为默认 key。"),
+        h("div", { className: "pf-hint" }, "单 provider 多 key（凭据引用名）——只填环境变量名/引用名：字母、数字、下划线，不能以数字开头（例：MY_PROVIDER_API_KEY_2）；不要填密钥值，值请写进 .credentials.yaml 或环境变量。列表顺序即轮换顺序，首项为默认 key。"),
         status.tiers.map((tier) => tier.entries.map((entry) =>
           h("div", { className: "pf-entry", key: entry.id },
             h("div", { className: "pf-row" },
@@ -348,14 +474,17 @@ window.__ModuleLoader__.load({
                   placeholder: "MY_PROVIDER_API_KEY_2",
                   onChange: (event) => { setKeyRef(entry.id, index, event.target.value); setSaved(""); setKeyError(""); },
                 }),
-                refBadge(entry, String(ref).trim()),
-                h("button", { className: "pf-btn", disabled: busy === true, onClick: () => removeKeyRef(entry.id, index) }, "移除"))),
+                String(ref).trim().length === 0 ? null : refBadge(entry, String(ref).trim()),
+                h("button", { className: "pf-btn", disabled: busy === true, onClick: () => removeKeyRef(entry.id, index) }, "移除"),
+                keyProblemOf(entry.id, index).length === 0 ? null : h("span", { className: "pf-err" }, keyProblemOf(entry.id, index)))),
             h("div", { className: "pf-actions" },
               h("button", { className: "pf-btn", disabled: busy === true, onClick: () => addKeyRef(entry.id) }, "+ 添加 key 引用"),
               h("span", { className: "pf-hint" }, keyDraft[entry.id].length === 0 ? "（无 key 引用：该条目不参与轮换）" : ""))))),
         h("div", { className: "pf-actions" },
           h("button", { className: "pf-btn", disabled: busy === true, onClick: saveKeys }, busy === true ? "保存中…" : "保存 key 列表"),
           h("span", { className: "pf-hint" }, "清空某条目的全部引用 = 删除该覆盖，回退 profile patch 的 keys"),
+          keyRows.length > 0 ? h("span", { className: "pf-err" }, "有 " + String(keyRows.length) + " 处待修正，修正后才能保存") : null,
+          keyDirty === true && keyRows.length === 0 ? h("span", { className: "pf-hint" }, "有未保存的 key 改动") : null,
           keyError.length > 0 ? h("span", { className: "pf-err" }, keyError) : null));
 
       /** 测试切换：切到目标条目（空 = 下一个启用条目），并展示结果。 */
@@ -543,9 +672,10 @@ window.__ModuleLoader__.load({
           resetAtRow),
 
         h("div", { className: "pf-actions" },
-          h("button", { className: "pf-btn", disabled: busy === true || dirty !== true, onClick: save }, busy === true ? "保存中…" : "保存"),
+          h("button", { className: "pf-btn", disabled: busy === true || (dirty !== true && keyDirty !== true), onClick: save }, busy === true ? "保存中…" : "保存"),
           h("button", { className: "pf-btn", disabled: busy === true, onClick: load }, "重新读取"),
           h("button", { className: "pf-btn", disabled: busy === true, onClick: resetAllKeys }, "重置 key 状态"),
+          keyDirty === true ? h("span", { className: "pf-hint" }, "key 列表有未保存改动（点『保存』会一并提交）") : null,
           saved.length > 0 ? h("span", { className: "pf-ok" }, saved) : null,
           error.length > 0 ? h("span", { className: "pf-err" }, error) : null,
           status.writable !== true ? h("span", { className: "pf-err" }, "settings 服务未装载，无法在此保存") : null),
@@ -731,6 +861,8 @@ window.__ModuleLoader__.load({
 
     exports.apply = apply;
     exports.inject = inject;
+    // 供 probe/smoke-keys.mjs 直接单测 key 草稿校验（Host/Web 运行期不使用）。
+    exports.__test = { REF_NAME_PATTERN, describeRefIssue, looksLikeSecretValue, keyDraftMap, normalizedKeyMap, reviewKeyDraft, friendlyKeyError };
     return module.exports;
   },
 });

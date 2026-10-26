@@ -147,6 +147,7 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 - **候选预检**：轮换前用 `credentials.describe(ref)` 确认目标引用已配置；未配置则跳过并每进程警告一次（`key reference skipped: …`）。全部候选不可用时交回宿主默认失败路径（写入设置文件失败同样如此）。
 - **有界**：记账键是 `entryId@route#ref`，同一引用每 `(turn, step)` 至多一次；轮换计入单 turn 上限与最小切换间隔；key 类失败**不给路由冷却**（否则换 key 后仍被冷却挡住）。
 - **每个引用只服务一个 provider**：同一引用名不得出现在多个条目（校验拒绝）。
+- **设置页口径（2026-10-26 修）**：设置页的多 key 卡片在提交前跑与 Host 半 `validateKeysByEntry` **同口径**的整表预检——引用名形状（`^[A-Za-z_][A-Za-z0-9_]*$`）、条目内重复、跨条目重复——非法行**行内标红**并写中文原因，保存按钮同时给出待修正计数；不会再出现「行先加上了、点保存才被英文 400 打回」的观感。主「保存」也会一并提交待保存的 key 改动（此前只管通用字段，key 草稿点了像没生效）。徽标 `未配置` 的准确含义是**宿主凭据库里没有这个引用名**——缺的是值（写 `.credentials.yaml` 的 `refs` 或同名环境变量），引用名本身没问题；`失效` 才是这个引用真实请求失败过（带时间、错误码与细分原因）。
 - 无 `keys` 或 `keys: []` 的条目行为与单 key 完全一致。
 
 ### 每日重置与手工状态
@@ -301,6 +302,10 @@ dsh 设置页新增「Provider 故障转移」小节：**总开关** + 常用参
 pnpm install
 node --check index.js
 node probe/smoke-config.mjs      # 配置归一化、key 轮换与接口冒烟（不依赖 dsh 运行时）
+node probe/smoke-keys.mjs        # key 引用名校验、跨条目去重与错误中文化单测（含与 Host 正则一致性断言）
+node probe/client-panel.mjs      # 设置页面板真实渲染回归（key 卡片：合法/非法草稿、未配置徽标、行内标红）
+node probe/smoke-client.mjs      # 客户端半字符串冒烟（slot 注册与关键接线）
+node probe/client-dock.mjs       # 会话通知条渲染回归
 node probe/mock-llm.mjs 8799     # 本地 mock LLM 端点（配合 probe/dsh-failover-probe 做运行时验证）
 ```
 
@@ -333,3 +338,33 @@ node probe/mock-llm.mjs 8799     # 本地 mock LLM 端点（配合 probe/dsh-fai
 - `pendingNeeds` 淘汰与 `steps` 同形，因入表时已写 `at: Date.now()` 故未触发，但仍补上排除当前 key（`if (k === needsKey) continue`）以固化不变量。
 
 其余有界集合无此问题：`switchLog`/`ignoredLog` 的 50 条上限方向正确；`rankingCache` 按插入序 FIFO 淘汰（新键追加在尾，不会被自身淘汰，`at` 仅用于 TTL）；`startupHandled` 为 `WeakSet` 不阻止 GC；`lastSwitchAt`/`pins` 随会话增长但非淘汰逻辑缺陷。
+
+## 缺陷修复：多 key 保存「提示无效」而实际未落盘（2026-10-26）
+
+**现象**：设置页「单 provider 多 key」里点「+ 添加 key 引用」并输入引用名后，行确实留在了面板里（像已生效），但点「保存 key 列表」被拒——提示一条英文 `invalid ...` 错误；`$DSH_HOME/plugins/provider-failover/settings.json` 里始终没有 `keysByEntry`，运行时也没有任何 key 轮换记录。
+
+**定位结论**（对运行中的宿主逐条复现 `POST /provider-failover/config`）：
+
+| 提交 | Host 返回 |
+| --- | --- |
+| `{"keysByEntry":{"ais":["AIS_2DSGLM_API_KEY_2"]}}` | `200`，写盘并即时生效 |
+| `{"keysByEntry":{"ais":["BAD-NAME"]}}` | `400 keysByEntry.ais has an invalid credential reference name: "BAD-NAME"` |
+| `{"keysByEntry":{"ais":["SHARED_KEY"],"opencodego":["SHARED_KEY"]}}` | `400 credential reference "SHARED_KEY" is used by both entry ais and entry opencodego` |
+| `{"keysByEntry":{"ais":["DUP_KEY","DUP_KEY"]}}` | `400 keysByEntry.ais repeats credential reference: DUP_KEY` |
+
+即**保存链路本身是通的**（合法引用名能落盘并立即生效，随后 `GET /status` 的 `editable.keysByEntry` 与 `tiers[].entries[].keys` 都会反映出来）；失败全部来自 Host 的整表校验，而界面在提交前不做同口径校验、错误也是英文原文，于是「行加上了」与「保存被拒」并存，读起来就是「添加生效了、保存说无效」。
+
+**修法**（只改客户端半 `client.js`，Host 半语义不变）：
+
+- 提交前跑与 `validateKeysByEntry` 同口径的整表预检：引用名形状、条目内重复、跨条目重复——非法行**行内标红**并写中文原因（含「看起来是密钥值；这里填环境变量名」这种可直接照做的提示），卡片底部给出待修正计数。
+- Host 的英文 key 校验错误在界面翻成可操作中文（识别不了的原样透出，不吞错误）。
+- 主「保存」一并提交待保存的 key 改动（此前只管通用字段，key 草稿点了像什么都没发生），并在有未保存 key 改动时给出提示。
+- `未配置` 徽标补全含义（缺的是值不是名字）；空行不再显示误导性的 `未保存` 徽标。
+- `client.js` 导出 `__test`（形状/预检/翻译三个纯函数），供离线单测直接调用。
+
+**回归**：
+
+- `node probe/smoke-keys.mjs`：形状规则与 Host 半 `KEY_REF_PATTERN` 逐字一致、四类拒绝前置拦截、英文错误中文化、提交体整理与脏标记。
+- `node probe/client-panel.mjs`：用最小 React 运行时**真实渲染设置面板**（有/无非法草稿、已保存多 key、未配置徽标），防止 slot 边界吞掉渲染期异常这类"整块空白"回归。
+
+**生效条件**：客户端半改动**必须重启 `dsh web`**，并用启动打印的新 token 地址重开页面（与上文同一约束）。
