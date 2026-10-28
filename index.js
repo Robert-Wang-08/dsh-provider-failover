@@ -154,6 +154,13 @@ const DEFAULT_FAILURE_PATTERNS = [
   'invalid api key',
   'token limit',
   'rate limit',
+  // 上游内容安全策略拦截：OpenAI 兼容接口返回 200 + choices[0].finish_reason='content_filter'，
+  // pi-ai 的 mapStopReason 把它折成 errorMessage "Provider finish_reason: content_filter"，
+  // 宿主 classifyPiAiError 认不出 → PI_AI_ERROR（既不重试也不切换），整轮只剩一句
+  // 「本轮运行失败Provider finish_reason: content_filter」。这不是路由故障，但换一条 provider
+  // （另一套内容审核）确实可能放行，因此纳入模式兜底：立即切换、不原地重试、不冷却路由。
+  'content_filter',
+  'content filter',
   // 传输层异常：上游 WebSocket/SSE 中途断开。宿主 classifyPiAiError 只把
   // "WebSocket closed unexpectedly" 归一化为 TRANSPORT，像 "WebSocket closed 1000"
   // 这类仅带关闭码的文案会落到通用 PI_AI_ERROR，必须靠消息模式兜底才能触发切换。
@@ -192,6 +199,13 @@ const DEFAULT_FAILURE_PATTERNS = [
  * effectiveFailureCode 不同，这里在码已归一化时**不短路**——短路正是 AUTH 提示丢失原文的原因。
  */
 const DEFAULT_FAILURE_REASONS = [
+  {
+    id: 'CONTENT_FILTERED',
+    label: '被上游内容安全策略拦截（同来源重试通常无效，换来源可再试）',
+    // 实测 2026-10-27：宿主原样拼出 "Provider finish_reason: content_filter"，整轮终止且无提示。
+    // 放在表首：语义最具体，且不会与额度/凭据类词条互相覆盖。
+    patterns: ['content_filter', 'content filter', 'finish_reason: content_filter'],
+  },
   {
     id: 'QUOTA_EXHAUSTED',
     label: '额度/余额不足',
@@ -237,6 +251,7 @@ const CODE_REASON_LABELS = {
   RATE_LIMIT: '被限流',
   SERVER: '服务端异常',
   TRANSPORT: '传输中断',
+  CONTENT_FILTER: '被上游内容安全策略拦截',
   CONTEXT_WINDOW_EXCEEDED: '上下文超限',
   INVALID_REQUEST: '请求无效',
   UNSUPPORTED_REASONING_EFFORT: '推理档位不支持',
@@ -355,6 +370,9 @@ const DEFAULT_CONFIG = {
     INVALID_CREDENTIAL: { attempts: 0 },
     MISSING_CREDENTIAL: { attempts: 0 },
     NO_ADAPTER: { attempts: 0 },
+    // 内容安全拦截：同一来源重复同一内容通常同样被拦（确定性），原地重试只是白烧一次调用，
+    // 直接进入 provider 切换（换一套内容审核）。次数上限仍受 maxSwitchesPerTurn 约束。
+    CONTENT_FILTER: { attempts: 0 },
     DEFAULT: { attempts: 1, delayMs: 2000, budgetMs: 10000 },
   },
   terminalCodes: DEFAULT_TERMINAL_CODES,
@@ -439,6 +457,10 @@ const COOLDOWN_PATTERN_CLASS = {
   'token limit': 'RATE_LIMIT',
   'invalid api key': 'AUTH',
   'overloaded': 'SERVER',
+  // 内容安全拦截按本次请求的内容判定，不代表路由不可用：归入独立类别，冷却时长为 0
+  // （见 cooldownMsFor），避免把一条健康路由因为一段被拦的内容从梯子上摘掉。
+  'content_filter': 'CONTENT_FILTER',
+  'content filter': 'CONTENT_FILTER',
 }
 
 /**
@@ -492,6 +514,13 @@ function cooldownMsFor(cooldownByCode, entryCooldownMs, code, how, patterns) {
     // 必须按**折算后的类别**取冷却：否则 "You have hit your ChatGPT usage limit" 这类
     // 真实额度耗尽只吃到条目兜底的 60 秒，一分钟后又把死路由捡回来打一次。
     klass = how.slice('effective:'.length)
+  }
+  // 内容安全拦截是「这次请求的内容」问题，不是这条路由的健康问题：同一条路由换一段内容
+  // 多半就能过，冻住它反而把好路由从梯子上摘掉。显式返回 0（不冷却），cooldownByCode 仍可覆盖。
+  if (klass === 'CONTENT_FILTER') {
+    const override = isPlainObject(cooldownByCode) ? cooldownByCode.CONTENT_FILTER : undefined
+    if (positiveNumber(override)) return override
+    return 0
   }
   const specific = klass.length > 0 && isPlainObject(cooldownByCode) ? cooldownByCode[klass] : undefined
   if (positiveNumber(specific)) return specific
@@ -1018,6 +1047,7 @@ const PROBE_STATUS_LABELS = {
   RATE_LIMIT: '限流',
   SERVER: '服务端/网络异常',
   TRANSPORT: '传输中断',
+  CONTENT_FILTER: '内容安全拦截',
   CONTEXT_WINDOW_EXCEEDED: '上下文超限',
   INVALID_REQUEST: '请求无效',
   UNSUPPORTED_REASONING_EFFORT: '推理档位不支持',

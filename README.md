@@ -17,7 +17,7 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 
 默认集合：`QUOTA`、`AUTH`、`INVALID_CREDENTIAL`、`MISSING_CREDENTIAL`、`NO_ADAPTER`、`SERVER`、`RATE_LIMIT`、`TRANSPORT`。
 
-另有**消息模式兜底**（编码未归一化时按文本匹配）：`insufficient balance`、`insufficient_quota`、`quota exceeded`、`usage limit`、`usage_limit`、`balance`、`overloaded`、`invalid api key`、`token limit`、`rate limit`、`websocket closed`、`websocket error`、`websocket`、`http2`、`upstream_`。
+另有**消息模式兜底**（编码未归一化时按文本匹配）：`insufficient balance`、`insufficient_quota`、`quota exceeded`、`usage limit`、`usage_limit`、`balance`、`overloaded`、`invalid api key`、`token limit`、`rate limit`、`websocket closed`、`websocket error`、`websocket`、`http2`、`upstream_`、`content_filter`、`content filter`。
 
 > 兜底的意义：宿主 `classifyPiAiError` **只看错误文案、不看错误对象与 HTTP 状态码**，认不出来就统一返回 `PI_AI_ERROR`；而宿主默认重试码表（`dsh-llm` 的 `retryableCodes`）只含 `EMPTY_RESPONSE`/`RATE_LIMIT`/`SERVER`/`TIMEOUT`/`TRANSPORT`，**不含 `PI_AI_ERROR`**。所以凡落成 `PI_AI_ERROR` 的失败，宿主既不重试也不切换，唯一恢复路径就是本节这张模式表——漏一条就等于该故障"整轮直接失败"。
 
@@ -39,9 +39,15 @@ DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切�
 >
 > **推荐根本不要写这两个键**，直接用默认表（上表即为默认表）。确需自定义时，请以上表为基线**逐项追加**，不要凭记忆重写。
 
+`content_filter` 覆盖上游内容安全拦截：OpenAI 兼容接口可能以 HTTP 200 + `finish_reason = "content_filter"` 结束，
+pi-ai 折成 `Provider finish_reason: content_filter`，宿主 `classifyPiAiError` 认不出而落成 `PI_AI_ERROR`（不重试、不切换）。
+插件把它折算成 `CONTENT_FILTER` 并**立即切换**（`retryPolicies.CONTENT_FILTER.attempts = 0`，不原地重试），
+且**不冷却**失败路由（`cooldownMsFor` 对 `CONTENT_FILTER` 返回 0：拦截是「这次请求的内容」问题，不是路由健康问题）。
+它不走 `policyMode`：`policy` 类（提示词被拒）默认同来源原地重试，`content_filter` 直接换来源。
+
 策略拒绝（例如 `Invalid prompt ... flagged as potentially violating our usage policy`）默认按 `policyMode: 'same'` 处理：**保留当前 provider/model**，在同一 `(turn, step)` 内原地重试（不轮换 key、不切换 provider、不给路由冷却），重试次数受 `maxPolicyRetriesPerStep`（默认 2）约束，耗尽后保持当前 provider/model 交回宿主。可用 `policyMode: 'switch'` 恢复旧的「切到下一条已配置 Provider」行为，或用 `'off'` 完全不介入。旧字段 `policyFailover` 仍兼容：未显式给出 `policyMode` 时，`true` → `switch`、`false` → `off`。
 
-`CONTEXT_WINDOW_EXCEEDED` 与 `INVALID_REQUEST` 默认**不**触发（换 provider 不解决问题）。策略拒绝单独由 `policyMode` 控制。
+`CONTEXT_WINDOW_EXCEEDED` 与 `INVALID_REQUEST` 默认**不**触发（换 provider 不解决问题）。策略拒绝单独由 `policyMode` 控制；`content_filter` 不在此列，按上面的 `CONTENT_FILTER` 处理（直接换来源、不冷却）。
 
 ### policy 失败为什么不做 prompt 改写
 

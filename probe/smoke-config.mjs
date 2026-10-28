@@ -90,6 +90,18 @@ check('prompt policy refusal is handled by default', __test.isSwitchable(switcha
 check('prompt policy refusal can remain terminal explicitly', __test.isSwitchable({ ...switchableShape(defaults), policyFailover: false }, 'PI_AI_ERROR', 'Invalid prompt: your prompt was flagged as potentially violating our usage policy').category === 'policy')
 check('policyFailover:true keeps the legacy switch semantics', __test.isSwitchable({ ...switchableShape(defaults), policyFailover: true }, 'PI_AI_ERROR', 'flagged as potentially violating our usage policy').hit === true)
 check('policyMode:off suppresses the policy takeover', __test.isSwitchable({ ...switchableShape(defaults), policyMode: 'off' }, 'PI_AI_ERROR', 'flagged as potentially violating our usage policy').category === 'policy')
+// 2026-10-27：上游内容安全拦截。OpenAI 兼容接口返回 200 + `finish_reason='content_filter'`，
+// pi-ai 的 mapStopReason 折成 `Provider finish_reason: content_filter`，宿主 classifyPiAiError 认不出
+// → PI_AI_ERROR（不重试、不切换），整轮终止且页面只剩一句宿主文案。插件侧必须靠模式兜底接管，
+// 且语义是「立即换来源」（attempts=0）而不是「同来源原地重试」：同一段内容重复发送通常仍被拦。
+const CONTENT_FILTER_FAILURE = 'Provider finish_reason: content_filter'
+check('message fallbacks include content_filter wording', defaults.failurePatterns.includes('content_filter'))
+check('content_filter is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', CONTENT_FILTER_FAILURE).how === 'pattern:content_filter')
+check('effectiveFailureCode: content_filter → CONTENT_FILTER', __test.effectiveFailureCode('PI_AI_ERROR', CONTENT_FILTER_FAILURE, switchableShape(defaults).failurePatterns) === 'CONTENT_FILTER')
+check('content_filter 不原地重试（attempts=0，直接切换）', defaults.retryPolicies?.CONTENT_FILTER?.attempts === 0)
+check('content_filter 不冷却失败路由', __test.cooldownMsFor({}, 60000, 'PI_AI_ERROR', 'pattern:content_filter', switchableShape(defaults).failurePatterns) === 0)
+check('content_filter 的原因标签可读', __test.failureReasonFor('CONTENT_FILTER', CONTENT_FILTER_FAILURE, defaults.failureReasons).id === 'CONTENT_FILTERED')
+check('content_filter 不误伤普通 stop 文案', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'Provider finish_reason: stop').hit === false)
 check('no credential field anywhere', JSON.stringify(defaults).toLowerCase().indexOf('apikeyenv') < 0)
 
 console.log('normalize:')

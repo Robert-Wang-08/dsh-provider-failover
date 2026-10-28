@@ -45,6 +45,26 @@
    回归：`node probe/smoke-config.mjs`（期望 FAILURES: 0），新增
    「失败原因细分（AUTH 类提示）」与「端到端：AUTH 类失败在通知里区分具体原因」两组断言。
 
+5. **content_filter（上游内容安全拦截）纳入切换（2026-10-27）**：OpenAI 兼容接口可能以
+   HTTP 200 + `choices[0].finish_reason = "content_filter"` 结束（上游内容安全策略拦截）。
+   pi-ai 的 `mapStopReason` 把它折成 `errorMessage: "Provider finish_reason: content_filter"`，
+   宿主 `classifyPiAiError` 认不出 → `PI_AI_ERROR`；该码不在宿主默认重试码表里，插件的
+   `failurePatterns` 此前也不含它，于是 `isSwitchable` 归入 other、原样交回宿主——用户只看到
+   一句「本轮运行失败Provider finish_reason: content_filter」，既没重试也没换来源。现在：
+
+   - `failurePatterns` 增加 `content_filter` / `content filter`，生效码折算为 `CONTENT_FILTER`；
+   - `retryPolicies.CONTENT_FILTER = { attempts: 0 }`：**不原地重试**（同一段内容重复发送通常
+     仍被拦），直接切下一条来源；切换次数仍受 `maxSwitchesPerTurn` 约束；
+   - `cooldownMsFor` 对 `CONTENT_FILTER` 返回 0：拦截是「这次请求的内容」问题、不是路由健康
+     问题，不冻结失败路由（`cooldownByCode.CONTENT_FILTER` 仍可显式覆盖）；
+   - `failureReasons` 新增 `CONTENT_FILTERED`（「被上游内容安全策略拦截（同来源重试通常无效，
+     换来源可再试）」），通知与设置页不再显示「原因未知」；
+   - 它与 `policyMode` 是两条路：`policy` 类（提示词被拒）默认同来源原地重试；`content_filter`
+     直接换来源。两者都不改写请求内容（见 README「policy 失败为什么不做 prompt 改写」）。
+
+   回归：`node probe/smoke-config.mjs`（期望 ALL PASSED），新增 7 条断言（可切换、生效码、
+   attempts=0、冷却 0、原因标签、不误伤 `finish_reason: stop`、模式表包含）。
+
 回归：`node probe/smoke-config.mjs`（期望 FAILURES: 0）。
 客户端半另有渲染回归：`node probe/client-dock.mjs`（期望 ALL PASSED）——用最小 React
 运行时真实渲染 `conversation.input.dock` 的通知条，覆盖「无通知隐形 / 有通知出标题与人话
