@@ -21,7 +21,8 @@
  *     状态的条目写回首项（默认 key）；当前引用不在 `keys` 内时视为用户手工状态，不动。
  *
  * 约束（自 openspec 规范）：
- *   - 不持有、不存储、不读取任何凭据值；只读写引用名，凭据由适配器按 apiKeyEnv 解析。
+ *   - 不持有、不存储明文；轮换只读写引用名。状态页为展示可 resolve 一次并立刻脱敏
+ *     （头尾 + 中间星号），明文不进日志、不进 settings、不进客户端载荷。
  *   - 每 `(turn, step)` 每个条目至多尝试一次；单 turn 切换次数有上限；冷却期内不选中。
  *   - 未配置/未启用时零介入；无法解析目标时交回宿主，不做隐式降级。
  */
@@ -45,7 +46,7 @@ const LOG_LIMIT = 10
  * 用户层的值落在插件自有文件 `$DSH_HOME/plugins/provider-failover/settings.json`
  * （0.2 起 dsh-settings 不再提供按插件命名空间 store，见 createFileSettingsScope），
  * 键集为 `enabled / minSwitchIntervalMs / maxSwitchesPerTurn / startupPreferTier /
- * rankingMode / keyResetAt / keysByEntry / rankingModel`；生效时机为写入后即时同步，无需重启。
+ * rankingMode / keyResetAt / keysByEntry / keyAliasesByEntry / rankingModel`；生效时机为写入后即时同步，无需重启。
  * 字段合法性由 /config 端点与 normalize 校验，不再维护独立的 schema 定义。
  */
 
@@ -259,6 +260,41 @@ const CODE_REASON_LABELS = {
 
 /** 通知里保留的上游原文长度（脱敏后截断）。 */
 const FAILURE_DETAIL_LIMIT = 200
+const FAILURE_LOG_LIMIT = 8192
+const FAILURE_LOG_MAX_DEPTH = 4
+const FAILURE_LOG_MAX_KEYS = 64
+
+/**
+ * 将错误对象投影为可落盘的诊断快照：保留 code/status/request id/cause 等信息，
+ * 丢弃凭据字段，避免“捕获原始错误”变成把 Authorization 或 token 写进日志。
+ */
+function failureLogValue(value, depth = 0) {
+  if (value === null || value === undefined) return value
+  if (typeof value === 'string') return sanitizeForRanking(value, FAILURE_LOG_LIMIT)
+  if (typeof value === 'number' || typeof value === 'boolean') return value
+  if (depth >= FAILURE_LOG_MAX_DEPTH) return '[depth-limit]'
+  if (Array.isArray(value)) return value.slice(0, FAILURE_LOG_MAX_KEYS).map((item) => failureLogValue(item, depth + 1))
+  if (typeof value !== 'object') return String(value)
+  const result = {}
+  for (const key of Object.keys(value).slice(0, FAILURE_LOG_MAX_KEYS)) {
+    if (/(authorization|api[-_]?key|token|secret|password|credential|cookie|set-cookie)/i.test(key)) {
+      result[key] = '[redacted]'
+      continue
+    }
+    try { result[key] = failureLogValue(value[key], depth + 1) } catch (error) { result[key] = '[unreadable]' }
+  }
+  return result
+}
+
+function failureLogSnapshot(failure) {
+  const snapshot = failureLogValue(failure)
+  if (snapshot !== null && typeof snapshot === 'object' && !Array.isArray(snapshot)) {
+    if (snapshot.name === undefined && failure?.name !== undefined) snapshot.name = String(failure.name)
+    if (snapshot.message === undefined && failure?.message !== undefined) snapshot.message = sanitizeForRanking(String(failure.message), FAILURE_LOG_LIMIT)
+    if (snapshot.code === undefined && failure?.code !== undefined) snapshot.code = String(failure.code)
+  }
+  return snapshot
+}
 
 /**
  * 一次失败的**原因**（纯函数）：先按 DEFAULT_FAILURE_REASONS 的顺序匹配原始报文与归一化码，
@@ -887,6 +923,29 @@ function normalizeConfig(raw) {
         }
       }
       if (id === undefined || route === undefined || model === undefined || !positiveNumber(cooldownMs)) continue
+      // 同路由多模型共用这组 key：`model` 是切到本条目时的主模型，`models` 列出其余共用 key 的模型。
+      const models = []
+      const seenModel = new Set()
+      const addModel = (value) => {
+        const name = optionalString(value)
+        if (name === undefined) return
+        if (seenModel.has(name) === true) return
+        seenModel.add(name)
+        models.push(name)
+      }
+      addModel(model)
+      if (rawEntry.models !== undefined && Array.isArray(rawEntry.models) !== true) {
+        errors.push('entry.models must be an array of model ids (entry ' + String(id ?? '?') + ')')
+      }
+      if (Array.isArray(rawEntry.models)) {
+        for (const item of rawEntry.models) {
+          if (typeof item !== 'string' || optionalString(item) === undefined) {
+            errors.push('entry.models items must be model ids (entry ' + String(id ?? '?') + ')')
+            continue
+          }
+          addModel(item)
+        }
+      }
       // WINDOWFIX: 可选显式上下文窗口声明（token 数），覆盖内置路由兜底表。
       let contextWindow
       if (rawEntry.contextWindow !== undefined) {
@@ -901,6 +960,7 @@ function normalizeConfig(raw) {
         id,
         route,
         model,
+        models,
         contextWindow,
         description: optionalString(rawEntry.description) ?? '',
         keywords: strings(rawEntry.keywords).map((keyword) => keyword.toLowerCase()),
@@ -958,11 +1018,40 @@ function sanitizeForRanking(text, limit) {
   return trimmed.length > limit ? trimmed.slice(0, limit) : trimmed
 }
 
+/**
+ * 密钥脱敏：头尾可见、中间星号。只给状态页用，绝不回传明文。
+ * 短串只露前 3 位，避免把整把短 key 拼回去。
+ */
 function masked(value) {
   const text = typeof value === 'string' ? value : ''
   if (text.length === 0) return ''
-  if (text.length <= 10) return text.slice(0, 3) + '***'
-  return text.slice(0, 6) + '····' + text.slice(-4)
+  if (text.length <= 10) return text.slice(0, 3) + '****'
+  return text.slice(0, 6) + '****' + text.slice(-4)
+}
+
+/** 宿主凭据层里属于环境变量的 source id（process 被 describe 折成 env）。 */
+const ENV_SOURCES = new Set(['env', 'process', 'user-env', 'project-env'])
+
+function isEnvSource(source) {
+  return typeof source === 'string' && ENV_SOURCES.has(source)
+}
+
+/** 来源层的中文级别名：进程环境 / 用户环境变量 / 项目环境变量 / 凭据文件。 */
+function sourceLabelOf(source) {
+  if (source === 'env' || source === 'process') return '进程环境'
+  if (source === 'user-env') return '用户环境变量'
+  if (source === 'project-env') return '项目环境变量'
+  if (source === 'file') return '凭据文件'
+  return typeof source === 'string' && source.length > 0 ? source : ''
+}
+
+const KEY_ALIAS_MAX = 40
+
+function normalizeAlias(value) {
+  if (typeof value !== 'string') return ''
+  const text = value.trim()
+  if (text.length === 0) return ''
+  return text.length > KEY_ALIAS_MAX ? text.slice(0, KEY_ALIAS_MAX) : text
 }
 
 // WINDOWFIX: 已知路由的声明上下文窗口兜底表（条目未显式声明 contextWindow 时使用）。
@@ -1208,6 +1297,10 @@ function parseRanking(text, candidates) {
  * @param {Record<string, unknown>} rawConfig 插件条目 config
  */
 export function apply(ctx, rawConfig) {
+  const runtimeHome = process.env.DSH_HOME !== undefined && process.env.DSH_HOME.trim() !== ''
+    ? process.env.DSH_HOME
+    : join(homedir(), '.dsh')
+  const persistentFailureLogFile = join(runtimeHome, 'plugins', SETTINGS_NAMESPACE, 'failures.jsonl')
   const localConfig = readLocalRouteConfig()
   const effectiveRawConfig = localConfig === undefined ? rawConfig : { ...rawConfig, ...localConfig }
   const { value: config, errors } = normalizeConfig(effectiveRawConfig)
@@ -1260,6 +1353,8 @@ export function apply(ctx, rawConfig) {
     keyGeneration: 0,
     /** 设置层覆盖的 key 引用列表（条目 id → 引用名[]）；空对象时全部回退 patch */
     keysByEntry: {},
+    /** 设置层覆盖的 key 别名（条目 id → { 引用名: 别名 }）；空串表示无别名 */
+    keyAliasesByEntry: {},
     /** 配置类警告去重（每消息每进程一次） */
     configWarned: new Set(),
     /** 每日重置排程是否已启用（界面新增 keys 后可补启用） */
@@ -1339,17 +1434,63 @@ export function apply(ctx, rawConfig) {
   async function refConfigured(ref) {
     const service = credentialsService()
     if (service === undefined || typeof service.describe !== 'function') {
-      state.refInfo.set(ref, { configured: false, source: undefined, at: Date.now() })
-      return { configured: false, source: undefined }
+      const record = { configured: false, source: undefined, preview: '', at: Date.now() }
+      state.refInfo.set(ref, record)
+      return record
     }
     try {
       const info = await service.describe(ref)
-      const record = { configured: info?.configured === true, source: typeof info?.source === 'string' ? info.source : undefined, at: Date.now() }
+      const configured = info?.configured === true
+      const source = typeof info?.source === 'string' ? info.source : undefined
+      let preview = ''
+      // 只为状态页脱敏展示 resolve 一次；明文立刻丢掉，不进缓存以外的任何地方。
+      if (configured === true && typeof service.resolve === 'function') {
+        try {
+          const resolved = await service.resolve(ref)
+          preview = masked(typeof resolved?.value === 'string' ? resolved.value : '')
+        } catch (error) {
+          preview = ''
+        }
+      }
+      const record = { configured, source, preview, at: Date.now() }
       state.refInfo.set(ref, record)
       return record
     } catch (error) {
-      state.refInfo.set(ref, { configured: false, source: undefined, at: Date.now() })
-      return { configured: false, source: undefined }
+      const record = { configured: false, source: undefined, preview: '', at: Date.now() }
+      state.refInfo.set(ref, record)
+      return record
+    }
+  }
+
+  function aliasOf(entryId, ref) {
+    const aliases = state.keyAliasesByEntry[entryId]
+    if (isPlainObject(aliases) !== true) return ''
+    return normalizeAlias(aliases[ref])
+  }
+
+  /**
+   * 一条引用给状态页用的身份字段：脱敏预览、别名、环境变量级别+id。
+   * 明文不在这里。
+   */
+  function keyIdentityOf(entryId, ref, active) {
+    const info = state.refInfo.get(ref)
+    const mark = refFailed(ref) ? state.keyFailed.get(ref) : undefined
+    const source = info?.source
+    const env = isEnvSource(source)
+    return {
+      ref,
+      alias: aliasOf(entryId, ref),
+      preview: typeof info?.preview === 'string' ? info.preview : '',
+      active: ref === active,
+      configured: info !== undefined ? info.configured === true : false,
+      source,
+      sourceLabel: sourceLabelOf(source),
+      envLevel: env === true ? sourceLabelOf(source) : undefined,
+      envId: env === true ? ref : undefined,
+      failed: mark !== undefined,
+      failedAt: mark !== undefined ? mark.at : undefined,
+      failedCode: mark !== undefined ? mark.code : undefined,
+      failedMessage: mark !== undefined ? String(mark.message ?? '').slice(0, 120) : undefined,
     }
   }
 
@@ -1397,6 +1538,20 @@ export function apply(ctx, rawConfig) {
       }
       seen.add(item)
       refs.push(item)
+    }
+    return refs
+  }
+
+  /**
+   * 设置页可见的引用：轮换列表 ∪ 当前 apiKeyEnv。
+   * 基础 key 即使还没写入 keysByEntry，也必须出现在配置页上，才能看见、才能手动切换。
+   */
+  function visibleKeyRefs(entry) {
+    const refs = effectiveKeys(entry)
+    const seen = new Set(refs)
+    const active = activeRefOf(entry.route)
+    if (typeof active === 'string' && active.length > 0 && isCredentialRef(active) === true && seen.has(active) !== true) {
+      refs.push(active)
     }
     return refs
   }
@@ -1689,6 +1844,71 @@ export function apply(ctx, rawConfig) {
     return errors
   }
 
+  /**
+   * 别名表校验：条目 id 必须已知，引用名必须合法，别名必须是短字符串。
+   * 空别名视为「未设」，不报错。未知引用名在 normalize 时丢弃，这里只拦形状。
+   */
+  function validateKeyAliasesByEntry(map) {
+    const errors = []
+    if (map === undefined) return errors
+    if (isPlainObject(map) !== true) {
+      errors.push('keyAliasesByEntry must be an object mapping entry id to { ref: alias }')
+      return errors
+    }
+    const known = new Set()
+    for (const tier of config.tiers) for (const entry of tier.entries) known.add(entry.id)
+    for (const [entryId, aliases] of Object.entries(map)) {
+      if (known.has(entryId) !== true) {
+        errors.push('keyAliasesByEntry has unknown entry id: ' + entryId)
+        continue
+      }
+      if (isPlainObject(aliases) !== true) {
+        errors.push('keyAliasesByEntry.' + entryId + ' must be an object mapping credential reference to alias')
+        continue
+      }
+      for (const [ref, alias] of Object.entries(aliases)) {
+        if (isCredentialRef(ref) !== true) {
+          errors.push('keyAliasesByEntry.' + entryId + ' has an invalid credential reference name: ' + JSON.stringify(ref))
+          continue
+        }
+        if (alias !== undefined && alias !== null && typeof alias !== 'string') {
+          errors.push('keyAliasesByEntry.' + entryId + '.' + ref + ' alias must be a string')
+        }
+      }
+    }
+    return errors
+  }
+
+  /**
+   * 整理别名表：去空白、截断、丢掉空别名与不在该条目 key 列表里的引用。
+   * keysMap 缺省时用当前生效 keys（含 patch 回退）。
+   */
+  function normalizeKeyAliasesByEntry(map, keysMap) {
+    const result = {}
+    if (isPlainObject(map) !== true) return result
+    const allowedOf = (entryId) => {
+      if (isPlainObject(keysMap) === true && Object.prototype.hasOwnProperty.call(keysMap, entryId)) {
+        return Array.isArray(keysMap[entryId]) ? new Set(keysMap[entryId].filter((ref) => isCredentialRef(ref) === true)) : new Set()
+      }
+      const entry = config.tiers.flatMap((tier) => tier.entries).find((item) => item.id === entryId)
+      return entry === undefined ? new Set() : new Set(effectiveKeys(entry))
+    }
+    for (const [entryId, aliases] of Object.entries(map)) {
+      if (isPlainObject(aliases) !== true) continue
+      const allowed = allowedOf(entryId)
+      const out = {}
+      for (const [ref, alias] of Object.entries(aliases)) {
+        if (isCredentialRef(ref) !== true) continue
+        if (allowed.has(ref) !== true) continue
+        const text = normalizeAlias(alias)
+        if (text.length === 0) continue
+        out[ref] = text
+      }
+      if (Object.keys(out).length > 0) result[entryId] = out
+    }
+    return result
+  }
+
   /** 每日重置：清空失效标记 + 把仍属插件状态的条目写回首项（默认 key）。 */
   async function keyResetDue(reason) {
     const previous = state.keyGeneration
@@ -1729,14 +1949,18 @@ export function apply(ctx, rawConfig) {
   /** 状态展示用的引用描述刷新（短 TTL；只读，失败按未配置）。 */
   async function refreshRefInfo() {
     const now = Date.now()
+    const refs = new Set()
     for (const tier of config.tiers) {
       for (const entry of tier.entries) {
-        for (const ref of effectiveKeys(entry)) {
-          const cached = state.refInfo.get(ref)
-          if (cached !== undefined && now - cached.at < REF_INFO_TTL_MS) continue
-          await refConfigured(ref)
-        }
+        for (const ref of effectiveKeys(entry)) refs.add(ref)
+        const active = activeRefOf(entry.route)
+        if (typeof active === 'string' && active.length > 0) refs.add(active)
       }
+    }
+    for (const ref of refs) {
+      const cached = state.refInfo.get(ref)
+      if (cached !== undefined && now - cached.at < REF_INFO_TTL_MS) continue
+      await refConfigured(ref)
     }
   }
 
@@ -1862,6 +2086,31 @@ export function apply(ctx, rawConfig) {
       ? process.env.DSH_HOME
       : join(homedir(), '.dsh')
     return join(base, 'plugins', SETTINGS_NAMESPACE, 'notices.jsonl')
+  }
+
+  function failureLogFile() {
+    return persistentFailureLogFile
+  }
+
+  /** 每次 request-error 都落一条独立诊断记录，和切换/忽略决策解耦。 */
+  function appendFailureLog(input) {
+    const record = {
+      at: input.at,
+      session: sessionKeyOf(input.session),
+      turn: input.turn,
+      step: input.step,
+      provider: input.provider,
+      model: input.model,
+      code: input.code,
+      effectiveCode: input.effectiveCode,
+      failure: failureLogSnapshot(input.failure),
+    }
+    try {
+      mkdirSync(dirname(failureLogFile()), { recursive: true })
+      appendFileSync(failureLogFile(), JSON.stringify(record) + '\n', 'utf8')
+    } catch (error) {
+      warnConfigOnce('failure log write failed: ' + messageOf(error))
+    }
   }
 
   function pushNotice(input) {
@@ -2464,12 +2713,27 @@ export function apply(ctx, rawConfig) {
 
   // ---------------------------------------------------------------- 钩子二
   ctx.on('agent/request-error', async (payload, next) => {
-    if (config.enabled !== true || config.tiers.length === 0) return next()
     const failure = payload?.failure
     const sessionId = sessionIdOf(payload?.agent)
     const sessionKey = sessionKeyOf(sessionId)
     const turn = payload?.turn ?? 0
     const step = payload?.step ?? 0
+    const rawCode = typeof failure?.code === 'string' ? failure.code.toUpperCase() : ''
+    const earlyEffectiveCode = effectiveFailureCode(rawCode, failure?.message, config.failurePatterns)
+    // 先捕获原始失败，再进入 enabled/tiers 和切换判定；即使本插件不介入，
+    // 也必须留下上游返回的 message、status、request id、cause 等诊断证据。
+    appendFailureLog({
+      at: Date.now(),
+      session: sessionId,
+      turn,
+      step,
+      provider: typeof payload?.provider === 'string' ? payload.provider : '',
+      model: typeof payload?.model === 'string' ? payload.model : '',
+      code: rawCode,
+      effectiveCode: earlyEffectiveCode,
+      failure,
+    })
+    if (config.enabled !== true || config.tiers.length === 0) return next()
     // 归一化前先做一次生效码判定：宿主把带关闭码的链路中断、网关自定义码、空体 5xx
     // 都留在通用 PI_AI_ERROR 里，只有靠 failurePatterns（+ 已知 HTTP 状态码）才能识别成
     // TRANSPORT/SERVER 等类别；重试分类与切换分类都用它。
@@ -2477,8 +2741,7 @@ export function apply(ctx, rawConfig) {
     // effectiveFailureCode 折算，否则 effectiveCode 永远退回 PI_AI_ERROR，
     // 重试策略会错用 DEFAULT（1 次）而不是该类别的策略（如 TRANSPORT 的 5 次）。
     // 该函数同时被全量测试的展示逻辑调用，保证「设置页说会切换」与实际行为一致。
-    const rawCode = typeof failure?.code === 'string' ? failure.code.toUpperCase() : ''
-    const effectiveCode = effectiveFailureCode(rawCode, failure?.message, config.failurePatterns)
+    const effectiveCode = earlyEffectiveCode
     // 原因细分与「生效码」并行计算：`AUTH` 已归一化时 effectiveFailureCode 会直接短路返回，
     // 原文就不再参与判定——这正是「提示只写 AUTH、看不出余额不足」的成因。所以这里对
     // **原始报文**独立跑一次 failureReasonFor，只用它填展示字段，不参与任何切换决策。
@@ -2806,6 +3069,7 @@ export function apply(ctx, rawConfig) {
         sameTierFirst: config.ranking.sameTierFirst === true,
         keyResetAt: config.keyResetAt,
         keysByEntry: {},
+        keyAliasesByEntry: {},
       },
     })
     const sync = (value, source) => {
@@ -2818,6 +3082,10 @@ export function apply(ctx, rawConfig) {
       if (parseClock(value.keyResetAt) !== undefined) config.keyResetAt = value.keyResetAt
       else console.warn('[dsh-provider-failover] ignoring invalid keyResetAt (expected HH:MM): ' + String(value.keyResetAt))
       state.keysByEntry = isPlainObject(value.keysByEntry) ? value.keysByEntry : {}
+      state.keyAliasesByEntry = normalizeKeyAliasesByEntry(
+        isPlainObject(value.keyAliasesByEntry) ? value.keyAliasesByEntry : {},
+        state.keysByEntry,
+      )
       state.retryPolicies = config.retryPolicies ?? DEFAULT_CONFIG.retryPolicies
       const keySummary = config.tiers.map((tier) => tier.entries.map((entry) => entry.id + ':' + String(effectiveKeys(entry).length)).join(',')).join(' | ')
       console.log('[dsh-provider-failover] settings ' + source + ': enabled=' + String(config.enabled) + ' minSwitchIntervalMs=' + String(config.minSwitchIntervalMs) + ' maxSwitchesPerTurn=' + String(config.maxSwitchesPerTurn) + ' startup.preferTier=' + String(config.startup.preferTier) + ' ranking=' + config.ranking.mode + ' keyResetAt=' + config.keyResetAt + ' keys=' + keySummary)
@@ -2948,28 +3216,25 @@ export function apply(ctx, rawConfig) {
         entries: tier.entries.map((entry) => {
           assigned.add(entry.route)
           const active = activeRefOf(entry.route)
+          const listedSet = new Set(effectiveKeys(entry))
+          const keys = visibleKeyRefs(entry).map((ref) => Object.assign(keyIdentityOf(entry.id, ref, active), {
+            listed: listedSet.has(ref) === true,
+          }))
+          const listed = listedSet
+          const activeKey = typeof active === 'string' && active.length > 0
+            ? Object.assign(keyIdentityOf(entry.id, active, active), { listed: listed.has(active) === true })
+            : null
           return {
             id: entry.id,
             route: entry.route,
             model: entry.model,
+            models: Array.isArray(entry.models) && entry.models.length > 0 ? entry.models.slice() : [entry.model],
             registered: directoryKnown ? registeredIds.has(entry.route) : true,
             cooling: cooling(entry.route, now),
             activeRef: active,
+            activeKey,
             keysSource: Array.isArray(state.keysByEntry[entry.id]) ? 'settings' : 'patch',
-            keys: effectiveKeys(entry).map((ref) => {
-              const info = state.refInfo.get(ref)
-              const mark = refFailed(ref) ? state.keyFailed.get(ref) : undefined
-              return {
-                ref,
-                active: ref === active,
-                configured: info !== undefined ? info.configured : false,
-                source: info?.source,
-                failed: mark !== undefined,
-                failedAt: mark !== undefined ? mark.at : undefined,
-                failedCode: mark !== undefined ? mark.code : undefined,
-                failedMessage: mark !== undefined ? String(mark.message ?? '').slice(0, 120) : undefined,
-              }
-            }),
+            keys,
           }
         }),
       }))
@@ -2999,6 +3264,7 @@ export function apply(ctx, rawConfig) {
           sameTierFirst: config.ranking.sameTierFirst === true,
           keyResetAt: config.keyResetAt,
           keysByEntry: state.keysByEntry,
+          keyAliasesByEntry: state.keyAliasesByEntry,
         },
         writable: state.settings !== undefined,
         keyResetAt: config.keyResetAt,
@@ -3040,29 +3306,39 @@ export function apply(ctx, rawConfig) {
       if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only' })
       const body = await readJsonBody(req)
       const wanted = typeof body.entry === 'string' ? body.entry : undefined
+      const wantedRef = typeof body.ref === 'string' && body.ref.length > 0 ? body.ref : undefined
       const targets = []
       for (const tier of config.tiers) {
         for (const entry of tier.entries) {
-          if (hasRotation(entry) !== true) continue
           if (wanted !== undefined && entry.id !== wanted) continue
+          // 不带 entry = 重置全部默认 key，仍只处理已声明轮换的条目。
+          // 指定条目 = 手工切换，只要有可见引用（含未加入轮换的基础 key）即可。
+          if (wanted === undefined && hasRotation(entry) !== true) continue
+          if (wanted !== undefined && visibleKeyRefs(entry).length === 0) continue
           targets.push(entry)
         }
       }
-      if (targets.length === 0) return sendJson(res, 404, { ok: false, error: 'no entry with keys matches the request' })
+      if (targets.length === 0) {
+        return sendJson(res, 404, {
+          ok: false,
+          error: wanted === undefined ? '没有可重置的 key 条目' : '找不到条目：' + wanted,
+        })
+      }
       // 手工操作即「状态重来」：清空本周期失效标记。
       state.keyGeneration += 1
       state.keyFailed.clear()
       const results = []
       for (const entry of targets) {
         const keys = effectiveKeys(entry)
-        const ref = typeof body.ref === 'string' && body.ref.length > 0 ? body.ref : keys[0]
-        if (keys.indexOf(ref) < 0) {
-          results.push({ entry: entry.id, ok: false, ref, error: 'ref is not declared in the entry key list' })
+        const allowed = visibleKeyRefs(entry)
+        const ref = wantedRef !== undefined ? wantedRef : keys[0]
+        if (ref === undefined || allowed.indexOf(ref) < 0) {
+          results.push({ entry: entry.id, ok: false, ref, error: '该引用不在本条目可见 key 里（未保存的新引用请先点「保存 key 列表」）' })
           continue
         }
         const info = await refConfigured(ref)
         if (info.configured !== true) {
-          results.push({ entry: entry.id, ok: false, ref, error: 'ref is not configured in the host credential store' })
+          results.push({ entry: entry.id, ok: false, ref, error: '宿主凭据库尚未配置这个引用，无法切换' })
           continue
         }
         try {
@@ -3084,7 +3360,7 @@ export function apply(ctx, rawConfig) {
       if (state.settings === undefined) return sendJson(res, 503, { ok: false, error: 'settings service is not composed; edit the profile patch instead' })
       const body = await readJsonBody(req)
       const patch = {}
-      for (const key of ['enabled', 'minSwitchIntervalMs', 'maxSwitchesPerTurn', 'startupPreferTier', 'rankingMode', 'keyResetAt', 'keysByEntry', 'rankingModel']) {
+      for (const key of ['enabled', 'minSwitchIntervalMs', 'maxSwitchesPerTurn', 'startupPreferTier', 'rankingMode', 'keyResetAt', 'keysByEntry', 'keyAliasesByEntry', 'rankingModel']) {
         if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
       }
       const hasRankingModel = Object.prototype.hasOwnProperty.call(body, 'rankingModel')
@@ -3113,6 +3389,15 @@ export function apply(ctx, rawConfig) {
       if (patch.keyResetAt !== undefined && parseClock(patch.keyResetAt) === undefined) return sendJson(res, 400, { ok: false, error: 'keyResetAt must be HH:MM in 24-hour local time' })
       const keyErrors = validateKeysByEntry(patch.keysByEntry)
       if (keyErrors.length > 0) return sendJson(res, 400, { ok: false, error: keyErrors.join('; '), errors: keyErrors })
+      const aliasErrors = validateKeyAliasesByEntry(patch.keyAliasesByEntry)
+      if (aliasErrors.length > 0) return sendJson(res, 400, { ok: false, error: aliasErrors.join('; '), errors: aliasErrors })
+      if (patch.keyAliasesByEntry !== undefined) {
+        const keysMap = patch.keysByEntry !== undefined ? patch.keysByEntry : state.keysByEntry
+        patch.keyAliasesByEntry = normalizeKeyAliasesByEntry(patch.keyAliasesByEntry, keysMap)
+      } else if (patch.keysByEntry !== undefined && Object.keys(state.keyAliasesByEntry).length > 0) {
+        // 改了引用列表时把已不存在的别名清掉，避免设置文件留下孤儿别名。
+        patch.keyAliasesByEntry = normalizeKeyAliasesByEntry(state.keyAliasesByEntry, patch.keysByEntry)
+      }
       if (hasDefaultModel && defaultSelection !== null) {
         try {
           await agentDefaultModel().saveSelection(defaultSelection)
@@ -3215,4 +3500,4 @@ export function normalize(raw) {
 export { masked }
 
 /** 内部纯函数，供冒烟测试断言（不属于对外契约）。 */
-export const __test = { parseRanking, hashKey, sanitizeForRanking, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef, resolveTestTarget, unsupportedReasoningEffort, classifyProbeFailure, cooldownMsFor, patternCodeFor, effectiveFailureCode, failureReasonFor, mergeFailureReasons, DEFAULT_FAILURE_REASONS, declaredContextWindow }
+export const __test = { parseRanking, hashKey, sanitizeForRanking, masked, isEnvSource, sourceLabelOf, normalizeAlias, isSwitchable, tierOf, orderEntries, isCredentialRef, parseClock, nextResetAt, selectNextRef, resolveTestTarget, unsupportedReasoningEffort, classifyProbeFailure, cooldownMsFor, patternCodeFor, effectiveFailureCode, failureReasonFor, mergeFailureReasons, DEFAULT_FAILURE_REASONS, declaredContextWindow }

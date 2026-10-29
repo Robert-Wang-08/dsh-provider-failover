@@ -65,6 +65,20 @@
    回归：`node probe/smoke-config.mjs`（期望 ALL PASSED），新增 7 条断言（可切换、生效码、
    attempts=0、冷却 0、原因标签、不误伤 `finish_reason: stop`、模式表包含）。
 
+6. **多 key 当前生效身份（2026-10-29）**：设置页不再只显示引用名和「在用」徽标。
+   Host `GET /status` 为每条引用补 `preview`（头尾+中间星号）、`alias`、环境变量则
+   `envLevel` + `envId`；条目顶部的 `activeKey` 即使不在轮换列表里也会标成基础 key。
+   别名写入 `settings.json` 的 `keyAliasesByEntry`，明文仍不落盘。生效需重启 `dsh web`
+   并用新 token 地址重开设置页。
+
+8. **全部可见 key + 手动切换（2026-10-29）**：配置页把当前 `apiKeyEnv` 与轮换列表并排展示；
+   已配置的行有「切换到此 key」。Host `POST /keys` 允许切到未写入 `keysByEntry` 的基础 key。
+   未保存的新引用仍须先点「保存 key 列表」。生效需重启 `dsh web` 并用新 token 打开设置页。
+
+7. **同路由多模型共用 key（2026-10-29）**：条目可声明 `models`（如 ais 上
+   `deepseek-v4.1-flash` 与 `glm-5.3-flash`）。设置页同一行列出；凭据类失败仍按
+   路由命中该条目轮换 key，不按模型拆引用。切到本条目时主模型仍是 `model`。
+
 回归：`node probe/smoke-config.mjs`（期望 FAILURES: 0）。
 客户端半另有渲染回归：`node probe/client-dock.mjs`（期望 ALL PASSED）——用最小 React
 运行时真实渲染 `conversation.input.dock` 的通知条，覆盖「无通知隐形 / 有通知出标题与人话

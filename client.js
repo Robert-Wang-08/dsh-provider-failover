@@ -6,9 +6,10 @@
  * 到变更即时生效（无需重启）。
  *
  * 读写经同源接口：
- *   GET  /provider-failover/status  → 当前生效值 + 档位表 + 最近转移 + 冷却
+ *   GET  /provider-failover/status  → 当前生效值 + 档位表（含脱敏预览/别名/环境变量级别）+ 最近转移 + 冷却
  *   GET  /provider-failover/catalog → 宿主 provider/model 目录
  *   POST /provider-failover/config  → { enabled?, rankingModel?, defaultModel?, ... }
+ *   POST /provider-failover/keys    → { entry, ref } 手工把该路由切换到指定凭据引用
  *
  * 本文件不包含任何凭据，也不接触密钥。
  */
@@ -42,8 +43,14 @@ window.__ModuleLoader__.load({
       ".pf-model-selects>select{width:168px;padding:4px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}",
       ".pf-hint{color:var(--dsw-alias-label-secondary);font-size:12px}",
       ".pf-warn{color:var(--dsw-alias-state-error-primary);font-size:12px}",
-      ".pf-keyrow{display:flex;align-items:center;gap:8px}",
+      ".pf-keyrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
       ".pf-keyrow>input{flex:1 1 auto;padding:4px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-mono,monospace);font-size:12px}",
+      ".pf-alias{width:132px;flex:0 0 132px;padding:4px 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:12px}",
+      ".pf-keyblock{display:flex;flex-direction:column;gap:4px}",
+      ".pf-keyblock-active{padding:6px;margin:0 -6px;border-radius:8px;outline:1px solid var(--dsw-alias-state-success-primary)}",
+      ".pf-keymeta{display:flex;flex-wrap:wrap;align-items:center;gap:8px;color:var(--dsw-alias-label-secondary);font-size:12px}",
+      ".pf-preview{font-family:var(--dsw-font-mono,monospace);color:var(--dsw-alias-label-primary)}",
+      ".pf-current{padding:6px 8px;border-radius:8px;background:var(--dsw-alias-bg-layer-2)}",
       ".pf-badge{flex:0 0 auto;font-size:12px;padding:1px 6px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1)}",
       ".pf-badge-active{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}",
       ".pf-badge-ok{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}",
@@ -186,6 +193,101 @@ window.__ModuleLoader__.load({
       return map;
     }
 
+    const ALIAS_MAX = 40;
+
+    function normalizeAlias(value) {
+      const text = String(value === undefined || value === null ? "" : value).trim();
+      if (text.length === 0) return "";
+      return text.length > ALIAS_MAX ? text.slice(0, ALIAS_MAX) : text;
+    }
+
+    /**
+     * 别名草稿 → 提交体：只保留「该条目仍有的引用」上的非空别名。
+     * 空对象表示全部无别名（Host 会写成 {} 或省略）。
+     */
+    function aliasDraftMap(draft, aliases) {
+      const map = {};
+      const refsOf = keyDraftMap(draft);
+      for (const entryId of Object.keys(refsOf)) {
+        const out = {};
+        for (const ref of refsOf[entryId]) {
+          const alias = normalizeAlias(aliases === undefined || aliases[entryId] === undefined ? "" : aliases[entryId][ref]);
+          if (alias.length > 0) out[ref] = alias;
+        }
+        if (Object.keys(out).length > 0) map[entryId] = out;
+      }
+      return map;
+    }
+
+    function normalizedAliasMap(map) {
+      return JSON.stringify(Object.keys(map).sort().map((entryId) => [entryId, map[entryId]]));
+    }
+
+    /** 一行 key 的可见身份：脱敏预览 + 别名 +（环境变量则级别·id）。 */
+    function modelsOf(entry) {
+      if (entry === null || entry === undefined) return [];
+      if (Array.isArray(entry.models) === true && entry.models.length > 0) {
+        return entry.models.map((item) => String(item)).filter((item) => item.length > 0);
+      }
+      return entry.model === undefined || entry.model === null || String(entry.model).length === 0 ? [] : [String(entry.model)];
+    }
+
+    function describeEntryRoute(entry) {
+      const models = modelsOf(entry);
+      const modelText = models.length === 0 ? String(entry.model) : models.join(" · ");
+      return String(entry.id) + " → " + String(entry.route) + "/" + modelText;
+    }
+
+    /**
+     * 配置页展示行：先可编辑的轮换草稿，再补上快照里有、草稿没有的可用 key
+     * （典型是「基础 key，未加入轮换列表」）。这样所有可用 key 都在同一张卡片上。
+     */
+    function displayKeyRows(entry, draftRefs) {
+      const rows = [];
+      const seen = new Set();
+      const list = Array.isArray(draftRefs) ? draftRefs : [];
+      list.forEach((ref, index) => {
+        rows.push({ kind: "draft", ref, index });
+        const trimmed = String(ref).trim();
+        if (trimmed.length > 0) seen.add(trimmed);
+      });
+      if (entry !== null && entry !== undefined && Array.isArray(entry.keys)) {
+        for (const item of entry.keys) {
+          if (typeof item.ref !== "string" || item.ref.length === 0) continue;
+          if (seen.has(item.ref) === true) continue;
+          rows.push({ kind: "available", ref: item.ref, identity: item });
+          seen.add(item.ref);
+        }
+      }
+      const activeRef = entry === null || entry === undefined
+        ? ""
+        : (entry.activeKey !== null && entry.activeKey !== undefined && typeof entry.activeKey.ref === "string"
+          ? entry.activeKey.ref
+          : (typeof entry.activeRef === "string" ? entry.activeRef : ""));
+      if (activeRef.length > 0 && seen.has(activeRef) !== true) {
+        rows.push({
+          kind: "available",
+          ref: activeRef,
+          identity: entry.activeKey !== null && entry.activeKey !== undefined ? entry.activeKey : { ref: activeRef, listed: false },
+        });
+      }
+      return rows;
+    }
+
+    function describeKeyIdentity(item) {
+      if (item === null || item === undefined) return "";
+      const parts = [];
+      if (typeof item.preview === "string" && item.preview.length > 0) parts.push(item.preview);
+      const alias = normalizeAlias(item.alias);
+      if (alias.length > 0) parts.push(alias);
+      if (typeof item.envLevel === "string" && item.envLevel.length > 0 && typeof item.envId === "string" && item.envId.length > 0) {
+        parts.push(item.envLevel + " · " + item.envId);
+      } else if (typeof item.sourceLabel === "string" && item.sourceLabel.length > 0) {
+        parts.push(item.sourceLabel);
+      }
+      return parts.join("  ");
+    }
+
     /** 稳定比较用的序列化（条目键排序，引用顺序保留——顺序即轮换顺序）。 */
     function normalizedKeyMap(map) {
       return JSON.stringify(Object.keys(map).sort().map((entryId) => [entryId, map[entryId]]));
@@ -253,6 +355,7 @@ window.__ModuleLoader__.load({
       const [catalog, setCatalog] = react.useState(null);
       const [form, setForm] = react.useState(null);
       const [keyDraft, setKeyDraft] = react.useState(null);
+      const [aliasDraft, setAliasDraft] = react.useState({});
       const [testTarget, setTestTarget] = react.useState("");
       const [testMsg, setTestMsg] = react.useState("");
       const [testMsgKind, setTestMsgKind] = react.useState("ok");
@@ -283,6 +386,31 @@ window.__ModuleLoader__.load({
         return draft;
       };
 
+      /** 由状态快照构造别名草稿：条目 id → { 引用名: 别名 }。 */
+      const aliasesOf = (data) => {
+        const map = {};
+        const declared = data.editable.keyAliasesByEntry;
+        for (const tier of data.tiers) {
+          for (const entry of tier.entries) {
+            const fromSettings = declared === undefined ? undefined : declared[entry.id];
+            const out = {};
+            if (fromSettings !== undefined && fromSettings !== null && typeof fromSettings === "object") {
+              for (const ref of Object.keys(fromSettings)) {
+                const alias = normalizeAlias(fromSettings[ref]);
+                if (alias.length > 0) out[ref] = alias;
+              }
+            } else {
+              for (const item of entry.keys) {
+                const alias = normalizeAlias(item.alias);
+                if (alias.length > 0) out[item.ref] = alias;
+              }
+            }
+            map[entry.id] = out;
+          }
+        }
+        return map;
+      };
+
       const load = react.useCallback(async () => {
         try {
           const data = await getStatus();
@@ -291,6 +419,7 @@ window.__ModuleLoader__.load({
           setCatalog(Array.isArray(catalogData.providers) ? catalogData.providers : []);
           setForm(formOf(data));
           setKeyDraft(draftOf(data));
+          setAliasDraft(aliasesOf(data));
           if (data.lastProbe !== undefined && data.lastProbe !== null) setProbeReport(data.lastProbe);
           setError("");
           setModelError("");
@@ -357,7 +486,11 @@ window.__ModuleLoader__.load({
       // key 草稿的派生状态：与快照比较得出脏标记，并在保存前做与 Host 同口径的整表预检。
       const savedKeyMap = keyDraftMap(draftOf(status));
       const keyDraftShape = keyDraftMap(keyDraft);
-      const keyDirty = normalizedKeyMap(keyDraftShape) !== normalizedKeyMap(savedKeyMap);
+      const savedAliasMap = aliasDraftMap(draftOf(status), aliasesOf(status));
+      const aliasDraftShape = aliasDraftMap(keyDraft, aliasDraft);
+      const refsDirty = normalizedKeyMap(keyDraftShape) !== normalizedKeyMap(savedKeyMap);
+      const aliasDirty = normalizedAliasMap(aliasDraftShape) !== normalizedAliasMap(savedAliasMap);
+      const keyDirty = refsDirty === true || aliasDirty === true;
       const keyRows = reviewKeyDraft(keyDraft);
       const keyBlocked = keyDirty === true && keyRows.length > 0;
       const keyProblemOf = (entryId, index) => {
@@ -376,11 +509,15 @@ window.__ModuleLoader__.load({
           // 主保存一并提交待保存的 key 改动：否则「行加上了、点保存却什么也没发生」，
           // 用户会把这种静默当成「保存无效」。
           const payload = Object.assign({}, patch);
-          if (keyDirty === true) payload.keysByEntry = keyDraftShape;
+          if (keyDirty === true) {
+            payload.keysByEntry = keyDraftShape;
+            payload.keyAliasesByEntry = aliasDraftShape;
+          }
           const data = await saveConfig(payload);
           setStatus(data);
           setForm(formOf(data));
           setKeyDraft(draftOf(data));
+          setAliasDraft(aliasesOf(data));
           setError("");
           setSaved("已保存并即时生效");
         } catch (err) {
@@ -398,6 +535,7 @@ window.__ModuleLoader__.load({
           setStatus(data);
           setForm(formOf(data));
           setKeyDraft(draftOf(data));
+          setAliasDraft(aliasesOf(data));
           setModelError("");
           setSaved("模型选择已保存并即时生效");
         } catch (err) {
@@ -407,13 +545,103 @@ window.__ModuleLoader__.load({
         }
       };
 
-      /** key 草稿编辑：改名 / 增行 / 删行。 */
-      const setKeyRef = (entryId, index, value) =>
-        setKeyDraft((prev) => Object.assign({}, prev, { [entryId]: prev[entryId].map((ref, at) => at === index ? value : ref) }));
+      /** key 草稿编辑：改名 / 增行 / 删行。改引用名时把别名跟着迁到新名下。 */
+      const setKeyRef = (entryId, index, value) => {
+        setKeyDraft((prev) => {
+          const previous = prev[entryId][index];
+          if (previous !== value) {
+            setAliasDraft((aliases) => {
+              const current = aliases[entryId] === undefined ? {} : aliases[entryId];
+              if (Object.prototype.hasOwnProperty.call(current, previous) !== true) return aliases;
+              const next = Object.assign({}, current);
+              const moved = next[previous];
+              delete next[previous];
+              const target = String(value).trim();
+              if (target.length > 0) next[target] = moved;
+              return Object.assign({}, aliases, { [entryId]: next });
+            });
+          }
+          return Object.assign({}, prev, { [entryId]: prev[entryId].map((ref, at) => at === index ? value : ref) });
+        });
+      };
       const addKeyRef = (entryId) =>
         setKeyDraft((prev) => Object.assign({}, prev, { [entryId]: prev[entryId].concat([""]) }));
-      const removeKeyRef = (entryId, index) =>
-        setKeyDraft((prev) => Object.assign({}, prev, { [entryId]: prev[entryId].filter((ref, at) => at !== index) }));
+      const removeKeyRef = (entryId, index) => {
+        setKeyDraft((prev) => {
+          const removed = prev[entryId][index];
+          if (String(removed).trim().length > 0) {
+            setAliasDraft((aliases) => {
+              const current = aliases[entryId] === undefined ? {} : aliases[entryId];
+              if (Object.prototype.hasOwnProperty.call(current, removed) !== true) return aliases;
+              const next = Object.assign({}, current);
+              delete next[removed];
+              return Object.assign({}, aliases, { [entryId]: next });
+            });
+          }
+          return Object.assign({}, prev, { [entryId]: prev[entryId].filter((ref, at) => at !== index) });
+        });
+      };
+      const setKeyAlias = (entryId, ref, value) => {
+        const key = String(ref).trim();
+        if (key.length === 0) return;
+        setAliasDraft((prev) => Object.assign({}, prev, {
+          [entryId]: Object.assign({}, prev[entryId], { [key]: value }),
+        }));
+      };
+      const aliasValueOf = (entry, ref) => {
+        const key = String(ref).trim();
+        const fromDraft = aliasDraft[entry.id];
+        if (fromDraft !== undefined && Object.prototype.hasOwnProperty.call(fromDraft, key)) return String(fromDraft[key] ?? "");
+        const item = entry.keys.find((row) => row.ref === key);
+        return item === undefined ? "" : String(item.alias ?? "");
+      };
+
+      const selectActiveKey = async (entryId, ref) => {
+        const target = String(ref).trim();
+        if (target.length === 0) return;
+        if (keyDirty === true) {
+          setKeyError("有未保存的 key 改动，请先保存列表再切换。");
+          return;
+        }
+        setBusy(true);
+        try {
+          const data = await resetKeys({ entry: entryId, ref: target });
+          if (data.ok !== true) {
+            const first = Array.isArray(data.results) ? data.results.find((item) => item.ok !== true) : undefined;
+            throw new Error(first !== undefined && typeof first.error === "string" ? first.error : "切换 key 失败");
+          }
+          setStatus(data.status);
+          setForm(formOf(data.status));
+          setKeyDraft(draftOf(data.status));
+          setAliasDraft(aliasesOf(data.status));
+          setKeyError("");
+          setSaved("已切换到 " + target);
+        } catch (err) {
+          setKeyError(friendlyKeyError(err.message));
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      const switchButton = (entry, ref, identity) => {
+        const trimmed = String(ref).trim();
+        if (trimmed.length === 0) return null;
+        const item = identity !== undefined ? identity : entry.keys.find((key) => key.ref === trimmed);
+        if (item !== undefined && item.active === true) return null;
+        const configured = item !== undefined && item.configured === true;
+        const disabled = busy === true || configured !== true || keyDirty === true;
+        const title = keyDirty === true
+          ? "先保存 key 列表再切换"
+          : configured !== true
+            ? "未配置，无法切换"
+            : "立即把该路由切换到这把 key";
+        return h("button", {
+          className: "pf-btn",
+          disabled,
+          title,
+          onClick: () => selectActiveKey(entry.id, trimmed),
+        }, "切换到此 key");
+      };
 
       /** 提交：只保留有内容的引用；某条目全部清空 = 删除该覆盖，回退 profile patch。 */
       const saveKeys = async () => {
@@ -424,10 +652,11 @@ window.__ModuleLoader__.load({
         }
         setBusy(true);
         try {
-          const data = await saveConfig({ keysByEntry: keyDraftShape });
+          const data = await saveConfig({ keysByEntry: keyDraftShape, keyAliasesByEntry: aliasDraftShape });
           setStatus(data);
           setForm(formOf(data));
           setKeyDraft(draftOf(data));
+          setAliasDraft(aliasesOf(data));
           setKeyError("");
           setSaved("key 列表已保存并即时生效");
         } catch (err) {
@@ -455,28 +684,95 @@ window.__ModuleLoader__.load({
           }, "未配置");
         }
         return h("span", { className: "pf-badge " + (item.active === true ? "pf-badge-active" : "pf-badge-muted") },
-          item.active === true ? "在用" : "可用",
-          item.source === "env" ? " · 环境" : "");
+          item.active === true ? "在用" : "可用");
+      };
+
+      const keyIdentityLine = (item, extra) => {
+        if (item === null || item === undefined) return null;
+        const preview = typeof item.preview === "string" ? item.preview : "";
+        const alias = normalizeAlias(item.alias);
+        const env = typeof item.envLevel === "string" && item.envLevel.length > 0 && typeof item.envId === "string" && item.envId.length > 0
+          ? item.envLevel + " · " + item.envId
+          : (typeof item.sourceLabel === "string" && item.sourceLabel.length > 0 ? item.sourceLabel : "");
+        if (preview.length === 0 && alias.length === 0 && env.length === 0 && extra === undefined) return null;
+        return h("div", { className: "pf-keymeta" },
+          preview.length > 0 ? h("span", { className: "pf-preview", title: "脱敏预览，不是完整密钥" }, preview) : null,
+          alias.length > 0 ? h("span", null, alias) : null,
+          env.length > 0 ? h("span", { className: "pf-mono" }, env) : null,
+          extra === undefined ? null : h("span", { className: "pf-hint" }, extra));
+      };
+
+      const currentKeyBanner = (entry) => {
+        let current = entry.activeKey;
+        if (current === null || current === undefined || typeof current.ref !== "string" || current.ref.length === 0) {
+          const ref = typeof entry.activeRef === "string" ? entry.activeRef : "";
+          if (ref.length === 0) {
+            return h("div", { className: "pf-current pf-hint" }, "当前生效：未知（该路由未配置 apiKeyEnv）");
+          }
+          const saved = entry.keys.find((item) => item.ref === ref);
+          current = saved === undefined
+            ? { ref, listed: false, preview: "", alias: aliasValueOf(entry, ref) }
+            : Object.assign({}, saved, { listed: true, alias: aliasValueOf(entry, ref) });
+        }
+        const listed = current.listed === true;
+        return h("div", { className: "pf-current" },
+          h("div", { className: "pf-keymeta" },
+            h("span", { className: "pf-badge pf-badge-active" }, "当前生效"),
+            h("span", { className: "pf-mono" }, current.ref)),
+          keyIdentityLine(current, listed === true ? undefined : "基础 key，未加入轮换列表"));
       };
 
       const keyCard = h("div", { className: "pf-card" },
-        h("div", { className: "pf-hint" }, "单 provider 多 key（凭据引用名）——只填环境变量名/引用名：字母、数字、下划线，不能以数字开头（例：MY_PROVIDER_API_KEY_2）；不要填密钥值，值请写进 .credentials.yaml 或环境变量。列表顺序即轮换顺序，首项为默认 key。"),
+        h("div", { className: "pf-hint" }, "单 provider 多 key（凭据引用名）——当前生效的基础 key 和轮换列表都会列在下面，已配置的可点「切换到此 key」立即改写该路由的 apiKeyEnv。添加时只填环境变量名/引用名：字母、数字、下划线，不能以数字开头（例：MY_PROVIDER_API_KEY_2）；不要填密钥值，值请写进 .credentials.yaml 或环境变量。列表顺序即轮换顺序，首项为默认 key。"),
         status.tiers.map((tier) => tier.entries.map((entry) =>
           h("div", { className: "pf-entry", key: entry.id },
             h("div", { className: "pf-row" },
-              h("label", null, String(entry.id) + " → " + String(entry.route) + "/" + String(entry.model)),
-              h("span", { className: "pf-hint" }, entry.keysSource === "settings" ? "来源：设置" : "来源：profile patch")),
-            keyDraft[entry.id].map((ref, index) =>
-              h("div", { className: "pf-keyrow", key: entry.id + "-" + String(index) },
-                h("input", {
-                  type: "text",
-                  value: ref,
-                  placeholder: "MY_PROVIDER_API_KEY_2",
-                  onChange: (event) => { setKeyRef(entry.id, index, event.target.value); setSaved(""); setKeyError(""); },
-                }),
-                String(ref).trim().length === 0 ? null : refBadge(entry, String(ref).trim()),
-                h("button", { className: "pf-btn", disabled: busy === true, onClick: () => removeKeyRef(entry.id, index) }, "移除"),
-                keyProblemOf(entry.id, index).length === 0 ? null : h("span", { className: "pf-err" }, keyProblemOf(entry.id, index)))),
+              h("label", null, describeEntryRoute(entry)),
+              h("span", { className: "pf-hint" }, entry.keysSource === "settings" ? "来源：设置" : "来源：profile patch", modelsOf(entry).length > 1 ? " · 同路由模型共用这组 key" : "")),
+            currentKeyBanner(entry),
+            displayKeyRows(entry, keyDraft[entry.id] === undefined ? [] : keyDraft[entry.id]).map((row) => {
+              if (row.kind === "available") {
+                const identity = row.identity === undefined
+                  ? { ref: row.ref, listed: false }
+                  : row.identity;
+                const active = identity.active === true;
+                return h("div", { className: "pf-keyblock" + (active === true ? " pf-keyblock-active" : ""), key: entry.id + "-avail-" + row.ref },
+                  h("div", { className: "pf-keyrow" },
+                    h("span", { className: "pf-mono" }, row.ref),
+                    refBadge(entry, row.ref),
+                    switchButton(entry, row.ref, identity)),
+                  keyIdentityLine(identity, identity.listed === false ? "基础 key，未加入轮换列表" : undefined));
+              }
+              const ref = row.ref;
+              const index = row.index;
+              const trimmed = String(ref).trim();
+              const saved = entry.keys.find((item) => item.ref === trimmed);
+              const identity = saved === undefined
+                ? { ref: trimmed, alias: aliasValueOf(entry, trimmed), preview: "", sourceLabel: "", envLevel: undefined, envId: undefined }
+                : Object.assign({}, saved, { alias: aliasValueOf(entry, trimmed) });
+              const active = saved !== undefined && saved.active === true;
+              return h("div", { className: "pf-keyblock" + (active === true ? " pf-keyblock-active" : ""), key: entry.id + "-" + String(index) },
+                h("div", { className: "pf-keyrow" },
+                  h("input", {
+                    type: "text",
+                    value: ref,
+                    placeholder: "MY_PROVIDER_API_KEY_2",
+                    onChange: (event) => { setKeyRef(entry.id, index, event.target.value); setSaved(""); setKeyError(""); },
+                  }),
+                  h("input", {
+                    className: "pf-alias",
+                    type: "text",
+                    value: aliasValueOf(entry, trimmed),
+                    placeholder: "别名（可空）",
+                    disabled: trimmed.length === 0,
+                    onChange: (event) => { setKeyAlias(entry.id, trimmed, event.target.value); setSaved(""); setKeyError(""); },
+                  }),
+                  trimmed.length === 0 ? null : refBadge(entry, trimmed),
+                  switchButton(entry, ref, identity),
+                  h("button", { className: "pf-btn", disabled: busy === true, onClick: () => removeKeyRef(entry.id, index) }, "移除"),
+                  keyProblemOf(entry.id, index).length === 0 ? null : h("span", { className: "pf-err" }, keyProblemOf(entry.id, index))),
+                trimmed.length === 0 ? null : keyIdentityLine(identity, saved !== undefined && saved.listed === false ? "基础 key，未加入轮换列表" : undefined));
+            }),
             h("div", { className: "pf-actions" },
               h("button", { className: "pf-btn", disabled: busy === true, onClick: () => addKeyRef(entry.id) }, "+ 添加 key 引用"),
               h("span", { className: "pf-hint" }, keyDraft[entry.id].length === 0 ? "（无 key 引用：该条目不参与轮换）" : ""))))),
@@ -602,6 +898,7 @@ window.__ModuleLoader__.load({
           setStatus(data.status);
           setForm(formOf(data.status));
           setKeyDraft(draftOf(data.status));
+          setAliasDraft(aliasesOf(data.status));
           setError("");
           setSaved("已重置全部 key 状态");
         } catch (err) {
@@ -695,7 +992,7 @@ window.__ModuleLoader__.load({
               "档 " + String(tier.tier) + (tier.enabled === true ? "" : "（关闭）") + "：",
               tier.entries.map((entry, index) => h("span", { key: entry.id },
                 index > 0 ? "、" : "",
-                String(entry.id) + " → " + String(entry.route) + "/" + String(entry.model),
+                describeEntryRoute(entry),
                 entry.registered !== true ? h("span", { className: "pf-warn" }, "［宿主未注册］") : null,
                 entry.cooling === true ? h("span", { className: "pf-hint" }, "［冷却中］") : null))))) ),
 
@@ -862,7 +1159,7 @@ window.__ModuleLoader__.load({
     exports.apply = apply;
     exports.inject = inject;
     // 供 probe/smoke-keys.mjs 直接单测 key 草稿校验（Host/Web 运行期不使用）。
-    exports.__test = { REF_NAME_PATTERN, describeRefIssue, looksLikeSecretValue, keyDraftMap, normalizedKeyMap, reviewKeyDraft, friendlyKeyError };
+    exports.__test = { REF_NAME_PATTERN, describeRefIssue, looksLikeSecretValue, keyDraftMap, normalizedKeyMap, reviewKeyDraft, friendlyKeyError, aliasDraftMap, normalizedAliasMap, describeKeyIdentity, normalizeAlias, modelsOf, describeEntryRoute, displayKeyRows };
     return module.exports;
   },
 });

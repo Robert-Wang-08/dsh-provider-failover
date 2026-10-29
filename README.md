@@ -4,6 +4,16 @@
 
 DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切换失败**结束时，按配置表的**档位顺序**把同一个 step 的下一次尝试换成另一条 harness 路由（provider），并可一并下发该条目声明的模型与推理层级；条目还可用 `keys` 声明同一条路由的多把 key（**改写该路由的 `apiKeyEnv` 引用名**，不新增路由），并按每日重置时刻恢复默认 key。
 
+## 原始失败日志
+
+每次宿主发出 `agent/request-error` 时，插件都会在不改变重试、切换和分类决策的前提下，追加一条诊断记录到：
+
+```text
+$DSH_HOME/plugins/provider-failover/failures.jsonl
+```
+
+记录包含时间、会话、turn/step、provider/model、原始 code、生效 code，以及错误对象中可安全序列化的 `message`、`status`、`requestId`、`cause` 等字段。凭据、Authorization、token、secret、password、cookie 等字段会脱敏；单条记录有长度和嵌套深度上限。日志路径在插件启动时绑定当前 `DSH_HOME`，避免运行期间环境变量变化导致写入错误目录。
+
 ## 为什么能生效（已实测）
 
 | 机制 | 证据 |
@@ -97,7 +107,9 @@ pi-ai 折成 `Provider finish_reason: content_filter`，宿主 `classifyPiAiErro
 
 交互式本机配置：使用 `ptc-route-setup` skill 探测 provider/子代理并询问人工偏好。它将无凭据的候选链写入 `$DSH_HOME/plugins/provider-failover/route-config.json`。插件启动时读取该文件，覆盖 `tiers`、切换上限/错误类别和按类冷却策略；现有 `settings.json`、profile patch 和凭据文件保持独立。该本机文件不应提交或同步；首次生成后需重启 DSH。
 
-字段：顶层 `enabled` / `policyMode` / `policyFailover`（兼容旧字段）/ `maxPolicyRetriesPerStep` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `cooldownByCode`（按错误码覆盖冷却毫秒，如 `{"QUOTA": 18000000}` 把额度耗尽的冷却拉到 5 小时；usage limit / quota 等消息模式兜底也归 QUOTA，未命中退回条目 `cooldownMs`）/ `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
+字段：顶层 `enabled` / `policyMode` / `policyFailover`（兼容旧字段）/ `maxPolicyRetriesPerStep` / `terminalCodes` / `failurePatterns` / `minSwitchIntervalMs` / `maxSwitchesPerTurn` / `cooldownByCode`（按错误码覆盖冷却毫秒，如 `{"QUOTA": 18000000}` 把额度耗尽的冷却拉到 5 小时；usage limit / quota 等消息模式兜底也归 QUOTA，未命中退回条目 `cooldownMs`）/ `probeTarget` / `keyResetAt` / `startup.preferTier` / `ranking` / `tiers`；条目 `id` / `route` / `model` / `models`（同路由共用这组 key 的模型列表，缺省即 `[model]`）/ `keys` / `description` / `keywords` / `compatible.{tools,images}` / `cooldownMs` / `reasoningEffort` / `enabled`。配置**不含任何凭据字段**（`keys` 只写引用名）；校验失败时插件完全不介入并在日志说明原因。
+
+同路由多模型（例如 `ais-2dsglm` 上的 `deepseek-v4.1-flash` 与 `glm-5.3-flash`）**共用**该条目的 key：凭据引用写在路由的 `apiKeyEnv` 上，不按模型拆。设置页会把已登记模型列在同一行。切到本条目时仍用主 `model`；这些模型上的凭据类失败按路由命中本条目做 key 轮换。
 
 ### 冷却语义与「无候选」
 
@@ -148,7 +160,8 @@ pi-ai 折成 `Provider finish_reason: content_filter`，宿主 `classifyPiAiErro
 
 规则：
 
-- **只写引用名，永不写值**：插件经 `ctx.settings.mutate('llm-pi-ai', …)` 改写 `providers.<route>.apiKeyEnv`，不调用凭据服务的任何写接口，也不读取/缓存/打印凭据值。
+- **轮换只写引用名**：插件经 `ctx.settings.mutate('llm-pi-ai', …)` 改写 `providers.<route>.apiKeyEnv`，不调用凭据服务的任何写接口，也不缓存/打印明文。状态页为展示可 `resolve` 一次并立刻脱敏（头尾 + 中间星号），明文不进 settings、不进日志、不进客户端。
+- **设置页列出全部可见 key，并可手动切换（2026-10-29）**：每条引用显示脱敏预览、可选别名（写入 `keyAliasesByEntry`，可空）；若该引用的值来自环境变量，再显示级别（进程环境 / 用户环境变量 / 项目环境变量）和变量名。快照是轮换列表 ∪ 当前 `apiKeyEnv`，所以基础 key 即使还没写入 `keysByEntry` 也会作为一行出现（标「未加入轮换列表」）。已配置且非当前的引用可点「切换到此 key」，经 `POST /provider-failover/keys` 立即改写该路由的 `apiKeyEnv`，不必等凭据类失败才轮换。
 - **失败分工**：凭据类编码（`QUOTA` / `AUTH` / `INVALID_CREDENTIAL` / `MISSING_CREDENTIAL`）→ 条目内换 key；`SERVER` / `RATE_LIMIT` / `NO_ADAPTER` 与消息模式兜底 → 走 provider 切换（换 key 治不了过载，也不因一句话就消耗一把 key）。
 - **候选预检**：轮换前用 `credentials.describe(ref)` 确认目标引用已配置；未配置则跳过并每进程警告一次（`key reference skipped: …`）。全部候选不可用时交回宿主默认失败路径（写入设置文件失败同样如此）。
 - **有界**：记账键是 `entryId@route#ref`，同一引用每 `(turn, step)` 至多一次；轮换计入单 turn 上限与最小切换间隔；key 类失败**不给路由冷却**（否则换 key 后仍被冷却挡住）。
@@ -160,7 +173,7 @@ pi-ai 折成 `Provider finish_reason: content_filter`，宿主 `classifyPiAiErro
 
 - 顶层 `keyResetAt`（`HH:MM` 本地时间，默认 `06:00`）：到点清空全部 key 失效标记，并把「当前引用属于 `keys` 且不是首项」的条目写回 `keys[0]`，全部 key 恢复可重试。
 - **手工状态优先**：活动引用每次实时读 settings（不缓存，经 `SettingsForms.describe` 读 `llm-pi-ai` 活动表单），你直接改模型路由的 `apiKeyEnv` 立即生效；当前引用**不在** `keys` 内时视为手工状态，重置只清标记、不改写它。
-- 手工干预接口：`POST /provider-failover/keys`，body `{entry, ref}` 置位某引用、`{entry}` 重置该条目到 `keys[0]`、`{}` 重置全部（未声明或未配置的引用被拒绝）。设置页也有「重置 key 状态」按钮。
+- 手工干预接口：`POST /provider-failover/keys`，body `{entry, ref}` 置位某引用（可见范围 = 轮换列表 ∪ 当前 `apiKeyEnv`）、`{entry}` 重置该条目到 `keys[0]`、`{}` 重置全部（未配置的引用被拒绝）。设置页每行有「切换到此 key」，底部也有「重置 key 状态」。
 
 配置示例（profile patch；`keys` 是引用名，不是路由名）：
 
@@ -229,7 +242,7 @@ pi-ai 折成 `Provider finish_reason: content_filter`，宿主 `classifyPiAiErro
 
 ## 凭据策略（重要）
 
-- **插件不持有、不存储、不读取、不写入任何密钥值**；不调用凭据服务的写入接口。
+- **插件不持有、不存储、不写入任何密钥值**；不调用凭据服务的写入接口。状态页为展示可 `resolve` 一次并立刻脱敏，明文不进 settings、不进日志、不进客户端。
 - 凭据由**各路由既有的 `apiKeyEnv`** 从宿主凭据源解析：继承的进程环境（只读、优先）→ `$DSH_HOME/.credentials.yaml`（可写）→ `.env` 兜底。
 - 单路由多 key 的唯一写动作是**改写引用名**（`llm-pi-ai.providers.<route>.apiKeyEnv`，经 settings 服务的路径编辑落盘）；轮换前用 `credentials.describe` 确认目标引用已配置，未配置不改写。见上文「单路由多 key」。
 - `$DSH_HOME/.credentials.yaml` 含明文密钥，**必须被 `.gitignore` 忽略**。
@@ -283,10 +296,10 @@ dsh 设置页新增「Provider 故障转移」小节：**总开关** + 常用参
 
 - 持久化：写插件自有文件 `$DSH_HOME/plugins/provider-failover/settings.json`（0.2 起 dsh-settings 移除了按插件命名空间 store 与 `settings.yaml` 用户层）；**用户层优先于 profile patch 的对应字段**（这正是开关语义；没被用户改过的项仍以 patch 为准）。
 - 接口（仅本地回环）：
-  - `GET /provider-failover/status`：生效值 + 档位表（含每条目 key 引用的 `ref/active/configured/source/failed` 标注）+ `nextKeyResetAt` + 最近 10 条转移/换 key 记录 + 冷却路由。
-  - `POST /provider-failover/config`：字段白名单 `{enabled, minSwitchIntervalMs, maxSwitchesPerTurn, startupPreferTier, rankingMode, keyResetAt, rankingModel, defaultModel}`，经 settings 服务落盘。`rankingModel: {provider, model}` 写用户层覆盖，`null` 表示清除覆盖并回退 profile 的 ranking 链；`defaultModel: {provider, model}` 经宿主 `agentDefaultModel` 保存，`null` 表示不改动（宿主默认模型是必填项，没有 clear 接口），宿主服务未装载时该字段返回 503。两者都会先对照实时目录校验，未知 provider/model 返回 400。
+  - `GET /provider-failover/status`：生效值 + 档位表（每条目 `activeKey` + key 引用的 `ref/alias/preview/active/configured/source/sourceLabel/envLevel/envId/failed` 标注）+ `nextKeyResetAt` + 最近 10 条转移/换 key 记录 + 冷却路由。`preview` 是脱敏串，不是明文。
+  - `POST /provider-failover/config`：字段白名单 `{enabled, minSwitchIntervalMs, maxSwitchesPerTurn, startupPreferTier, rankingMode, keyResetAt, keysByEntry, keyAliasesByEntry, rankingModel, defaultModel}`，经 settings 服务落盘。`keyAliasesByEntry` 是 `{条目 id: {引用名: 别名}}`，空别名省略；改 `keysByEntry` 时会丢掉已不存在的引用上的别名。`rankingModel: {provider, model}` 写用户层覆盖，`null` 表示清除覆盖并回退 profile 的 ranking 链；`defaultModel: {provider, model}` 经宿主 `agentDefaultModel` 保存，`null` 表示不改动（宿主默认模型是必填项，没有 clear 接口），宿主服务未装载时该字段返回 503。两者都会先对照实时目录校验，未知 provider/model 返回 400。
   - `GET /provider-failover/catalog`：宿主 provider/model 目录 `{providers:[{id,name,models:[{id,name}],error?}]}`，供设置页下拉使用；单个 provider 取模型失败只标注 `error`，不影响其余目录。
-  - `POST /provider-failover/keys`：`{entry, ref}` 手工置位、`{entry}` 重置该条目、`{}` 重置全部（未声明或未配置的引用被拒绝）。
+  - `POST /provider-failover/keys`：`{entry, ref}` 手工置位（可见范围含未加入轮换的基础 key）、`{entry}` 重置该条目、`{}` 重置全部（未配置的引用被拒绝）。
   - `POST /provider-failover/test`：`{entry?, sessionId?, clear?}` 会话级测试切换；状态接口同时返回 `testTargets`、`pins`、`lastSessionId`。
 - 档位表与宿主 provider 目录**实时关联**：条目显示 `id → route/model` 并标注「宿主未注册／冷却中」；同时列出未纳入任何档位的 provider 与「档位引用但未注册」的警告。目录不可用（llm 未就绪）时不做关联判断，不误标。
 - 客户端半仅注册这一个设置小节；路由决策完全在 Host 半。

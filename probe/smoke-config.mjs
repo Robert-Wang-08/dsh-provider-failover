@@ -162,6 +162,9 @@ check('rejects non-array keys', normalize({ tiers: [{ tier: 1, entries: [{ id: '
 check('rejects ref reused across entries', normalize({ tiers: [{ tier: 1, entries: [{ id: 'a', route: 'r1', model: 'm', keys: ['K9'] }, { id: 'b', route: 'r2', model: 'm', keys: ['K9'] }] }] }).errors.some((error) => error.includes('each reference serves a single provider')))
 check('ref uniqueness is global across tiers', normalize({ tiers: [{ tier: 1, entries: [{ id: 'a', route: 'r1', model: 'm', keys: ['K9'] }] }, { tier: 2, entries: [{ id: 'b', route: 'r2', model: 'm', keys: ['K9'] }] }] }).errors.some((error) => error.includes('each reference serves a single provider')))
 check('distinct refs across entries are fine', normalize({ tiers: [{ tier: 1, entries: [{ id: 'a', route: 'r1', model: 'm', keys: ['K1'] }, { id: 'b', route: 'r3', model: 'm', keys: ['K2'] }] }] }).errors.length === 0)
+const withModels = normalize({ tiers: [{ tier: 1, enabled: true, entries: [{ id: 'a', route: 'r1', model: 'm1', models: ['m1', 'glm-5.3-flash'] }] }] })
+check('entry.models 保留主模型并追加同路由模型', withModels.errors.length === 0 && JSON.stringify(withModels.value.tiers[0].entries[0].models) === JSON.stringify(['m1', 'glm-5.3-flash']), JSON.stringify(withModels.value.tiers[0].entries[0].models))
+check('未声明 models 时默认为 [model]', JSON.stringify(good.value.tiers[0].entries[0].models) === JSON.stringify([good.value.tiers[0].entries[0].model]), JSON.stringify(good.value.tiers[0].entries[0].models))
 
 console.log('keyResetAt:')
 check('defaults to 06:00', normalize({}).value.keyResetAt === '06:00', normalize({}).value.keyResetAt)
@@ -527,7 +530,10 @@ const USAGE_LIMIT_TIERS = [{ tier: 1, enabled: true, entries: [
 ] }]
 const envUsage = makeSwitchEnv(undefined, { probeTarget: false, minSwitchIntervalMs: 0, startup: { preferTier: 0 }, tiers: USAGE_LIMIT_TIERS })
 const usageAgent = freshAgent('usage-limit-session')
-const usageDecision = await envUsage.handlers['agent/request-error']({ agent: usageAgent, failure: { code: 'PI_AI_ERROR', message: 'Codex error: The usage limit has been reached' }, provider: 'r1', turn: 1, step: 1 }, async () => 'NEXT')
+const usageDecision = await envUsage.handlers['agent/request-error']({ agent: usageAgent, failure: { code: 'PI_AI_ERROR', message: 'Codex error: The usage limit has been reached', status: 503, requestId: 'req-diagnostic-123' }, provider: 'r1', turn: 1, step: 1 }, async () => 'NEXT')
+const usageFailureLog = readFileSync(join(dirname(envUsage.settingsFile), 'failures.jsonl'), 'utf8')
+check('每次 request-error 写入独立 failures.jsonl', usageFailureLog.includes('req-diagnostic-123') && usageFailureLog.includes('PI_AI_ERROR'), usageFailureLog)
+check('failure log 保留 status 与完整 message', usageFailureLog.includes('\"status\":503') && usageFailureLog.includes('The usage limit has been reached'), usageFailureLog)
 const usageRoute = await envUsage.handlers['agent/request']({ agent: usageAgent, turn: 1, step: 1 }, async () => ({ provider: 'r1', model: 'm1' }))
 const usageStatus = await statusOf(envUsage)
 check('PI_AI_ERROR usage-limit 文案触发同一步 retry', usageDecision?.kind === 'retry', JSON.stringify(usageDecision))
