@@ -21,7 +21,9 @@
 
 新增 [插件恢复回归](probe/smoke-recovery.mjs) 与 [真实宿主集成](probe/host-recovery.mjs)。两者及既有 smoke-config、smoke-cooldown、smoke-keys、smoke-client 共六组命令均 exit 0。真实集成加载本机已安装 DSH 0.2.0-rc.2 的 Cordis、LLM、Session、Tools、Agent 和 AgentLoop 服务，以内存 mock adapter 故障注入；不调用外部模型、不读凭据、不读写生产会话。
 
-真实集成先执行计数工具，再在下一步先返回 overloaded 后返回通用 server_error，验证请求路由依次 a,a,a,b，工具只执行 1 次，用户消息只记录 1 次，turn/end 为 completed。下一轮继续使用 b；全部候选失败为 error，退避中取消为 aborted 且无第二次派发。
+真实集成先执行计数工具，再在下一步先返回 overloaded 后返回通用 server_error，验证请求路由依次 a,a,a,b，工具只执行 1 次，用户消息只记录 1 次，turn/end 为 completed。下一轮继续使用 b；全部候选失败为 error，退避中取消为 aborted 且无第二次派发。额外三 Agent 并发测试分别得到 a,a,b，验证真实错误 hook 中 agent 身份由 agentEvents 分发器注入、预算与目标隔离；其中一条在输出工具块后由适配器直接抛出 LlmError，LLM runtime 将其归一化为 finish(error)，仍自动恢复。失败流中的工具调用块从不执行。
+
+独立架构复核提出 pin 优先级与切换守卫阻断，已修复并回归。最终复核关于“错误 payload 缺 agent 导致并发串线”的疑点，经检查 agentEvents 的 fused(payload) 注入与上述真实并发试验排除；不能只从调用点对象字面量推断最终事件载荷。宿主规范流经 LLM runtime 归一化；绕过该 runtime 的自定义 prepared adapter 若直接抛异常，不纳入本次已验证边界。
 
 ## 生效与回滚
 

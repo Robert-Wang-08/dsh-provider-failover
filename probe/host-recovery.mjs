@@ -28,11 +28,17 @@ try {
   let executions = 0
   ctx.tools.register(defineTool({ name: 'count_once', description: 'Count one completed side effect', parameters: {}, output: { schema: { type: 'number' } }, execute: async () => ++executions }))
   const attempts = []
+  const bySession = new Map()
+  const failureSessions = []
+  ctx.on('agent/request-error', (payload, next) => { failureSessions.push(payload.agent?.session.id); return next() })
   let failed = 0
   let cancelAgent
   class Mock extends llmModule.LlmAdapter {
     async *stream(options) {
       attempts.push(options.provider)
+      const sessionAttempts = bySession.get(options.sessionId) ?? []
+      sessionAttempts.push(options.provider)
+      bySession.set(options.sessionId, sessionAttempts)
       if (executions === 0) {
         const block = { type: 'tool-call', id: 'count-call', name: 'count_once', arguments: '{}' }
         yield { type: 'block-start', index: 0, blockType: 'tool-call' }
@@ -44,6 +50,7 @@ try {
         // A failed stream's tool block must never dispatch before retry.
         yield { type: 'block-start', index: 0, blockType: 'tool-call' }
         yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'failed-call-' + failed, name: 'count_once', arguments: '{}' } }
+        if (options.sessionId === 'host-throw-test') throw new llmModule.LlmError('server_error: failed after partial stream', 'PI_AI_ERROR')
         yield { type: 'finish', reason: { kind: 'error', failure: { code: 'PI_AI_ERROR', message: failed === 1 ? 'server_error: Our servers are currently overloaded. Please try again later.' : 'server_error: An error occurred while processing your request.' } } }
       } else {
         yield { type: 'block-start', index: 0, blockType: 'text' }
@@ -70,6 +77,16 @@ try {
   handle.agent.followup(llmModule.createUserMessage({ content: [{ type: 'text', text: 'continue' }] }))
   await handle.agent.whenIdle()
   assert.equal(attempts.at(-1), 'b', 'recovered request header must persist into next turn')
+  await Promise.all(['host-concurrent-1', 'host-concurrent-2', 'host-throw-test'].map(async sessionId => {
+    const parallelHandle = await ctx.agents.create({ sessionId, agentOptions: { provider: 'a', model: 'm' } })
+    handles.push(parallelHandle)
+    parallelHandle.agent.followup(llmModule.createUserMessage({ content: [{ type: 'text', text: 'parallel recovery' }] }))
+    await parallelHandle.agent.whenIdle()
+    assert.deepEqual(bySession.get(sessionId), ['a', 'a', 'b'], 'each concurrent agent owns its retry budget and target')
+    assert.equal(parallelHandle.agent.session.requestHeader().config.provider, 'b')
+    assert.ok(failureSessions.includes(sessionId), 'host dispatcher must inject agent identity')
+  }))
+  assert.ok(failureSessions.every(Boolean))
   for (const [sessionId, expected] of [['host-exhausted-test', 'error'], ['host-cancel-test', 'aborted']]) {
     const testHandle = await ctx.agents.create({ sessionId, agentOptions: { provider: 'a', model: 'm' } })
     handles.push(testHandle)
