@@ -4,6 +4,32 @@
 
 DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切换失败**结束时，按配置表的**档位顺序**把同一个 step 的下一次尝试换成另一条 harness 路由（provider），并可一并下发该条目声明的模型与推理层级；条目还可用 `keys` 声明同一条路由的多把 key（**改写该路由的 `apiKeyEnv` 引用名**，不新增路由），并按每日重置时刻恢复默认 key。
 
+## 请求自恢复（3.8.1）
+
+上游 SSE/Responses 可能返回 `server_error: An error occurred while processing your request...`，HTTP 本身仍为 200，宿主归类为 `PI_AI_ERROR`。3.8.1 将 `server_error`、`internal_server_error`、`overloaded_error`、`service_unavailable` 的消息与显式 code 统一归类 `SERVER`。此前只认过载文案，导致同一步从 overloaded 变成通用 server_error 后突然退出恢复链。
+
+恢复顺序：同一步按 `retryPolicies.SERVER` 有界等待并重试 → 预算耗尽后选择已配置且可用的候选 → 宿主重新构建该步请求并继续执行。默认 SERVER 最多重试 5 次、每次等待 5 秒、累计等待预算 30 秒；预算按 session/turn/step/category 共享，换报错文案或路由不会重置。`budgetMs` 只计算退避等待，不是整轮请求总耗时上限。不会无限重试；没有候选时记录 exhausted 并交回宿主。
+
+退避支持 AbortSignal；用户取消立即结束等待，不再发出下一次请求。切换间隔与次数护栏只约束切换，不能拦截尚有预算的原地重试。实际选中备用路由时解除指向失败路由的测试 pin，避免通知称已切换而实际请求仍被拉回。宿主把新请求头持久化，后续 step/turn 继承恢复路由。重试仅重建失败的模型请求，已完成工具不重新执行。
+
+验证命令（在本仓库运行；临时 DSH_HOME、无网络调用或真实凭据）：
+
+```powershell
+node probe/smoke-recovery.mjs
+node probe/smoke-config.mjs
+node probe/smoke-cooldown.mjs
+node probe/smoke-keys.mjs
+node probe/smoke-client.mjs
+# 真实已安装宿主的集成测试；路径参数由当前设备提供
+node probe/host-recovery.mjs <installed-dsh-package-root>
+```
+
+已登记为 `link:` 的设备只需在本仓库 `git pull --ff-only`，然后重启原 DSH web 服务，无需重新 add、安装依赖或改 profile。已运行进程中的插件模块需要重启才加载新代码；页面刷新不足以生效。重启后恢复原失败会话并发送一次“继续”，之后同类故障在本步内自动恢复。已经终止的历史 turn 不会因更新代码自行重放。不要另起第二个 Web 服务代替原服务。
+
+回滚：在干净工作树中对 3.8.1 修复提交执行 `git revert <fix-commit>`，然后重启原服务。验收应看到插件 ready、无 did not activate，并运行上述回归。运行时的失败/通知日志路径均绑定插件启动时的 DSH_HOME，测试不会随之后环境变量变化写入生产目录。
+
+边界：该插件接管 Host 的 `agent/request-error`，不自动重派 ACP 子代理，也不自动恢复进程崩溃、凭据缺失或所有候选均不可用的故障；未知应用错误仍交回宿主。配置项 `maxSwitchesPerTurn` 目前实际上按 `(session, turn, step)` 计数，本次保持兼容口径。
+
 ## 原始失败日志
 
 每次宿主发出 `agent/request-error` 时，插件都会在不改变重试、切换和分类决策的前提下，追加一条诊断记录到：

@@ -31,6 +31,7 @@ import { randomUUID } from 'node:crypto'
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 
 export const name = 'dsh-provider-failover'
 
@@ -152,6 +153,11 @@ const DEFAULT_FAILURE_PATTERNS = [
   'usage_limit',
   'balance',
   'overloaded',
+  // SSE/Responses errors may carry a symbolic code without an HTTP status.
+  'server_error',
+  'internal_server_error',
+  'overloaded_error',
+  'service_unavailable',
   'invalid api key',
   'token limit',
   'rate limit',
@@ -493,6 +499,10 @@ const COOLDOWN_PATTERN_CLASS = {
   'token limit': 'RATE_LIMIT',
   'invalid api key': 'AUTH',
   'overloaded': 'SERVER',
+  'server_error': 'SERVER',
+  'internal_server_error': 'SERVER',
+  'overloaded_error': 'SERVER',
+  'service_unavailable': 'SERVER',
   // 内容安全拦截按本次请求的内容判定，不代表路由不可用：归入独立类别，冷却时长为 0
   // （见 cooldownMsFor），避免把一条健康路由因为一段被拦的内容从梯子上摘掉。
   'content_filter': 'CONTENT_FILTER',
@@ -1181,6 +1191,8 @@ function statusCodeToClass(status) {
  */
 function effectiveFailureCode(code, message, patterns) {
   const raw = typeof code === 'string' ? code.toUpperCase() : ''
+  // Explicit upstream codes are aliases, not opaque normalized host failures.
+  if (['SERVER_ERROR', 'INTERNAL_SERVER_ERROR', 'OVERLOADED_ERROR', 'SERVICE_UNAVAILABLE'].includes(raw)) return 'SERVER'
   if (raw !== '' && raw !== 'PI_AI_ERROR') return raw
   const text = String(message ?? '')
   const mapped = patternCodeFor(text, patterns)
@@ -1202,7 +1214,7 @@ function effectiveFailureCode(code, message, patterns) {
  * 误导用户的一处（`status` 保持原码不变，只细化给人看的 label；QUOTA 等原有标签一律不动）。
  */
 function classifyProbeFailure(code, message, patterns, reasons) {
-  const normalized = typeof code === 'string' ? code.toUpperCase() : ''
+  const normalized = effectiveFailureCode(code, message, patterns)
   const haystack = (String(message ?? '') + ' ' + normalized).toLowerCase()
   const detail = String(message ?? '').slice(0, 200)
   const unknownCode = normalized === '' || normalized === 'PI_AI_ERROR'
@@ -2082,10 +2094,7 @@ export function apply(ctx, rawConfig) {
    * 落盘失败只警告，绝不影响切换本身。
    */
   function noticeFile() {
-    const base = process.env.DSH_HOME !== undefined && process.env.DSH_HOME.trim() !== ''
-      ? process.env.DSH_HOME
-      : join(homedir(), '.dsh')
-    return join(base, 'plugins', SETTINGS_NAMESPACE, 'notices.jsonl')
+    return join(runtimeHome, 'plugins', SETTINGS_NAMESPACE, 'notices.jsonl')
   }
 
   function failureLogFile() {
@@ -2203,6 +2212,7 @@ export function apply(ctx, rawConfig) {
    * 「还能重试几次」与「该等多久」。
    */
   async function transientRetryGate(payload, failure, record, sessionId, turn, step, failedRoute, code) {
+    payload?.signal?.throwIfAborted()
     const cls = retryClassOf(code)
     const policy = retryPolicyFor(code)
     if (policy === undefined || !Number.isInteger(policy.attempts) || policy.attempts <= 0) return undefined
@@ -2253,7 +2263,8 @@ export function apply(ctx, rawConfig) {
       step,
     })
     console.warn('[dsh-provider-failover] transient retry ' + cls + ' ' + String(budget.attempts) + '/' + String(policy.attempts) + ' on ' + (failedRoute.length > 0 ? failedRoute : '(unknown)') + ' after ' + String(delayMs) + 'ms (spent ' + String(budget.spent) + '/' + String(budgetMs) + 'ms, turn ' + String(turn) + ' step ' + String(step) + ')')
-    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs))
+    if (delayMs > 0) await delay(delayMs, undefined, { signal: payload?.signal })
+    payload?.signal?.throwIfAborted()
     return { kind: 'retry' }
   }
 
@@ -2734,6 +2745,7 @@ export function apply(ctx, rawConfig) {
       failure,
     })
     if (config.enabled !== true || config.tiers.length === 0) return next()
+    payload?.signal?.throwIfAborted()
     // 归一化前先做一次生效码判定：宿主把带关闭码的链路中断、网关自定义码、空体 5xx
     // 都留在通用 PI_AI_ERROR 里，只有靠 failurePatterns（+ 已知 HTTP 状态码）才能识别成
     // TRANSPORT/SERVER 等类别；重试分类与切换分类都用它。
@@ -2814,15 +2826,16 @@ export function apply(ctx, rawConfig) {
       return next()
     }
 
-    if (now - (state.lastSwitchAt.get(sessionKey) ?? 0) < config.minSwitchIntervalMs) return next()
-    if (record.switches >= config.maxSwitchesPerTurn) return next()
-
     // ⓪ 按类别决定「先原地重试」还是「直接切换」：
     //    额度/凭据类 attempts=0 → 立即切换；TRANSPORT/RATE_LIMIT/SERVER → 等 delayMs 重试，
     //    次数或预算用尽才落到下面的 key 轮换与 provider 切换。
     //    放在凭据轮换之前：凭据类失败优先换 key（同路由同模型），一类失败只吃一层策略。
     const retried = await transientRetryGate(payload, failure, record, sessionId, turn, step, failedRoute, effectiveCode)
     if (retried !== undefined) return retried
+
+    // Switching guards must not suppress a remaining same-route retry budget.
+    if (Date.now() - (state.lastSwitchAt.get(sessionKey) ?? 0) < config.minSwitchIntervalMs) return next()
+    if (record.switches >= config.maxSwitchesPerTurn) return next()
 
     const failedLoc = failedRoute.length > 0 ? locateRoute(config, failedRoute) : undefined
     const failedEntry = failedLoc?.entry
@@ -2946,6 +2959,9 @@ export function apply(ctx, rawConfig) {
       return next()
     }
 
+    payload?.signal?.throwIfAborted()
+    // A failed test pin must not override the selected recovery route now or on the next step.
+    if (activePin(sessionId)?.route === failedRoute) state.pins.delete(pinKeyOf(sessionId))
     // 真的选到了下一跳，才把失败路由写进冷却（只延长、不缩短）。
     coolDownRoute(failedRoute, now, coolingMs, code, failure?.message)
     record.target = { entry: picked.entry, tier: picked.tier, reason: decision.how }
