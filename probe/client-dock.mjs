@@ -279,5 +279,22 @@ console.log('会话内通知条（client.js FailoverNoticeDock）:')
   check('failover / startup-align / retry / manual-switch / test / 缺字段 都能渲染', threw === '' && rendered.includes('启动对齐') && rendered.includes('手动切换') && rendered.includes('测试切换') && rendered.includes('原地重试') && rendered.includes('未知原因'), threw === '' ? rendered.slice(0, 300) : threw)
 }
 
+// Full upstream message is visible without expanding, with independent schedule metadata.
+{
+  const raw = 'server_error: Our servers are currently overloaded. Please try again later.\n' + 'upstream detail '.repeat(30) + '<script>not executable</script> request ID req-original-tail'
+  const future = Date.now() + 60000
+  const notice = { ...NOTICE, kind: 'retry', code: 'SERVER', rawCode: 'PI_AI_ERROR', rawMessage: raw, detail: 'short legacy summary', status: 503, requestId: 'req-original-tail', retryAttempt: 2, retryMaxAttempts: 5, retryDelayMs: 5000, nextRetryAt: future, retryState: 'scheduled' }
+  const { tree } = await renderDock([notice])
+  const text = textOf(tree)
+  check('完整上游原文超过200字符仍默认可见，保留换行及尾部request ID', text.includes(raw), text.slice(-160))
+  check('原始错误码、HTTP状态与request ID可见', text.includes('PI_AI_ERROR') && text.includes('HTTP 503') && text.includes('req-original-tail'))
+  check('显示重试次数、倒计时与耗尽后的备用provider说明', text.includes('第 2/5 次定时重试') && text.includes('秒后自动执行') && text.includes('切换备用 provider'))
+  check('上游原文按文本渲染，不注入HTML', !JSON.stringify(tree).includes('dangerouslySetInnerHTML') && text.includes('<script>not executable</script>'))
+  const { exportsOf } = loadClient(async () => ({ ok: true, json: async () => ({}) }))
+  const describe = exportsOf.__test.describeRetry
+  check('计划时间过去后不会显示负倒计时', describe(notice, future + 1000).includes('计划时间已到') && !describe(notice, future + 1000).includes('-1'))
+  check('取消定时重试不会继续承诺自动执行', describe({ ...notice, retryState: 'cancelled' }, future - 1000).includes('已取消') && !describe({ ...notice, retryState: 'cancelled' }, future - 1000).includes('自动执行'))
+}
+
 console.log(failures === 0 ? '\nALL PASSED' : '\nFAILURES: ' + String(failures))
 process.exitCode = failures === 0 ? 0 : 1

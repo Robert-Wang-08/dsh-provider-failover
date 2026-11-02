@@ -4,6 +4,23 @@
 
 DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切换失败**结束时，按配置表的**档位顺序**把同一个 step 的下一次尝试换成另一条 harness 路由（provider），并可一并下发该条目声明的模型与推理层级；条目还可用 `keys` 声明同一条路由的多把 key（**改写该路由的 `apiKeyEnv` 引用名**，不新增路由），并按每日重置时刻恢复默认 key。
 
+## overload 原文与定时重试提示（3.8.2）
+
+会话故障通知默认直接显示上游完整 `rawMessage`，保留原文措辞、换行、错误码、HTTP 状态和 request ID。中文原因分类作为补充，不替代原文。旧版 `detail` 的 200 字符摘要继续保留供兼容，新版界面使用完整原文；候选耗尽时也保留触发失败的原文，另列无候选/冷却原因。原文按纯文本渲染，沿用凭据值脱敏。
+
+`overload` / `overloaded` / `overloaded_error` / `server_error` 统一进入 SERVER 定时重试。通知显示 `retryAttempt/retryMaxAttempts`、`retryDelayMs`、`nextRetryAt` 和 `retryState`，例如“第 1/5 次定时重试 · 13:20:05（5 秒后自动执行）”；界面每秒更新倒计时，取消后显示已取消。通知轮询暂时失败时保留上次已收到的原始报错，不把它隐藏。
+
+默认每 5 秒原地重试一次，最多 5 次；仍失败并用尽次数/等待预算后切换到档位表中下一条可用 provider，继续同一步请求。没有可用候选时明确报耗尽。可在 failover 插件配置的 `retryPolicies.SERVER` 调整 `attempts`、`delayMs`、`budgetMs`，例如：
+
+```yaml
+retryPolicies:
+  SERVER: { attempts: 3, delayMs: 10000, budgetMs: 30000 }
+```
+
+这表示每 10 秒重试、最多 3 次；预算是累计退避等待时间。Host 的通知落盘记录是当时的调度事件，当前 ready/cancelled 状态通过运行中 notices 接口查询。
+
+3.8.2 修改包含 Host 与已提交的客户端 JS，无新增依赖；已 link 登记设备 git pull 后重启原 DSH 服务并刷新原页面。没有确认运行客户端构建 watcher，不承诺免刷新热更新。验收增加 `node probe/client-dock.mjs`，覆盖完整原文、尾部 request ID、HTML 纯文本展示、计时和取消文案；`node probe/smoke-recovery.mjs` 覆盖真实等待与失败后切换下一请求 provider。
+
 ## 请求自恢复（3.8.1）
 
 上游 SSE/Responses 可能返回 `server_error: An error occurred while processing your request...`，HTTP 本身仍为 200，宿主归类为 `PI_AI_ERROR`。3.8.1 将 `server_error`、`internal_server_error`、`overloaded_error`、`service_unavailable` 的消息与显式 code 统一归类 `SERVER`。此前只认过载文案，导致同一步从 overloaded 变成通用 server_error 后突然退出恢复链。

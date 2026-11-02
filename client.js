@@ -66,7 +66,9 @@ window.__ModuleLoader__.load({
       ".pf-mono{font-family:var(--dsw-font-mono,monospace);font-size:12px}",
       ".pf-list{margin:0;padding-left:18px}",
       ".pf-dock{display:flex;flex-direction:column;gap:4px;margin:0 0 6px;padding:6px 10px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);border-radius:8px;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-primary)}",
-      ".pf-dock-head{display:flex;align-items:center;gap:8px;cursor:pointer}",
+      ".pf-dock-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;cursor:pointer}",
+      ".pf-raw-message{margin:4px 0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;color:var(--dsw-alias-label-primary)}",
+      ".pf-notice-meta{color:var(--dsw-alias-label-secondary);font-size:12px}",
       ".pf-dock-title{font-weight:600}",
       ".pf-dock-body{margin:0;padding-left:18px;max-height:180px;overflow:auto}",
       ".pf-dock-more{color:var(--dsw-alias-label-secondary);cursor:pointer;text-decoration:underline}",
@@ -1033,7 +1035,37 @@ window.__ModuleLoader__.load({
     }
 
     /** 把一条通知写成人话：谁失败、为什么（细分原因）、切到哪、什么时候。 */
-    function describeNotice(item) {
+    function describeRetry(item, now) {
+      if (item.kind !== "retry" || !Number.isFinite(item.nextRetryAt)) return "";
+      const attempt = String(item.retryAttempt) + "/" + String(item.retryMaxAttempts);
+      const at = new Date(item.nextRetryAt).toLocaleTimeString();
+      if (item.retryState === "cancelled") return " · 已取消第 " + attempt + " 次定时重试";
+      const seconds = Math.max(0, Math.ceil((item.nextRetryAt - now) / 1000));
+      return " · 第 " + attempt + " 次定时重试 · " + at
+        + (item.retryState === "scheduled" && seconds > 0 ? "（" + seconds + " 秒后自动执行）" : "（计划时间已到）")
+        + " · 重试仍失败且预算耗尽后切换备用 provider";
+    }
+
+    function noticeMessage(item) {
+      return String(item.rawMessage === undefined ? (item.detail === undefined ? "" : item.detail) : item.rawMessage);
+    }
+
+    function renderNoticeMessage(item) {
+      const raw = noticeMessage(item);
+      const meta = [
+        item.rawCode ? "收到的错误码：" + String(item.rawCode) : "",
+        item.status === undefined ? "" : "HTTP " + String(item.status),
+        item.requestId ? "request ID: " + String(item.requestId) : "",
+      ].filter(Boolean).join(" · ");
+      return h("div", null,
+        meta ? h("div", { className: "pf-notice-meta" }, meta) : null,
+        raw ? h("pre", { className: "pf-raw-message" }, raw) : null,
+        item.kind === "exhausted" && item.rawMessage && item.detail
+          ? h("div", { className: "pf-notice-meta" }, String(item.detail)) : null);
+    }
+
+    function describeNotice(item, now) {
+      if (now === undefined) now = Date.now();
       if (item === null || item === undefined) return "";
       const when = new Date(item.at).toLocaleTimeString();
       const head = item.kind === "retry"
@@ -1063,12 +1095,7 @@ window.__ModuleLoader__.load({
       const tier = typeof item.tier === "number" && item.tier > 0 ? "（档 " + String(item.tier) + "）" : "";
       const effort = item.reasoningEffort === undefined || item.reasoningEffort === null ? "" : " · effort " + String(item.reasoningEffort);
       const where = " · turn " + String(item.turn) + " step " + String(item.step);
-      // 上游原文：让用户能自查（余额不足会直接读出「用户剩余额度: ¥1.04」）。
-      // 服务端已做密钥形状抹除与截断，这里只负责显示形状。
-      const detail = item.detail === undefined || item.detail === null || String(item.detail) === ""
-        ? ""
-        : " · " + String(item.detail);
-      return when + " " + head + " · " + reason + " · " + from + " → " + to + tier + effort + where + detail;
+      return when + " " + head + " · " + reason + " · " + from + " → " + to + tier + effort + where + describeRetry(item, now);
     }
 
     /**
@@ -1082,6 +1109,15 @@ window.__ModuleLoader__.load({
       const [notices, setNotices] = react.useState([]);
       const [open, setOpen] = react.useState(false);
       const [failed, setFailed] = react.useState(false);
+      const [now, setNow] = react.useState(Date.now());
+      const [loadedSessionId, setLoadedSessionId] = react.useState(null);
+
+      react.useEffect(() => {
+        const latest = notices[0];
+        if (!latest || latest.kind !== "retry" || latest.retryState !== "scheduled") return undefined;
+        const timer = setInterval(() => setNow(Date.now()), 1000);
+        return () => clearInterval(timer);
+      }, [sessionId, notices]);
 
       react.useEffect(() => {
         if (sessionId === undefined || sessionId === null) return undefined;
@@ -1091,21 +1127,22 @@ window.__ModuleLoader__.load({
             const data = await getNotices(sessionId, 20);
             if (alive !== true) return;
             setNotices(Array.isArray(data.notices) ? data.notices : []);
+            setLoadedSessionId(sessionId);
+            setNow(Date.now());
             setFailed(false);
           } catch (error) {
             if (alive === true) setFailed(true);
           }
         };
         tick();
-        const timer = setInterval(tick, 4000);
+        const timer = setInterval(tick, 1000);
         return () => {
           alive = false;
           clearInterval(timer);
         };
       }, [sessionId]);
 
-      if (sessionId === undefined || sessionId === null) return null;
-      if (failed === true) return null;
+      if (sessionId === undefined || sessionId === null || loadedSessionId !== sessionId) return null;
       if (notices.length === 0) return null;
       const latest = notices[0];
       return h(
@@ -1115,13 +1152,15 @@ window.__ModuleLoader__.load({
           "div",
           { className: "pf-dock-head", onClick: () => setOpen(!open) },
           h("span", { className: "pf-dock-title" }, "故障转移通知"),
-          h("span", { className: "pf-mono" }, describeNotice(latest)),
+          h("span", { className: "pf-mono" }, describeNotice(latest, now)),
           notices.length > 1
             ? h("span", { className: "pf-dock-more" }, open ? "收起" : "展开 " + String(notices.length) + " 条")
             : null,
         ),
+        renderNoticeMessage(latest),
+        failed ? h("div", { className: "pf-notice-meta" }, "通知状态暂时无法更新；保留上次收到的原始报错。") : null,
         open === true
-          ? h("ul", { className: "pf-dock-body pf-mono" }, notices.map((item, index) => h("li", { key: index }, describeNotice(item))))
+          ? h("ul", { className: "pf-dock-body pf-mono" }, notices.map((item, index) => h("li", { key: item.noticeId || index }, describeNotice(item, now), renderNoticeMessage(item))))
           : null,
       );
     }
@@ -1159,7 +1198,7 @@ window.__ModuleLoader__.load({
     exports.apply = apply;
     exports.inject = inject;
     // 供 probe/smoke-keys.mjs 直接单测 key 草稿校验（Host/Web 运行期不使用）。
-    exports.__test = { REF_NAME_PATTERN, describeRefIssue, looksLikeSecretValue, keyDraftMap, normalizedKeyMap, reviewKeyDraft, friendlyKeyError, aliasDraftMap, normalizedAliasMap, describeKeyIdentity, normalizeAlias, modelsOf, describeEntryRoute, displayKeyRows };
+    exports.__test = { REF_NAME_PATTERN, describeRefIssue, looksLikeSecretValue, keyDraftMap, normalizedKeyMap, reviewKeyDraft, friendlyKeyError, aliasDraftMap, normalizedAliasMap, describeKeyIdentity, normalizeAlias, modelsOf, describeEntryRoute, displayKeyRows, describeNotice, describeRetry, noticeMessage };
     return module.exports;
   },
 });

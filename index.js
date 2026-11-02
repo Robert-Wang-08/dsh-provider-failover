@@ -153,6 +153,7 @@ const DEFAULT_FAILURE_PATTERNS = [
   'usage_limit',
   'balance',
   'overloaded',
+  'overload',
   // SSE/Responses errors may carry a symbolic code without an HTTP status.
   'server_error',
   'internal_server_error',
@@ -499,6 +500,7 @@ const COOLDOWN_PATTERN_CLASS = {
   'token limit': 'RATE_LIMIT',
   'invalid api key': 'AUTH',
   'overloaded': 'SERVER',
+  'overload': 'SERVER',
   'server_error': 'SERVER',
   'internal_server_error': 'SERVER',
   'overloaded_error': 'SERVER',
@@ -1192,7 +1194,7 @@ function statusCodeToClass(status) {
 function effectiveFailureCode(code, message, patterns) {
   const raw = typeof code === 'string' ? code.toUpperCase() : ''
   // Explicit upstream codes are aliases, not opaque normalized host failures.
-  if (['SERVER_ERROR', 'INTERNAL_SERVER_ERROR', 'OVERLOADED_ERROR', 'SERVICE_UNAVAILABLE'].includes(raw)) return 'SERVER'
+  if (['SERVER_ERROR', 'INTERNAL_SERVER_ERROR', 'OVERLOAD', 'OVERLOADED', 'OVERLOADED_ERROR', 'SERVICE_UNAVAILABLE'].includes(raw)) return 'SERVER'
   if (raw !== '' && raw !== 'PI_AI_ERROR') return raw
   const text = String(message ?? '')
   const mapped = patternCodeFor(text, patterns)
@@ -2125,7 +2127,18 @@ export function apply(ctx, rawConfig) {
   function pushNotice(input) {
     const key = sessionKeyOf(input.session)
     state.noticeSeq += 1
+    const rawMessage = String(input.failure?.message ?? input.detail ?? '')
     const notice = {
+      // Keep the complete upstream message visible; only credential-shaped values are redacted.
+      rawMessage: sanitizeForRanking(rawMessage, rawMessage.length),
+      rawCode: input.failure?.code === undefined ? input.code : String(input.failure.code),
+      status: input.failure?.status,
+      requestId: input.failure?.requestId,
+      retryAttempt: input.retryAttempt,
+      retryMaxAttempts: input.retryMaxAttempts,
+      retryDelayMs: input.retryDelayMs,
+      nextRetryAt: input.nextRetryAt,
+      retryState: input.retryState,
       noticeId: 'n' + String(state.noticeSeq) + '-' + String(input.at) + '-' + Math.random().toString(36).slice(2, 8),
       at: input.at,
       session: key,
@@ -2232,10 +2245,16 @@ export function apply(ctx, rawConfig) {
     const at = Date.now()
     // 原地重试同样带原因细分：TRANSPORT/RATE_LIMIT 类下「限流」与「链路抖动」的等待预期不同。
     const retryReason = failureReasonFor(code, failure?.message, config.failureReasons)
-    pushNotice({
+    const retryNotice = pushNotice({
       at,
       session: sessionId,
       kind: 'retry',
+      failure,
+      retryAttempt: budget.attempts,
+      retryMaxAttempts: policy.attempts,
+      retryDelayMs: delayMs,
+      nextRetryAt: at + delayMs,
+      retryState: 'scheduled',
       stage: 'retrying',
       code,
       trigger: 'retry:' + cls + ' ' + String(budget.attempts) + '/' + String(policy.attempts) + ' after ' + String(delayMs) + 'ms',
@@ -2263,9 +2282,15 @@ export function apply(ctx, rawConfig) {
       step,
     })
     console.warn('[dsh-provider-failover] transient retry ' + cls + ' ' + String(budget.attempts) + '/' + String(policy.attempts) + ' on ' + (failedRoute.length > 0 ? failedRoute : '(unknown)') + ' after ' + String(delayMs) + 'ms (spent ' + String(budget.spent) + '/' + String(budgetMs) + 'ms, turn ' + String(turn) + ' step ' + String(step) + ')')
-    if (delayMs > 0) await delay(delayMs, undefined, { signal: payload?.signal })
-    payload?.signal?.throwIfAborted()
-    return { kind: 'retry' }
+    try {
+      if (delayMs > 0) await delay(delayMs, undefined, { signal: payload?.signal })
+      payload?.signal?.throwIfAborted()
+      retryNotice.retryState = 'ready'
+      return { kind: 'retry' }
+    } catch (error) {
+      retryNotice.retryState = 'cancelled'
+      throw error
+    }
   }
 
   /** 该会话的通知列表（最新在前）；`after` 为 noticeId，返回它之后（更新）的通知。 */
@@ -2943,6 +2968,7 @@ export function apply(ctx, rawConfig) {
         session: sessionId,
         kind: 'exhausted',
         stage: 'exhausted',
+        failure,
         code: typeof failure?.code === 'string' ? failure.code : '',
         trigger: 'no-candidate',
         fromRoute: failedRoute,
@@ -2986,6 +3012,7 @@ export function apply(ctx, rawConfig) {
       session: sessionId,
       kind: 'failover',
       stage: 'selected',
+      failure,
       code: typeof failure?.code === 'string' ? failure.code : '',
       trigger: decision.how,
       fromRoute: failedRoute,

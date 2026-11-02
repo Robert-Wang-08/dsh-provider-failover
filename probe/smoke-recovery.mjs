@@ -34,7 +34,7 @@ function fixture(overrides = {}) {
   })
   const payload = (session = 's', step = 14, provider = 'a', message = MESSAGE, signal) => ({
     agent: { session: { id: session } }, turn: 40, step, provider,
-    failure: { code: 'PI_AI_ERROR', message }, signal,
+    failure: { code: 'PI_AI_ERROR', message, status: 503, requestId: 'req-original-tail' }, signal,
   })
   const fail = (...args) => handlers['agent/request-error'](payload(...args), async () => 'NEXT')
   const request = (session = 's', step = 14) => handlers['agent/request'](payload(session, step), async () => ({ provider: 'a', model: 'm' }))
@@ -43,18 +43,23 @@ function fixture(overrides = {}) {
     await routes['/provider-failover/status']({ socket: { remoteAddress: '127.0.0.1' } }, { writeHead() {}, end(body) { value = JSON.parse(body) } })
     return value
   }
+  const notices = async () => {
+    let value
+    await routes['/provider-failover/notices']({ url: '/provider-failover/notices?sessionId=s', socket: { remoteAddress: '127.0.0.1' } }, { writeHead() {}, end(body) { value = JSON.parse(body) } })
+    return value.notices
+  }
   const pin = async () => {
     let value
     const req = { method: 'POST', socket: { remoteAddress: '127.0.0.1' }, async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ sessionId: 's', entry: 'a' })) } }
     await routes['/provider-failover/test'](req, { writeHead() {}, end(body) { value = JSON.parse(body) } })
     assert.equal(value.ok, true)
   }
-  return { home, fail, request, status, pin }
+  return { home, fail, request, status, pin, notices }
 }
 
 try {
   const defaults = defaultConfig()
-  for (const code of ['server_error', 'internal_server_error', 'overloaded_error', 'service_unavailable']) {
+  for (const code of ['server_error', 'internal_server_error', 'overload', 'overloaded', 'overloaded_error', 'service_unavailable']) {
     assert.equal(__test.effectiveFailureCode('PI_AI_ERROR', code + ': request failed', defaults.failurePatterns), 'SERVER', code)
     assert.equal(__test.effectiveFailureCode(code, 'request failed', defaults.failurePatterns), 'SERVER', code + ' raw code')
     assert.equal(__test.classifyProbeFailure(code, 'request failed', defaults.failurePatterns).status, 'SERVER')
@@ -87,6 +92,31 @@ try {
   assert.equal((await f.fail('other')).kind, 'retry', 'other session has independent budget')
   assert.equal((await f.fail('s', 15)).kind, 'retry', 'new step has independent budget')
 
+  const rawOverload = 'server_error: Our servers are currently overloaded. Please try again later.\n' + 'Upstream diagnostic details. '.repeat(25) + 'request ID req-original-tail'
+  const scheduled = fixture({ retryPolicies: { SERVER: { attempts: 1, delayMs: 200, budgetMs: 200 } } })
+  const startedAt = Date.now()
+  let settled = false
+  const scheduledRetry = scheduled.fail('s', 14, 'a', rawOverload).then(result => { settled = true; return result })
+  const waiting = (await scheduled.notices())[0]
+  assert.equal(settled, false, 'retry action must wait for its timer')
+  assert.equal(waiting.rawMessage, rawOverload, 'full original message beyond 200 characters must survive')
+  assert.equal(waiting.rawCode, 'PI_AI_ERROR')
+  assert.equal(waiting.status, 503)
+  assert.equal(waiting.requestId, 'req-original-tail')
+  assert.equal(waiting.retryAttempt, 1)
+  assert.equal(waiting.retryMaxAttempts, 1)
+  assert.equal(waiting.nextRetryAt, waiting.at + 200)
+  assert.equal(waiting.retryState, 'scheduled')
+  assert.equal((await scheduledRetry).kind, 'retry')
+  assert.ok(Date.now() - startedAt >= 180)
+  assert.equal((await scheduled.notices())[0].retryState, 'ready')
+  assert.equal((await scheduled.fail('s', 14, 'a', rawOverload)).kind, 'retry')
+  assert.equal((await scheduled.request()).provider, 'b', 'retry failure must select backup provider')
+  assert.equal((await scheduled.notices())[0].rawMessage, rawOverload)
+  assert.equal(await scheduled.fail('s', 14, 'b', rawOverload), 'NEXT')
+  assert.equal((await scheduled.notices())[0].kind, 'exhausted')
+  assert.equal((await scheduled.notices())[0].rawMessage, rawOverload, 'no-candidate diagnosis must not replace original error')
+
   const disabled = fixture({ enabled: false })
   assert.equal(await disabled.fail(), 'NEXT')
   const capped = fixture({ maxSwitchesPerTurn: 1, retryPolicies: { SERVER: { attempts: 0 } } })
@@ -114,6 +144,7 @@ try {
   const pending = cancel.fail('s', 14, 'a', MESSAGE, controller.signal)
   controller.abort()
   await assert.rejects(pending, { name: 'AbortError' })
+  assert.equal((await cancel.notices())[0].retryState, 'cancelled')
   assert.equal((await cancel.status()).switches.filter(item => item.kind === 'failover').length, 0)
   const preAborted = new AbortController()
   preAborted.abort()
