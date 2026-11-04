@@ -73,6 +73,22 @@ try {
   assert.equal(__test.isSwitchable(shape, 'PI_AI_ERROR', 'An error occurred while processing your request').hit, false)
   assert.equal(__test.isSwitchable(shape, 'PI_AI_ERROR', 'application validation failed').hit, false)
 
+  // Bare HTTP/2 and coded HTTP2 errors share the TRANSPORT retry budget.
+  const transport = fixture({ retryPolicies: { TRANSPORT: { attempts: 1, delayMs: 1, budgetMs: 1, observationWindowMs: 30000 } } })
+  const bareHttp2 = 'Upstream HTTP/2 stream failed'
+  assert.equal((await transport.fail('s', 14, 'a', bareHttp2)).kind, 'retry')
+  assert.equal((await transport.request()).provider, 'a', 'first failure retries same provider')
+  assert.equal((await transport.notices())[0].code, 'TRANSPORT')
+  assert.equal((await transport.notices())[0].rawMessage, bareHttp2)
+  assert.equal((await transport.fail('s', 14, 'a', 'Error Code upstream_http2_stream_error: ' + bareHttp2)).kind, 'retry')
+  assert.equal((await transport.request()).provider, 'b', 'shared transport budget exhaustion switches the actual request')
+  assert.equal(await transport.fail('s', 14, 'b', bareHttp2), 'NEXT', 'all routes exhausted remains bounded')
+  const transportRecords = readFileSync(join(transport.home, 'plugins/provider-failover/failures.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)
+  assert.ok(transportRecords.every(record => record.effectiveCode === 'TRANSPORT'))
+  const unrelated = fixture()
+  assert.equal(await unrelated.fail('s', 14, 'a', 'stream failed to produce output'), 'NEXT')
+  assert.equal((await unrelated.notices()).length, 0, 'application failure must not schedule retries or switches')
+
   // An overloaded response followed by generic server_error must share one budget.
   const f = fixture()
   assert.equal((await f.fail('s', 14, 'a', 'server_error: Our servers are currently overloaded. Please try again later.')).kind, 'retry')

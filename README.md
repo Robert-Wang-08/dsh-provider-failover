@@ -4,6 +4,16 @@
 
 DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切换失败**结束时，按配置表的**档位顺序**把同一个 step 的下一次尝试换成另一条 harness 路由（provider），并可一并下发该条目声明的模型与推理层级；条目还可用 `keys` 声明同一条路由的多把 key（**改写该路由的 `apiKeyEnv` 引用名**，不新增路由），并按每日重置时刻恢复默认 key。
 
+## HTTP/2 裸文案恢复（3.8.3）
+
+上游有时只返回 `Upstream HTTP/2 stream failed`，不再带 `upstream_http2_stream_error`。旧规则只匹配 `http2` / `upstream_`，因斜杠和错误码前缀缺失而漏判为 `PI_AI_ERROR`，既不重试也不切换。现在增加限定模式 `http/2 stream failed`，统一折算成 `TRANSPORT`；不匹配宽泛的 `stream failed`，也不将所有 `PI_AI_ERROR` 设为可重试。
+
+恢复使用现有 TRANSPORT 策略：默认最多 5 次原地重试、每次间隔 5 秒、累计退避预算 30 秒；超过 30 秒观测窗口可跳过原地重试直接尝试切换。次数/预算耗尽后按已配置候选切换，无候选则有界终止。已完成工具不会重放。若自行整体覆盖 `failurePatterns`，请保留新增的 `http/2 stream failed` 模式；无需修改默认配置。
+
+验证：`node probe/smoke-config.mjs`、`node probe/smoke-recovery.mjs`、`node probe/host-recovery.mjs <installed-dsh-package-root>`；覆盖裸文案及大小写、带码文案、共享预算、通知分类、实际路由切换、普通应用错误不介入、宿主 finish/throw 两种流失败及工具副作用不重放。宿主探针补齐当前 API 要求的 user source，不改宿主代码。
+
+升级仅改插件源码，无依赖/profile/插件清单变更。已 link 登记设备 `git pull --ff-only` 后重启**原 DSH 服务**才生效，无需重新 add；页面刷新不能替代后端重启。已终止的历史轮次不会自行重放，重启后在原会话发送一次“继续”。回滚可对本次修复提交执行 `git revert <fix-commit>` 后重启原服务。本次修改前源码副本已保存在本机工作区备份中，不进入发布载荷。
+
 ## overload 原文与定时重试提示（3.8.2）
 
 会话故障通知默认直接显示上游完整 `rawMessage`，保留原文措辞、换行、错误码、HTTP 状态和 request ID。中文原因分类作为补充，不替代原文。旧版 `detail` 的 200 字符摘要继续保留供兼容，新版界面使用完整原文；候选耗尽时也保留触发失败的原文，另列无候选/冷却原因。原文按纯文本渲染，沿用凭据值脱敏。
@@ -70,7 +80,7 @@ $DSH_HOME/plugins/provider-failover/failures.jsonl
 
 默认集合：`QUOTA`、`AUTH`、`INVALID_CREDENTIAL`、`MISSING_CREDENTIAL`、`NO_ADAPTER`、`SERVER`、`RATE_LIMIT`、`TRANSPORT`。
 
-另有**消息模式兜底**（编码未归一化时按文本匹配）：`insufficient balance`、`insufficient_quota`、`quota exceeded`、`usage limit`、`usage_limit`、`balance`、`overloaded`、`invalid api key`、`token limit`、`rate limit`、`websocket closed`、`websocket error`、`websocket`、`http2`、`upstream_`、`content_filter`、`content filter`。
+另有**消息模式兜底**（编码未归一化时按文本匹配）：`insufficient balance`、`insufficient_quota`、`quota exceeded`、`usage limit`、`usage_limit`、`balance`、`overloaded`、`invalid api key`、`token limit`、`rate limit`、`websocket closed`、`websocket error`、`websocket`、`http2`、`http/2 stream failed`、`upstream_`、`content_filter`、`content filter`。
 
 > 兜底的意义：宿主 `classifyPiAiError` **只看错误文案、不看错误对象与 HTTP 状态码**，认不出来就统一返回 `PI_AI_ERROR`；而宿主默认重试码表（`dsh-llm` 的 `retryableCodes`）只含 `EMPTY_RESPONSE`/`RATE_LIMIT`/`SERVER`/`TIMEOUT`/`TRANSPORT`，**不含 `PI_AI_ERROR`**。所以凡落成 `PI_AI_ERROR` 的失败，宿主既不重试也不切换，唯一恢复路径就是本节这张模式表——漏一条就等于该故障"整轮直接失败"。
 
@@ -85,7 +95,7 @@ $DSH_HOME/plugins/provider-failover/failures.jsonl
 
 `websocket closed` 覆盖上游 WebSocket/SSE 中途断开（如 `WebSocket closed 1000`）：宿主 `classifyPiAiError` 只把 `WebSocket closed unexpectedly` 归一化为 `TRANSPORT`，仅带关闭码的文案会落到通用 `PI_AI_ERROR`，须靠消息模式兜底才能触发切换。传输层失败按**非凭据类**处理，直接走 provider 切换（换 key 治不了连接断开）。
 
-`http2` / `upstream_` 覆盖网关把上游连接层故障改写成自定义码的情形（实测 2026-10-15：codex-relay 的上游 chatgpt.com Codex 后端 HTTP/2 流被对端复位，relay 以 SSE `error` 事件下发 `{"code":"upstream_http2_stream_error","message":"Upstream HTTP/2 stream failed"}`，pi-ai 拼成 `Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed` 抛出）。该文案既无 5xx 数字也无 `network/socket/connection` 词，宿主两条规则都不命中 → `PI_AI_ERROR` → 修复前**既不重试也不切换**（实测 `isSwitchable` 返回 `hit:false`）。现在折算成 `TRANSPORT`（通知里记 `effective:TRANSPORT`），可吃到「原地重试 5 次 × 5s、预算 30s、观测窗口 30s」，预算耗尽再切换 provider；全量测试里同样显示为「传输中断」。同一条修复也覆盖**任何**留在 `PI_AI_ERROR` 里的 HTTP 失败：空体 502 现在折算 `SERVER`（`effective:SERVER`）并真的触发重试/切换，而不只是状态页好看。
+`http/2 stream failed` 覆盖仅剩 message 的裸文案；`http2` / `upstream_` 覆盖网关把上游连接层故障改写成自定义码的情形（实测 2026-10-15：codex-relay 的上游 chatgpt.com Codex 后端 HTTP/2 流被对端复位，relay 以 SSE `error` 事件下发 `{"code":"upstream_http2_stream_error","message":"Upstream HTTP/2 stream failed"}`，pi-ai 拼成 `Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed` 抛出）。该文案既无 5xx 数字也无 `network/socket/connection` 词，宿主两条规则都不命中 → `PI_AI_ERROR` → 修复前**既不重试也不切换**（实测 `isSwitchable` 返回 `hit:false`）。现在折算成 `TRANSPORT`（通知里记 `effective:TRANSPORT`），可吃到「原地重试 5 次 × 5s、预算 30s、观测窗口 30s」，预算耗尽再切换 provider；全量测试里同样显示为「传输中断」。同一条修复也覆盖**任何**留在 `PI_AI_ERROR` 里的 HTTP 失败：空体 502 现在折算 `SERVER`（`effective:SERVER`）并真的触发重试/切换，而不只是状态页好看。
 刻意**没有**采用宽泛的 `stream failed`：应用语义的 `stream failed to produce output` 会被误伤（实测仍为「未知错误、不切换」）；`upstream_*` 前缀码已覆盖网关层改写，其余上游文案（`*_timeout`、`*_connection_*`）由 `timeout`/`network`/`connection` 类关键词或 `http2` 承接。
 
 > ⚠️ **这两个键是「整体替换」，不是「追加」。** `terminalCodes` / `failurePatterns` 只要非空，就会**完全替换**上表的默认集合（`index.js` 的 `normalizeConfig`：`strings(input.terminalCodes).length > 0 ? strings(input.terminalCodes) : DEFAULT_TERMINAL_CODES`）。因此在 profile 里一旦列出它们却漏掉 `TRANSPORT`、`SERVER` 或 `websocket closed` / `http2` / `upstream_`，对应故障转移会被**静默关闭**：上游 WebSocket/SSE 中途断开、网关 `upstream_*` 流错误、留在 `PI_AI_ERROR` 里的空体 5xx 都不切换，宿主日志里也不会出现 `switch` 行——看起来像「插件失效」，实际是配置把触发条件删掉了。

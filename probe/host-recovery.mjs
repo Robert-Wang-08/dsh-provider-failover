@@ -50,6 +50,11 @@ try {
         // A failed stream's tool block must never dispatch before retry.
         yield { type: 'block-start', index: 0, blockType: 'tool-call' }
         yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'failed-call-' + failed, name: 'count_once', arguments: '{}' } }
+        if (options.sessionId === 'host-http2-throw-test') throw new llmModule.LlmError('Upstream HTTP/2 stream failed', 'PI_AI_ERROR')
+        if (options.sessionId === 'host-http2-test') {
+          yield { type: 'finish', reason: { kind: 'error', failure: { code: 'PI_AI_ERROR', message: 'Upstream HTTP/2 stream failed' } } }
+          return
+        }
         if (options.sessionId === 'host-throw-test') throw new llmModule.LlmError('server_error: failed after partial stream', 'PI_AI_ERROR')
         yield { type: 'finish', reason: { kind: 'error', failure: { code: 'PI_AI_ERROR', message: failed === 1 ? 'server_error: Our servers are currently overloaded. Please try again later.' : 'server_error: An error occurred while processing your request.' } } }
       } else {
@@ -61,12 +66,12 @@ try {
     }
   }
   ctx.llm.registerAdapter(['a', 'b'], new Mock())
-  ctx.plugin(failover, { minSwitchIntervalMs: 0, retryPolicies: { SERVER: { attempts: 1, delayMs: 20, budgetMs: 20 } }, tiers: [{ tier: 1, enabled: true, entries: [{ id: 'a', route: 'a', model: 'm' }, { id: 'b', route: 'b', model: 'm' }] }] })
+  ctx.plugin(failover, { minSwitchIntervalMs: 0, retryPolicies: { SERVER: { attempts: 1, delayMs: 20, budgetMs: 20 }, TRANSPORT: { attempts: 1, delayMs: 20, budgetMs: 20, observationWindowMs: 30000 } }, tiers: [{ tier: 1, enabled: true, entries: [{ id: 'a', route: 'a', model: 'm' }, { id: 'b', route: 'b', model: 'm' }] }] })
   const events = []
   ctx.on('session/event', (_session, event) => { events.push(event) })
   const handle = await ctx.agents.create({ sessionId: 'host-recovery-test', agentOptions: { provider: 'a', model: 'm' } })
   handles.push(handle)
-  handle.agent.followup(llmModule.createUserMessage({ content: [{ type: 'text', text: 'perform work' }] }))
+  handle.agent.followup(llmModule.createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'perform work' }] }))
   await handle.agent.whenIdle()
   assert.equal(executions, 1, 'completed tool side effect must not replay')
   assert.deepEqual(attempts, ['a', 'a', 'a', 'b'])
@@ -74,16 +79,17 @@ try {
   const end = events.filter(e => e.type === 'turn/end').at(-1)
   assert.equal(end.data.reason.kind, 'completed')
   assert.equal(handle.agent.session.requestHeader().config.provider, 'b')
-  handle.agent.followup(llmModule.createUserMessage({ content: [{ type: 'text', text: 'continue' }] }))
+  handle.agent.followup(llmModule.createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'continue' }] }))
   await handle.agent.whenIdle()
   assert.equal(attempts.at(-1), 'b', 'recovered request header must persist into next turn')
-  await Promise.all(['host-concurrent-1', 'host-concurrent-2', 'host-throw-test'].map(async sessionId => {
+  await Promise.all(['host-concurrent-1', 'host-concurrent-2', 'host-throw-test', 'host-http2-test', 'host-http2-throw-test'].map(async sessionId => {
     const parallelHandle = await ctx.agents.create({ sessionId, agentOptions: { provider: 'a', model: 'm' } })
     handles.push(parallelHandle)
-    parallelHandle.agent.followup(llmModule.createUserMessage({ content: [{ type: 'text', text: 'parallel recovery' }] }))
+    parallelHandle.agent.followup(llmModule.createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'parallel recovery' }] }))
     await parallelHandle.agent.whenIdle()
     assert.deepEqual(bySession.get(sessionId), ['a', 'a', 'b'], 'each concurrent agent owns its retry budget and target')
     assert.equal(parallelHandle.agent.session.requestHeader().config.provider, 'b')
+    assert.equal(events.filter(e => e.type === 'turn/end' && e.data.reason.kind === 'error').length, 0, 'recovered sessions must not end in error')
     assert.ok(failureSessions.includes(sessionId), 'host dispatcher must inject agent identity')
   }))
   assert.ok(failureSessions.every(Boolean))
@@ -92,7 +98,7 @@ try {
     handles.push(testHandle)
     cancelAgent = testHandle.agent
     const before = attempts.length
-    testHandle.agent.followup(llmModule.createUserMessage({ content: [{ type: 'text', text: 'exercise terminal state' }] }))
+    testHandle.agent.followup(llmModule.createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'exercise terminal state' }] }))
     await testHandle.agent.whenIdle()
     assert.equal(events.filter(e => e.type === 'turn/end').at(-1).data.reason.kind, expected)
     if (expected === 'aborted') assert.equal(attempts.length - before, 1, 'cancel during backoff must not dispatch again')

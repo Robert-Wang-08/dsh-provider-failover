@@ -184,11 +184,13 @@ const DEFAULT_FAILURE_PATTERNS = [
   // pi-ai 拼成 `Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed` 抛出。
   // 该文案两条都不命中宿主 classifyPiAiError（既无 5xx 数字也无 network/socket/connection 词），
   // 于是落成 PI_AI_ERROR；宿主默认重试码表又不含 PI_AI_ERROR → 整轮终止、无自动恢复。
-  // 这两条按 TRANSPORT 归类（连接层中断，与能否换 key 无关）：
-  //   'http2'    —— HTTP/2 流/请求失败的各种文案；
+  // 按 TRANSPORT 归类（连接层中断，与能否换 key 无关）：
+  //   'http/2 stream failed' —— 仅剩 message、无 upstream_* 码的裸文案（2026-11-04）；
+  //   'http2'    —— 无斜杠的协议名/错误码；
   //   'upstream_'—— 网关/relay 转发层的前缀式错误码（upstream_*）。
   // 刻意不加宽泛的 'stream failed'：应用语义的 "stream failed to produce output" 会被误伤。
   'http2',
+  'http/2 stream failed',
   'upstream_',
 ]
 
@@ -495,6 +497,7 @@ const COOLDOWN_PATTERN_CLASS = {
   // 上游流错误（HTTP/2 流复位、网关 upstream_* 前缀码）：连接层中断，归 TRANSPORT
   // 才能吃到「原地重试 5 次 × 5s、预算 30s」，而不是落到 DEFAULT 的 1 次或直接切换。
   'http2': 'TRANSPORT',
+  'http/2 stream failed': 'TRANSPORT',
   'upstream_': 'TRANSPORT',
   'rate limit': 'RATE_LIMIT',
   'token limit': 'RATE_LIMIT',

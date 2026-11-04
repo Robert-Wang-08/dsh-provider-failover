@@ -77,6 +77,15 @@ check('normalized TRANSPORT failure is switchable', __test.isSwitchable(switchab
 // 必须靠插件的 'http2' / 'upstream_' 模式兜底，且归类必须是 TRANSPORT（5 次原地重试 + 观测窗口），
 // 否则既无宿主重试也无插件重试，整轮直接终止。
 const HTTP2_FAILURE = 'Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed'
+// 2026-11-04: the adapter may preserve only message, without the symbolic code.
+for (const message of ['Upstream HTTP/2 stream failed', 'upstream http/2 stream failed', 'UPSTREAM HTTP/2 STREAM FAILED']) {
+  check('bare HTTP/2 maps to TRANSPORT: ' + message, __test.effectiveFailureCode('PI_AI_ERROR', message, defaults.failurePatterns) === 'TRANSPORT')
+  check('bare HTTP/2 is switchable: ' + message, __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', message).how === 'effective:TRANSPORT')
+  check('bare HTTP/2 display matches recovery', __test.classifyProbeFailure('PI_AI_ERROR', message, defaults.failurePatterns).status === 'TRANSPORT')
+  check('bare HTTP/2 uses transport cooldown', __test.cooldownMsFor({ TRANSPORT: 1234 }, 99, 'PI_AI_ERROR', 'effective:' + __test.effectiveFailureCode('PI_AI_ERROR', message, defaults.failurePatterns), defaults.failurePatterns) === 1234)
+}
+check('application stream failure remains unhandled', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', 'stream failed to produce output').hit === false)
+check('explicit invalid request is not overridden by HTTP/2 text', __test.isSwitchable(switchableShape(defaults), 'INVALID_REQUEST', 'Upstream HTTP/2 stream failed').hit === false)
 check('message fallbacks include upstream http2 wording', defaults.failurePatterns.includes('http2') && defaults.failurePatterns.includes('upstream_'))
 check('upstream http2 stream error is switchable despite PI_AI_ERROR', __test.isSwitchable(switchableShape(defaults), 'PI_AI_ERROR', HTTP2_FAILURE).how === 'effective:TRANSPORT')
 check('upstream http2 stream error maps to TRANSPORT (not DEFAULT)', __test.patternCodeFor(HTTP2_FAILURE, switchableShape(defaults).failurePatterns) === 'TRANSPORT')
