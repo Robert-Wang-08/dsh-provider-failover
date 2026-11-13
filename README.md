@@ -4,6 +4,21 @@
 
 DSH（DeepSeek Harness）的 Host 级常驻插件：当模型请求以**可切换失败**结束时，按配置表的**档位顺序**把同一个 step 的下一次尝试换成另一条 harness 路由（provider），并可一并下发该条目声明的模型与推理层级；条目还可用 `keys` 声明同一条路由的多把 key（**改写该路由的 `apiKeyEnv` 引用名**，不新增路由），并按每日重置时刻恢复默认 key。
 
+## 会话头部一键「自动切换」开关（3.9.0）
+
+会话头部右侧工具区（`conversation.session.header.utilities`，与 PTC/通知/打开方式同一排，`order:92` 紧邻 PTC）新增一个紧凑开关，显示 `自动切换 开` / `自动切换 关` 并带轨道。点击即写 `POST /provider-failover/config`，**只提交 `{enabled}`**，以 Host 返回的最新快照落定；失败回滚到点击前的已确认值并保留可重试提示。
+
+语义必须按实现理解：关闭后 Host 在 `agent/request-error` 里直接交回宿主，**不原地重试、不策略重试、也不切换 provider**；原始失败仍写入 `failures.jsonl` 供诊断。tooltip 与开关文案都按这一点写，不把“不自动切换”误读成“只不换 provider”。
+
+状态处理：
+
+- 首次 GET 失败时保持 **unknown**（按钮显示“自动切换 状态未知”，不画开关轨道），避免把“不知道”伪装成“关”；点击重试。
+- `writable=false`（设置服务未装载）时显示当前值但禁用，并说明原因；`/config` 的 503 不会被吞成 off。
+- 设置页的「启用故障转移」是同一语义的第二个入口：顶部开关写回后会同步设置页的“当前”显示；设置页主保存会用共享的当前 `enabled` 兜底，避免旧表单把新值静默改回去。
+- 挂载读一次 + 窗口重新获得焦点/网络恢复时补读；不做轮询，也不做跨标签广播。
+
+验证：`node probe/client-toggle.mjs`（渲染、unknown/loading/只读、写回成功/失败回滚、错误态重试、设置页合入规则）与 `node probe/smoke-client.mjs`、`node probe/smoke-recovery.mjs`（`enabled=false` 不重试不切换但仍写失败日志）。客户端半改动仍需重启 `dsh web` 并用启动时打印的新 token 重开页面；页面刷新不足以加载新的 `client.js` rev。
+
 ## HTTP/2 裸文案恢复（3.8.3）
 
 上游有时只返回 `Upstream HTTP/2 stream failed`，不再带 `upstream_http2_stream_error`。旧规则只匹配 `http2` / `upstream_`，因斜杠和错误码前缀缺失而漏判为 `PI_AI_ERROR`，既不重试也不切换。现在增加限定模式 `http/2 stream failed`，统一折算成 `TRANSPORT`；不匹配宽泛的 `stream failed`，也不将所有 `PI_AI_ERROR` 设为可重试。
@@ -171,7 +186,11 @@ pi-ai 折成 `Provider finish_reason: content_filter`，宿主 `classifyPiAiErro
 - **冷却只延长、不缩短**：同一路由先被判 `QUOTA`（`cooldownByCode.QUOTA`，默认 5 小时）之后，
   再来一条 `SERVER` 不会把它改写成 60 秒，额度已死的路由不会被 60 秒后重新捡回。
 - **无候选会留痕**：档位表耗尽时推一条 `kind=exhausted` 的会话通知（进 `notices.jsonl` 与会话
-  通知条，附带「谁在冷却」摘要），不再只有内存 `ignored` 环里那条看不见的记录。
+  通知条），不再只有内存 `ignored` 环里那条看不见的记录。
+- **无候选要说清成因**：耗尽有三种互不相干的原因——本步已尝试、冷却中、能力不兼容/不可解析。
+  通知的 `detail` 因此同时给出「本步已失败（均不可用）：`route/model(CODE)` …」的有序清单与
+  「冷却中：…」摘要；只写冷却会在冷却到期而 `attempted` 仍生效时呈现「冷却中：(无)」，
+  看起来自相矛盾（2026-11-06 实况：turn 1 step 47 连跳五条路由后耗尽）。
 - **类别按折算后的生效码**：宿主管线把失败留在 `PI_AI_ERROR` 里、靠消息或状态码折算成 `QUOTA`
   时，冷却同样按 `QUOTA` 计；只有未登记的类别才回退条目 `cooldownMs`。
 
@@ -355,7 +374,7 @@ dsh 设置页新增「Provider 故障转移」小节：**总开关** + 常用参
   - `POST /provider-failover/keys`：`{entry, ref}` 手工置位（可见范围含未加入轮换的基础 key）、`{entry}` 重置该条目、`{}` 重置全部（未配置的引用被拒绝）。
   - `POST /provider-failover/test`：`{entry?, sessionId?, clear?}` 会话级测试切换；状态接口同时返回 `testTargets`、`pins`、`lastSessionId`。
 - 档位表与宿主 provider 目录**实时关联**：条目显示 `id → route/model` 并标注「宿主未注册／冷却中」；同时列出未纳入任何档位的 provider 与「档位引用但未注册」的警告。目录不可用（llm 未就绪）时不做关联判断，不误标。
-- 客户端半仅注册这一个设置小节；路由决策完全在 Host 半。
+- 客户端半注册三个席位：`settings.section`（设置小节）、`conversation.input.dock`（会话通知条）与 `conversation.session.header.utilities`（顶部一键自动切换开关）；路由决策完全在 Host 半。顶部开关复用上面的 `GET /status` / `POST /config`，不新增 Host 端点。
 
 ## 客户端半的渲染约束（2026-09-23 修复）
 
@@ -376,6 +395,7 @@ node --check index.js
 node probe/smoke-config.mjs      # 配置归一化、key 轮换与接口冒烟（不依赖 dsh 运行时）
 node probe/smoke-keys.mjs        # key 引用名校验、跨条目去重与错误中文化单测（含与 Host 正则一致性断言）
 node probe/client-panel.mjs      # 设置页面板真实渲染回归（key 卡片：合法/非法草稿、未配置徽标、行内标红）
+node probe/client-toggle.mjs     # 顶部自动切换开关渲染/写回/unknown/503 回归
 node probe/smoke-client.mjs      # 客户端半字符串冒烟（slot 注册与关键接线）
 node probe/client-dock.mjs       # 会话通知条渲染回归
 node probe/mock-llm.mjs 8799     # 本地 mock LLM 端点（配合 probe/dsh-failover-probe 做运行时验证）

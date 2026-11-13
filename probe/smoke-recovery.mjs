@@ -89,6 +89,13 @@ try {
   assert.equal(await unrelated.fail('s', 14, 'a', 'stream failed to produce output'), 'NEXT')
   assert.equal((await unrelated.notices()).length, 0, 'application failure must not schedule retries or switches')
 
+  // 2026-11-11 codex-relay 实测（failures.jsonl: code=PI_AI_ERROR，message 仅
+  // "Upstream response stream was interrupted"）：裸 interrupted 文案必须与 http2 家族
+  // 共享同一 TRANSPORT 语义，否则宿主 classifyPiAiError 落 PI_AI_ERROR、插件沉默、整轮终止。
+  const interrupted = fixture({ retryPolicies: { TRANSPORT: { attempts: 1, delayMs: 1, budgetMs: 1, observationWindowMs: 30000 } } })
+  assert.equal(__test.effectiveFailureCode('PI_AI_ERROR', 'Upstream response stream was interrupted', defaults.failurePatterns), 'TRANSPORT')
+  assert.equal((await interrupted.fail('s', 14, 'a', 'Upstream response stream was interrupted')).kind, 'retry')
+
   // An overloaded response followed by generic server_error must share one budget.
   const f = fixture()
   assert.equal((await f.fail('s', 14, 'a', 'server_error: Our servers are currently overloaded. Please try again later.')).kind, 'retry')
@@ -135,6 +142,13 @@ try {
 
   const disabled = fixture({ enabled: false })
   assert.equal(await disabled.fail(), 'NEXT')
+  const disabledStatus = await disabled.status()
+  assert.equal(disabledStatus.enabled, false)
+  assert.equal(disabledStatus.switches.length, 0, 'enabled=false must not retry or switch')
+  assert.equal((await disabled.notices()).length, 0, 'enabled=false must not schedule retries')
+  const disabledRecords = readFileSync(join(disabled.home, 'plugins/provider-failover/failures.jsonl'), 'utf8').trim().split('\n').filter(Boolean)
+  assert.ok(disabledRecords.length >= 1, 'enabled=false must still append the raw failure for diagnosis')
+  assert.equal(JSON.parse(disabledRecords.at(-1)).code, 'PI_AI_ERROR')
   const capped = fixture({ maxSwitchesPerTurn: 1, retryPolicies: { SERVER: { attempts: 0 } } })
   assert.equal((await capped.fail()).kind, 'retry')
   assert.equal(await capped.fail('s', 14, 'b'), 'NEXT')

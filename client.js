@@ -72,6 +72,21 @@ window.__ModuleLoader__.load({
       ".pf-dock-title{font-weight:600}",
       ".pf-dock-body{margin:0;padding-left:18px;max-height:180px;overflow:auto}",
       ".pf-dock-more{color:var(--dsw-alias-label-secondary);cursor:pointer;text-decoration:underline}",
+      // 顶部「自动切换」开关：与 PTC 开关同区同尺寸；只用文字+轨道表达状态，不依赖颜色。
+      ".pf-toggle{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 7px;border:1px solid var(--dsw-alias-border-l2,#afb8c1);border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1;white-space:nowrap;cursor:pointer;flex:none}",
+      ".pf-toggle:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}",
+      ".pf-toggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#2f6feb);outline-offset:2px}",
+      ".pf-toggle[data-on=true]{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-brand-primary,#2f6feb)}",
+      ".pf-toggle[data-pending=true]{opacity:.65;cursor:progress}",
+      ".pf-toggle[data-error=true]{border-color:var(--dsw-alias-state-error-primary,#cf222e);color:var(--dsw-alias-state-error-primary,#cf222e)}",
+      ".pf-toggle:disabled{opacity:.55;cursor:not-allowed}",
+      ".pf-toggle-track{position:relative;display:inline-block;width:22px;height:12px;border-radius:999px;background:var(--dsw-alias-border-l4,#8c959f);transition:background .15s ease;flex:none}",
+      ".pf-toggle-knob{position:absolute;top:2px;left:2px;width:8px;height:8px;border-radius:50%;background:#fff;box-shadow:0 0 0 1px rgba(15,23,42,.18);transition:transform .15s ease}",
+      ".pf-toggle[data-on=true] .pf-toggle-knob{transform:translateX(10px)}",
+      ".pf-toggle[data-on=true] .pf-toggle-track{background:var(--dsw-alias-brand-primary,#2f6feb)}",
+      ".pf-toggle-label{line-height:1}",
+      ".pf-toggle-alert{font-weight:700}",
+      ".pf-toggle-live{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}",
     ].join("");
 
     async function apiFetch(url, options, timeoutMs) {
@@ -120,6 +135,131 @@ window.__ModuleLoader__.load({
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body === undefined ? {} : body),
       }, 600000);
+
+    // ── 顶部「自动切换」开关的共享状态 ────────────────────────────────
+    // 开关挂在会话头部 utilities 席位；设置页的「启用故障转移」是同一语义的
+    // 第二个入口。两者都在这个 client.js 模块里，所以一个模块级快照 + 订阅就
+    // 足够同步，不需要跨标签轮询：挂载读一次、写回以 Host 返回的快照为准，
+    // 窗口重新获得焦点时补一次（另一标签可能刚改过）。
+    //
+    // 关键语义（对应 Host 的 `config.enabled`）：关闭后 agent/request-error
+    // 直接交回宿主——**不原地重试、不策略重试、也不切换 provider**；原始失败
+    // 仍会写入 failures.jsonl。tooltip 必须把这一点说清楚，不能只说“不切换”。
+    const toggleState = {
+      loaded: false,
+      enabled: undefined,
+      writable: undefined,
+      pending: false,
+      loading: false,
+      error: "",
+      at: 0,
+    };
+    const toggleListeners = new Set();
+    let toggleInflight = false;
+
+    function toggleSnapshot() {
+      return {
+        loaded: toggleState.loaded,
+        enabled: toggleState.enabled,
+        writable: toggleState.writable,
+        pending: toggleState.pending,
+        loading: toggleState.loading,
+        error: toggleState.error,
+      };
+    }
+
+    function emitToggle(patch) {
+      Object.assign(toggleState, patch);
+      const value = toggleSnapshot();
+      for (const listener of toggleListeners) {
+        try {
+          listener(value);
+        } catch (error) {
+          // 一个订阅者渲染失败不能拖垮另一个入口；这与 slot 边界吞异常的行为一致。
+          console.warn("[dsh-provider-failover] toggle listener failed: " + String(error && error.message || error));
+        }
+      }
+    }
+
+    /** 设置页拿到快照后回填共享状态，顶部开关无需再发一次 GET。 */
+    function publishToggleSnapshot(data) {
+      if (data === null || data === undefined || typeof data !== "object") return;
+      if (toggleState.pending === true) return;
+      emitToggle({
+        loaded: true,
+        enabled: data.enabled === true,
+        writable: data.writable === true,
+        error: "",
+        at: Date.now(),
+      });
+    }
+
+    /** 读一次 Host 的真实状态；首次失败必须留在 unknown，不能伪装成“关”。 */
+    async function refreshToggle(force) {
+      if (toggleInflight === true) return;
+      if (force !== true && toggleState.loaded === true && Date.now() - toggleState.at < 5000) return;
+      toggleInflight = true;
+      emitToggle({ loading: true });
+      try {
+        const data = await getStatus();
+        emitToggle({
+          loaded: true,
+          enabled: data.enabled === true,
+          writable: data.writable === true,
+          loading: false,
+          error: "",
+          at: Date.now(),
+        });
+      } catch (error) {
+        // loaded 保持原值：有旧值就保留并标记错误；没有旧值就是 unknown。
+        emitToggle({
+          loaded: toggleState.loaded === true,
+          loading: false,
+          error: String(error && error.message || error),
+        });
+      } finally {
+        toggleInflight = false;
+      }
+    }
+
+    /** 一键写回；失败回滚到点击前的已确认值，并把错误留给 UI 显示。 */
+    async function writeToggle(target) {
+      if (toggleState.pending === true || toggleState.loaded !== true || toggleState.writable !== true) return;
+      const previous = toggleState.enabled;
+      emitToggle({ pending: true, enabled: target === true, error: "" });
+      try {
+        const data = await saveConfig({ enabled: target === true });
+        emitToggle({
+          pending: false,
+          loaded: true,
+          enabled: data.enabled === true,
+          writable: data.writable === true,
+          error: "",
+          at: Date.now(),
+        });
+      } catch (error) {
+        emitToggle({ pending: false, enabled: previous, error: String(error && error.message || error) });
+      }
+    }
+
+    function subscribeToggle(listener) {
+      toggleListeners.add(listener);
+      listener(toggleSnapshot());
+      return () => {
+        toggleListeners.delete(listener);
+      };
+    }
+
+    /**
+     * 设置页保存时合入「当前 enabled」：另一个入口刚改过值时，不能拿旧表单
+     * 把它静默改回去。form 相对 status 有改动时以 form 为准；否则用共享状态。
+     * 返回 null 表示不需要写 enabled。
+     */
+    function enabledPatchFor(form, status, currentEnabled) {
+      if (form.enabled !== status.editable.enabled) return form.enabled === true;
+      if (currentEnabled !== status.editable.enabled) return currentEnabled === true;
+      return null;
+    }
 
     function describeSwitch(entry) {
       if (entry === null || entry === undefined) return "";
@@ -418,6 +558,7 @@ window.__ModuleLoader__.load({
           const data = await getStatus();
           const catalogData = await getCatalog();
           setStatus(data);
+          publishToggleSnapshot(data);
           setCatalog(Array.isArray(catalogData.providers) ? catalogData.providers : []);
           setForm(formOf(data));
           setKeyDraft(draftOf(data));
@@ -433,6 +574,13 @@ window.__ModuleLoader__.load({
       react.useEffect(() => {
         load();
       }, [load]);
+
+      // 顶部开关是同一语义的另一个入口：它写回后，这里只同步“当前启用”显示；
+      // 设置表单的 enabled 由 enabledPatchFor 在保存时合入，避免旧表单把新值改回去。
+      react.useEffect(() => subscribeToggle((state) => {
+        if (state.loaded !== true || state.enabled === undefined) return;
+        setStatus((prev) => prev === null || prev.enabled === state.enabled ? prev : Object.assign({}, prev, { enabled: state.enabled }));
+      }), []);
 
       if (error.length > 0 && status === null) {
         return h("div", { className: "pf-root" }, h("div", { className: "pf-err" }, "无法读取状态：" + error));
@@ -477,7 +625,12 @@ window.__ModuleLoader__.load({
       });
 
       const patch = {};
-      if (form.enabled !== status.editable.enabled) patch.enabled = form.enabled === true;
+      const enabledPatch = enabledPatchFor(
+        form,
+        status,
+        toggleState.loaded === true && toggleState.enabled !== undefined ? toggleState.enabled === true : status.editable.enabled === true,
+      );
+      if (enabledPatch !== null) patch.enabled = enabledPatch;
       if (String(form.minSwitchIntervalMs) !== String(status.editable.minSwitchIntervalMs)) patch.minSwitchIntervalMs = Number(form.minSwitchIntervalMs);
       if (String(form.maxSwitchesPerTurn) !== String(status.editable.maxSwitchesPerTurn)) patch.maxSwitchesPerTurn = Number(form.maxSwitchesPerTurn);
       if (String(form.startupPreferTier) !== String(status.editable.startupPreferTier)) patch.startupPreferTier = Number(form.startupPreferTier);
@@ -517,6 +670,7 @@ window.__ModuleLoader__.load({
           }
           const data = await saveConfig(payload);
           setStatus(data);
+          publishToggleSnapshot(data);
           setForm(formOf(data));
           setKeyDraft(draftOf(data));
           setAliasDraft(aliasesOf(data));
@@ -535,6 +689,7 @@ window.__ModuleLoader__.load({
         try {
           const data = await saveConfig({ rankingModel: modelSelection("rankingModel"), defaultModel: modelSelection("defaultModel") });
           setStatus(data);
+          publishToggleSnapshot(data);
           setForm(formOf(data));
           setKeyDraft(draftOf(data));
           setAliasDraft(aliasesOf(data));
@@ -613,6 +768,7 @@ window.__ModuleLoader__.load({
             throw new Error(first !== undefined && typeof first.error === "string" ? first.error : "切换 key 失败");
           }
           setStatus(data.status);
+          publishToggleSnapshot(data.status);
           setForm(formOf(data.status));
           setKeyDraft(draftOf(data.status));
           setAliasDraft(aliasesOf(data.status));
@@ -656,6 +812,7 @@ window.__ModuleLoader__.load({
         try {
           const data = await saveConfig({ keysByEntry: keyDraftShape, keyAliasesByEntry: aliasDraftShape });
           setStatus(data);
+          publishToggleSnapshot(data);
           setForm(formOf(data));
           setKeyDraft(draftOf(data));
           setAliasDraft(aliasesOf(data));
@@ -791,6 +948,7 @@ window.__ModuleLoader__.load({
         try {
           const data = await testSwitch(testTarget.length > 0 ? { entry: testTarget } : {});
           setStatus(data.status);
+          publishToggleSnapshot(data.status);
           setForm(formOf(data.status));
           setTestMsgKind("ok");
           setTestMsg("已切换：" + String(data.pin.route) + "/" + String(data.pin.model) + "（会话 " + String(data.sessionId) + "）");
@@ -808,6 +966,7 @@ window.__ModuleLoader__.load({
         try {
           const data = await testSwitch({ clear: true });
           setStatus(data.status);
+          publishToggleSnapshot(data.status);
           setTestMsgKind("ok");
           setTestMsg("已解除测试切换");
         } catch (err) {
@@ -898,6 +1057,7 @@ window.__ModuleLoader__.load({
         try {
           const data = await resetKeys({});
           setStatus(data.status);
+          publishToggleSnapshot(data.status);
           setForm(formOf(data.status));
           setKeyDraft(draftOf(data.status));
           setAliasDraft(aliasesOf(data.status));
@@ -1165,6 +1325,123 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * 会话头部的一键「自动切换」开关。
+     *
+     * 位置：`conversation.session.header.utilities`，与 PTC 开关同区（PC/通知/监控
+     * 同一顶栏）；只在有会话时出现，与 monitor 等会话工具一起隐藏——这是 slot 的预期，
+     * 不是缺陷。状态由模块级 toggleState 提供，切换会话重挂载不会闪烁或重复请求。
+     *
+     * 未知态（首次 GET 失败）刻意不画 switch 轨道：`aria-checked` 只有 true/false，
+     * 把“不知道”画成 off 会让用户以为自动切换真的被关了。此时只给一个可点击重试的按钮。
+     */
+    function AutoSwitchToggle() {
+      const statePair = react.useState(() => toggleSnapshot());
+      const state = statePair[0];
+      const setState = statePair[1];
+
+      react.useEffect(() => {
+        const unsubscribe = subscribeToggle(setState);
+        refreshToggle(false);
+        // 另一个标签页可能刚改过配置；窗口重新获得焦点时补读一次即可，不做轮询。
+        const onFocus = () => { refreshToggle(false); };
+        if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+          window.addEventListener("focus", onFocus);
+          window.addEventListener("online", onFocus);
+        }
+        return () => {
+          unsubscribe();
+          if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
+            window.removeEventListener("focus", onFocus);
+            window.removeEventListener("online", onFocus);
+          }
+        };
+      }, []);
+
+      const loaded = state.loaded === true;
+      const pending = state.pending === true;
+      const writable = state.writable === true;
+      const on = state.enabled === true;
+      const error = typeof state.error === "string" ? state.error : "";
+      const loading = loaded !== true && error.length === 0;
+
+      if (loaded !== true) {
+        if (loading === true) {
+          return h("button", {
+            type: "button",
+            className: "pf-toggle",
+            disabled: true,
+            "aria-busy": "true",
+            title: "正在读取自动切换状态",
+          }, h("span", { className: "pf-toggle-label" }, "自动切换 …"));
+        }
+        return h(react.Fragment, null,
+          h("button", {
+            type: "button",
+            className: "pf-toggle pf-toggle-error",
+            "data-error": "true",
+            title: "自动切换状态未知：" + error + "；点击重试",
+            "aria-label": "自动切换状态未知，点击重试",
+            onClick: () => { refreshToggle(true); },
+          }, h("span", { className: "pf-toggle-label" }, "自动切换 状态未知")),
+          h("span", { className: "pf-toggle-live", role: "status", "aria-live": "polite" }, "自动切换状态未知，点击重试"),
+        );
+      }
+
+      const disabled = pending === true || writable !== true;
+      const target = on !== true;
+      const label = pending === true
+        ? (on ? "自动切换 开…" : "自动切换 关…")
+        : (on ? "自动切换 开" : "自动切换 关");
+      const title = pending === true
+        ? "正在保存自动切换状态…"
+        : writable !== true
+          ? "设置服务未装载，无法修改；当前：" + (on ? "已开启" : "已关闭")
+          : error.length > 0
+            ? "上次自动切换操作失败：" + error + "；点击重试"
+            : on
+              ? "自动切换已开启：失败时自动重试并切换 provider；点击关闭"
+              : "自动切换已关闭：不原地重试、不策略重试、不切换 provider；点击开启";
+      const live = pending === true
+        ? "正在保存自动切换状态"
+        : error.length > 0
+          ? "自动切换操作失败"
+          : on
+            ? "自动切换已开启"
+            : "自动切换已关闭";
+
+      return h(react.Fragment, null,
+        h("button", {
+          type: "button",
+          className: "pf-toggle",
+          role: "switch",
+          "aria-checked": on ? "true" : "false",
+          "aria-label": "自动切换",
+          "aria-busy": pending === true ? "true" : undefined,
+          "aria-disabled": disabled === true ? "true" : undefined,
+          "data-on": on ? "true" : "false",
+          "data-pending": pending === true ? "true" : undefined,
+          "data-error": error.length > 0 ? "true" : undefined,
+          disabled: disabled,
+          title: title,
+          onClick: () => {
+            if (pending === true || writable !== true) return;
+            // 上次写失败后先重读真实状态，避免拿旧值做第二次盲目写入。
+            if (error.length > 0) {
+              refreshToggle(true);
+              return;
+            }
+            writeToggle(target);
+          },
+        },
+          h("span", { className: "pf-toggle-track", "aria-hidden": "true" }, h("span", { className: "pf-toggle-knob" })),
+          h("span", { className: "pf-toggle-label" }, label),
+          error.length > 0 ? h("span", { className: "pf-toggle-alert", "aria-hidden": "true" }, "!") : null,
+        ),
+        h("span", { className: "pf-toggle-live", role: "status", "aria-live": "polite" }, live),
+      );
+    }
+
     const inject = ["slots"];
 
     function apply(ctx) {
@@ -1193,12 +1470,24 @@ window.__ModuleLoader__.load({
         },
         FailoverNoticeDock,
       ));
+
+      // 顶部一键开关：与 PTC(91)、通知铃铛同一右对齐工具区；order 92 紧邻 PTC。
+      // 只在有会话时出现（与 monitor/通知一致），不另做 shell.overlay 双入口。
+      ctx.slots.inject("conversation.session.header.utilities", () => ctx.slots.register(
+        {
+          name: "conversation.session.header.utilities",
+          id: "provider-failover-auto-toggle",
+          order: 92,
+          label: "自动切换",
+        },
+        AutoSwitchToggle,
+      ));
     }
 
     exports.apply = apply;
     exports.inject = inject;
     // 供 probe/smoke-keys.mjs 直接单测 key 草稿校验（Host/Web 运行期不使用）。
-    exports.__test = { REF_NAME_PATTERN, describeRefIssue, looksLikeSecretValue, keyDraftMap, normalizedKeyMap, reviewKeyDraft, friendlyKeyError, aliasDraftMap, normalizedAliasMap, describeKeyIdentity, normalizeAlias, modelsOf, describeEntryRoute, displayKeyRows, describeNotice, describeRetry, noticeMessage };
+    exports.__test = { REF_NAME_PATTERN, describeRefIssue, looksLikeSecretValue, keyDraftMap, normalizedKeyMap, reviewKeyDraft, friendlyKeyError, aliasDraftMap, normalizedAliasMap, describeKeyIdentity, normalizeAlias, modelsOf, describeEntryRoute, displayKeyRows, describeNotice, describeRetry, noticeMessage, toggleSnapshot, publishToggleSnapshot, refreshToggle, writeToggle, enabledPatchFor };
     return module.exports;
   },
 });

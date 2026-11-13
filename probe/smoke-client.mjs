@@ -59,6 +59,10 @@ plugin.apply({
   },
 })
 check('设置区仍注册到 settings.section', registered.some((item) => item.options.name === 'settings.section' && item.options.id === 'provider-failover'))
+check('顶部开关注册到 conversation.session.header.utilities', registered.some((item) => item.options.name === 'conversation.session.header.utilities' && item.options.id === 'provider-failover-auto-toggle' && item.options.order === 92))
+check('顶部开关走现有 /config 且只提交 enabled', source.includes('saveConfig({ enabled: target === true })'))
+check('首次读取失败保留未知态而不是画成关', source.includes('自动切换 状态未知'))
+check('关闭 tooltip 写明不重试也不切换', source.includes('不原地重试') && source.includes('不切换 provider'))
 
 console.log(failures.length === 0 ? '\nALL PASSED' : '\nFAILURES: ' + String(failures.length))
 process.exitCode = failures.length === 0 ? 0 : 1
