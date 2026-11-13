@@ -85,6 +85,7 @@ console.log('无候选：不冻结、不重试、必须留痕:')
   const notice = (feed.notices ?? []).find((item) => item.kind === 'exhausted')
   check('落 kind=exhausted 的会话可见通知', notice !== undefined && notice.code === 'QUOTA', JSON.stringify(feed.notices))
   check('通知点名「无可用候选」并带冷却摘要', notice !== undefined && String(notice.detail).includes('无可用候选') && String(notice.detail).includes('冷却中'), notice === undefined ? '(none)' : String(notice.detail))
+  check('通知点名本步已失败的路由（只写冷却会变成「冷却中：(无)」）', notice !== undefined && String(notice.detail).includes('本步已失败') && String(notice.detail).includes('solo/m'), notice === undefined ? '(none)' : String(notice.detail))
   const file = join(home, 'plugins', 'provider-failover', 'notices.jsonl')
   const persisted = existsSync(file) ? readFileSync(file, 'utf8') : ''
   check('通知落盘 notices.jsonl（可回看）', persisted.includes('"kind":"exhausted"'), persisted.slice(0, 200))
@@ -136,6 +137,24 @@ console.log('瞬时故障的冷却时长可配置:')
   const cooling = (await readStatus(env)).cooling.find((item) => item.route === 'r1')
   check('TRANSPORT 失败照样切换', decision?.kind === 'retry', JSON.stringify(decision))
   check('TRANSPORT 冷却取 cooldownByCode 的 60 秒', cooling !== undefined && cooling.code === 'TRANSPORT' && cooling.until - Date.now() <= 65000, JSON.stringify(cooling))
+}
+
+console.log('候选耗尽：列出本步已试过、均不可用的路由:')
+{
+  // 2026-11-06 实况：turn 1 step 47 连跳 ais→codex-relay→openai-codex→kimi→opencode-go 后耗尽，
+  // 冷却到期那一刻通知只剩「冷却中：(无)」，看不出「已经试过 a,b,c,d」。这里固定顺序与失败码必须出现。
+  const env = makeCtx()
+  apply(env.ctx, { ...TWO_ENTRIES, retryPolicies: { TRANSPORT: { attempts: 0 } } })
+  const first = await env.handlers['agent/request-error'](fail('TRANSPORT', 'Connection error.', 'r1', 2, 5), async () => 'NEXT')
+  const second = await env.handlers['agent/request-error'](fail('TRANSPORT', 'Connection error.', 'r2', 2, 5), async () => 'NEXT')
+  check('r1 失败先切到 r2', first?.kind === 'retry', JSON.stringify(first))
+  check('r2 也失败后交回宿主', second === 'NEXT', JSON.stringify(second))
+  const feed = await readNotices(env, 's-cooldown')
+  const last = (feed.notices ?? []).filter((item) => item.kind === 'exhausted').pop()
+  const detail = last === undefined ? '' : String(last.detail)
+  check('耗尽通知列出 r1 与 r2', detail.includes('r1/m1') && detail.includes('r2/m1'), detail)
+  check('按尝试顺序排列（r1 在前）', detail.indexOf('r1/m1') < detail.indexOf('r2/m1'), detail)
+  check('每条都带失败码', detail.includes('r1/m1(TRANSPORT)') && detail.includes('r2/m1(TRANSPORT)'), detail)
 }
 
 rmSync(home, { recursive: true, force: true })

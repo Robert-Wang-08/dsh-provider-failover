@@ -192,6 +192,10 @@ const DEFAULT_FAILURE_PATTERNS = [
   'http2',
   'http/2 stream failed',
   'upstream_',
+  // 2026-11-11 codex-relay 实测：message 只有 "Upstream response stream was interrupted"，
+  // 无 upstream_* 前缀码、无 HTTP 状态码、无 http2 字样，上面三条全部错过 → 整轮终止。
+  // 与 pi-ai retry.js 的可重试名单同词，按 TRANSPORT 归类（见 COOLDOWN_PATTERN_CLASS）。
+  'stream was interrupted',
 ]
 
 /**
@@ -499,6 +503,14 @@ const COOLDOWN_PATTERN_CLASS = {
   'http2': 'TRANSPORT',
   'http/2 stream failed': 'TRANSPORT',
   'upstream_': 'TRANSPORT',
+  // 上游流被网关中途掐断、可辨认的只剩 "interrupted" 一词（实测 2026-11-11 codex-relay，
+  // failures.jsonl: code=PI_AI_ERROR、message="Upstream response stream was interrupted"）：
+  // 宿主 classifyPiAiError 只认 "stream ended before/without"、terminated、premature close 等
+  // 字样，认不出 "interrupted" → 落 PI_AI_ERROR。pi-ai 自身可重试名单明确包含
+  // "stream was interrupted"（retry.js RETRYABLE_PROVIDER_ERROR_PATTERN），而 DSH 关闭了
+  // pi-ai 内部重试（maxRetries:0），恢复责任在本插件：不收这条就整轮终止（复现与回归见
+  // probe/repro-upstream-interrupted.mjs、probe/smoke-recovery.mjs）。
+  'stream was interrupted': 'TRANSPORT',
   'rate limit': 'RATE_LIMIT',
   'token limit': 'RATE_LIMIT',
   'invalid api key': 'AUTH',
@@ -1985,7 +1997,7 @@ export function apply(ctx, rawConfig) {
     const key = stepKeyOf(sessionId, turn, step)
     let record = state.steps.get(key)
     if (record === undefined) {
-      record = { attempted: new Set(), target: undefined, switches: 0, policyRetries: 0, needs: { tools: false, images: false }, at: Date.now() }
+      record = { attempted: new Set(), attemptedCodes: new Map(), target: undefined, switches: 0, policyRetries: 0, needs: { tools: false, images: false }, at: Date.now() }
       state.steps.set(key, record)
       if (state.steps.size > 128) {
         // 按 lastAccess 淘汰：不得误删活跃 step 的记账（R5 语义）。
@@ -2078,6 +2090,32 @@ export function apply(ctx, rawConfig) {
       if (health === undefined || !(health.coolingUntil > now)) continue
       const until = new Date(health.coolingUntil).toLocaleTimeString('zh-CN', { hour12: false })
       items.push(route + '(' + String(health.code ?? '') + ', 至 ' + until + ')')
+    }
+    return items.length === 0 ? '(无)' : items.join(', ')
+  }
+
+  /**
+   * 本 (turn, step) 已失败过的条目摘要（按实际尝试顺序）：route/model(CODE)。
+   * 候选耗尽有三种互不相干的原因——本步已尝试、冷却中、能力不兼容/不可解析。冷却摘要只说第二种，
+   * 只说它就会出现「无可用候选；冷却中：(无)」这种自相矛盾的提示（2026-11-06 实测），所以两种必须并列。
+   */
+  function attemptedSummary(record) {
+    if (record === undefined || record.attempted === undefined) return '(无)'
+    const byId = new Map()
+    for (const tier of config.tiers) {
+      for (const entry of tier.entries) if (!byId.has(entry.id)) byId.set(entry.id, entry)
+    }
+    const items = []
+    for (const key of record.attempted) {
+      const text = String(key)
+      const at = text.indexOf('@')
+      const hash = text.indexOf('#')
+      const id = at < 0 ? text : text.slice(0, at)
+      const route = at < 0 ? '' : text.slice(at + 1, hash < 0 ? undefined : hash)
+      const entry = byId.get(id)
+      const label = entry !== undefined ? entry.route + '/' + entry.model : (route.length > 0 ? route : text)
+      const code = record.attemptedCodes !== undefined ? record.attemptedCodes.get(key) : undefined
+      items.push(typeof code === 'string' && code.length > 0 ? label + '(' + code + ')' : label)
     }
     return items.length === 0 ? '(无)' : items.join(', ')
   }
@@ -2868,7 +2906,14 @@ export function apply(ctx, rawConfig) {
     const failedLoc = failedRoute.length > 0 ? locateRoute(config, failedRoute) : undefined
     const failedEntry = failedLoc?.entry
     const activeRef = failedRoute.length > 0 ? activeRefOf(failedRoute) : undefined
-    if (failedEntry !== undefined) record.attempted.add(attemptKey(failedEntry.id, failedRoute, activeRef))
+    if (failedEntry !== undefined) {
+      const failedAttemptKey = attemptKey(failedEntry.id, failedRoute, activeRef)
+      record.attempted.add(failedAttemptKey)
+      // 记账键只有 id@route#ref，没有任何可读信息；候选耗尽时要向人交代「这一轮试过谁、都怎么败的」，
+      // 因此同键补存归一化失败码（OE），供 attemptedSummary 拼成人话（2026-11-06 实况：冷却到期后
+      // 排除只剩 attempted，通知却只写「冷却中：(无)」，看起来像档位表坏了）。
+      record.attemptedCodes.set(failedAttemptKey, typeof effectiveCode === 'string' && effectiveCode.length > 0 ? effectiveCode : (typeof code === 'string' ? code : ''))
+    }
 
     // ① 凭据类失败：先在该条目内换 key（同路由、同模型，只改 apiKeyEnv 引用）。
     //    只有归一化到凭据类编码才走这里；消息模式兜底命中的失败按非凭据类处理。
@@ -2958,7 +3003,7 @@ export function apply(ctx, rawConfig) {
         session: sessionKey === '-' ? '' : sessionKey,
         provider: failedRoute,
         category: 'no-candidate',
-        reason: '可切换失败已确认，但档位表中没有可用候选（已尝试/冷却中/能力不兼容/不可解析）。',
+        reason: '可切换失败已确认，但档位表中没有可用候选（已尝试/冷却中/能力不兼容/不可解析）：本步已失败 ' + attemptedSummary(record),
         code: typeof failure?.code === 'string' ? failure.code : '',
         message: String(failure?.message ?? '').slice(0, 200),
         turn,
@@ -2983,7 +3028,7 @@ export function apply(ctx, rawConfig) {
         step,
         reasonId: reason.id,
         reasonLabel: reason.label,
-        detail: '无可用候选；冷却中：' + coolingSummary(now),
+        detail: '无可用候选；本步已失败（均不可用）：' + attemptedSummary(record) + '；冷却中：' + coolingSummary(now),
       })
       return next()
     }
