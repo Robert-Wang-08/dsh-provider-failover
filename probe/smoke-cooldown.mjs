@@ -86,6 +86,7 @@ console.log('无候选：不冻结、不重试、必须留痕:')
   check('落 kind=exhausted 的会话可见通知', notice !== undefined && notice.code === 'QUOTA', JSON.stringify(feed.notices))
   check('通知点名「无可用候选」并带冷却摘要', notice !== undefined && String(notice.detail).includes('无可用候选') && String(notice.detail).includes('冷却中'), notice === undefined ? '(none)' : String(notice.detail))
   check('通知点名本步已失败的路由（只写冷却会变成「冷却中：(无)」）', notice !== undefined && String(notice.detail).includes('本步已失败') && String(notice.detail).includes('solo/m'), notice === undefined ? '(none)' : String(notice.detail))
+  check('通知说明候选被过滤的原因', notice !== undefined && String(notice.detail).includes('过滤：') && String(notice.detail).includes('solo/m(当前失败路由)'), notice === undefined ? '(none)' : String(notice.detail))
   const file = join(home, 'plugins', 'provider-failover', 'notices.jsonl')
   const persisted = existsSync(file) ? readFileSync(file, 'utf8') : ''
   check('通知落盘 notices.jsonl（可回看）', persisted.includes('"kind":"exhausted"'), persisted.slice(0, 200))
