@@ -1997,7 +1997,7 @@ export function apply(ctx, rawConfig) {
     const key = stepKeyOf(sessionId, turn, step)
     let record = state.steps.get(key)
     if (record === undefined) {
-      record = { attempted: new Set(), attemptedCodes: new Map(), target: undefined, switches: 0, policyRetries: 0, needs: { tools: false, images: false }, at: Date.now() }
+      record = { attempted: new Set(), attemptedCodes: new Map(), skipped: [], target: undefined, switches: 0, policyRetries: 0, needs: { tools: false, images: false }, at: Date.now() }
       state.steps.set(key, record)
       if (state.steps.size > 128) {
         // 按 lastAccess 淘汰：不得误删活跃 step 的记账（R5 语义）。
@@ -2063,6 +2063,21 @@ export function apply(ctx, rawConfig) {
   function cooling(route, now) {
     const health = state.routeHealth.get(route)
     return health !== undefined && health.coolingUntil > now
+  }
+
+  /** Record why a configured candidate was filtered from this step's search. */
+  function noteCandidateSkip(record, entry, reason) {
+    if (record === undefined || entry === undefined) return
+    if (Array.isArray(record.skipped) !== true) record.skipped = []
+    const key = entry.id + '@' + entry.route + '#' + reason
+    if (record.skipped.some((item) => item.key === key)) return
+    if (record.skipped.length >= 32) return
+    record.skipped.push({ key, label: entry.route + '/' + entry.model, reason })
+  }
+
+  function skippedSummary(record) {
+    const items = Array.isArray(record?.skipped) ? record.skipped : []
+    return items.length === 0 ? '(无)' : items.map((item) => item.label + '(' + item.reason + ')').join(', ')
   }
 
   /**
@@ -2400,19 +2415,21 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * 目标预检：路由/模型必须能被解析；声明了 `reasoningEffort` 的条目还必须确认该层级受模型支持。
-   * 任一不满足即视为候选不合格——跳过候选，而不是把 `UNSUPPORTED_REASONING_EFFORT` 抛给宿主打断整轮。
+   * 目标预检：只有声明了 `reasoningEffort` 的条目才检查模型能力。普通候选不依赖模型目录；
+   * 元数据解析异常时交给真实请求判定，只有明确确认层级不受支持才跳过候选。
    */
   async function serviceable(entry, signal) {
-    if (config.probeTarget !== true) return true
+    // 普通候选不依赖模型目录；只有显式 reasoningEffort 才需要预检。
+    if (config.probeTarget !== true || entry.reasoningEffort === undefined) return true
     const service = llm()
     if (service === undefined || typeof service.resolveModelInfo !== 'function') return true
     let info
     try {
       info = await service.resolveModelInfo(entry.route, entry.model, signal)
     } catch (error) {
-      console.warn('[dsh-provider-failover] candidate skipped (unresolvable): ' + entry.route + '/' + entry.model + ' — ' + messageOf(error))
-      return false
+      // 元数据服务的瞬时失败不能证明目标路由不可用；交给真实请求判定，避免误报无候选。
+      console.warn('[dsh-provider-failover] candidate precheck unavailable; keeping candidate: ' + entry.route + '/' + entry.model + ' — ' + messageOf(error))
+      return true
     }
     const unsupported = unsupportedReasoningEffort(entry, info)
     if (unsupported !== undefined) {
@@ -2618,20 +2635,20 @@ export function apply(ctx, rawConfig) {
     for (const tier of tiers) {
       if (tier.enabled !== true) continue
       for (const entry of await entriesInOrder(tier, context, signal, excludeRoute)) {
-        if (entry.enabled !== true) continue
+        if (entry.enabled !== true) { noteCandidateSkip(record, entry, '条目未启用'); continue }
         // 失败路由本身不是自己的候选。旧实现靠「选候选之前先把失败路由写进冷却」间接排除它；
         // 冷却写入已移到选中候选之后（agent/request-error），因此这里必须显式排除，
         // 否则 no-candidate 之后的下一步会把自己的失败路由又选回来。
-        if (typeof excludeRoute === 'string' && excludeRoute.length > 0 && entry.route === excludeRoute) continue
-        if (record.attempted.has(attemptKey(entry.id, entry.route, activeRefOf(entry.route)))) continue
-        if (cooling(entry.route, now)) continue
+        if (typeof excludeRoute === 'string' && excludeRoute.length > 0 && entry.route === excludeRoute) { noteCandidateSkip(record, entry, '当前失败路由'); continue }
+        if (record.attempted.has(attemptKey(entry.id, entry.route, activeRefOf(entry.route)))) { noteCandidateSkip(record, entry, '本步已尝试'); continue }
+        if (cooling(entry.route, now)) { noteCandidateSkip(record, entry, '路由冷却中'); continue }
         // WINDOWFIX: 溢出切换只在「声明窗口严格更大」的候选间选择；窗口未知者不参与。
         if (minContextWindow !== undefined) {
           const entryWindow = declaredContextWindow(entry)
-          if (entryWindow === undefined || entryWindow <= minContextWindow) continue
+          if (entryWindow === undefined || entryWindow <= minContextWindow) { noteCandidateSkip(record, entry, '上下文窗口不够大'); continue }
         }
-        if (compatible(entry, record.needs) !== true) continue
-        if ((await serviceable(entry, signal)) !== true) continue
+        if (compatible(entry, record.needs) !== true) { noteCandidateSkip(record, entry, '能力不兼容'); continue }
+        if ((await serviceable(entry, signal)) !== true) { noteCandidateSkip(record, entry, '推理层级不支持'); continue }
         return { tier, entry }
       }
     }
@@ -3003,7 +3020,7 @@ export function apply(ctx, rawConfig) {
         session: sessionKey === '-' ? '' : sessionKey,
         provider: failedRoute,
         category: 'no-candidate',
-        reason: '可切换失败已确认，但档位表中没有可用候选（已尝试/冷却中/能力不兼容/不可解析）：本步已失败 ' + attemptedSummary(record),
+        reason: '可切换失败已确认，但档位表中没有可用候选：本步已失败 ' + attemptedSummary(record) + '；过滤：' + skippedSummary(record),
         code: typeof failure?.code === 'string' ? failure.code : '',
         message: String(failure?.message ?? '').slice(0, 200),
         turn,
@@ -3028,7 +3045,7 @@ export function apply(ctx, rawConfig) {
         step,
         reasonId: reason.id,
         reasonLabel: reason.label,
-        detail: '无可用候选；本步已失败（均不可用）：' + attemptedSummary(record) + '；冷却中：' + coolingSummary(now),
+        detail: '无可用候选；本步已失败（均不可用）：' + attemptedSummary(record) + '；过滤：' + skippedSummary(record) + '；冷却中：' + coolingSummary(now),
       })
       return next()
     }

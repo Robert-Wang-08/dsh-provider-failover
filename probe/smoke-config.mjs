@@ -485,6 +485,12 @@ const env17 = makeSwitchEnv(undefined, { probeTarget: true, startup: { preferTie
 const aligned17 = await env17.handlers['agent/request']({ agent: { session: { id: 'p2' } }, turn: 1, step: 1 }, async () => ({ provider: 'r-other', model: 'm-other' }))
 check('层级受支持时候选正常下发 reasoningEffort', aligned17.provider === 'r-bad' && aligned17.reasoningEffort === 'medium', JSON.stringify(aligned17))
 
+// 模型目录服务瞬时失败不应把真实候选过滤掉；真实请求负责给出最终可用性。
+const RESOLUTION_ERROR_TIERS = [{ tier: 1, enabled: true, entries: [{ id: 'fallback', route: 'r-ok', model: 'm-ok', enabled: true }] }]
+const env17b = makeSwitchEnv(undefined, { probeTarget: true, startup: { preferTier: 1 }, tiers: RESOLUTION_ERROR_TIERS }, async () => { throw new Error('model catalog temporarily unavailable') })
+const aligned17b = await env17b.handlers['agent/request']({ agent: { session: { id: 'p2b' } }, turn: 1, step: 1 }, async () => ({ provider: 'r-other', model: 'm-other' }))
+check('模型目录解析瞬时失败时仍保留候选', aligned17b.provider === 'r-ok' && aligned17b.model === 'm-ok', JSON.stringify(aligned17b))
+
 // 测试切换路径：条目层级不受支持时丢弃（官方 selectModel 会校验并抛错）。
 const DROP_TIERS = [{ tier: 1, enabled: true, entries: [{ id: 'ais', route: 'r1', model: 'm1', reasoningEffort: 'medium', enabled: true }] }]
 const dropSelections = []
